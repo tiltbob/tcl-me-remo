@@ -3,8 +3,9 @@
 A SteamOS machine controls a TCL Google TV by acting as a Bluetooth LE remote control
 (HID over GATT), paired once with the TV. A root systemd service turns the TV on (and
 optionally switches its input) when the machine boots or wakes, and off when it suspends or
-shuts down. A Decky Loader plugin is the Game Mode UI; an opt-in Wi-Fi assist speaks the
-Google TV remote protocol.
+shuts down. A Decky Loader plugin is the Game Mode UI and the installer: people install,
+update and remove everything from inside Decky, with no terminal. An opt-in Wi-Fi assist
+speaks the Google TV remote protocol.
 
 Read `docs/how-it-works.md` before changing behaviour, and `docs/control-protocol.md` before
 touching the CLI or the plugin.
@@ -27,6 +28,9 @@ touching the CLI or the plugin.
   produces `docs/images/` and is the only way to see the panel without a Deck.
 - `tests/` — pytest; `fake_bluez.py` and `fake_logind.py` stand in for the system services on
   a private D-Bus daemon.
+- `scripts/build_zip.py`, `scripts/release_plan.py`, `.github/workflows/release.yml` — the
+  plugin archive and its GitHub release. `release_plan.py` holds every decision the workflow
+  makes (`tests/test_release_plan.py`).
 - `hardware-results/` — what was observed on real hardware. Add to it, never rewrite history.
 
 ## Commands
@@ -55,6 +59,19 @@ tcl-me-remo doctor                   # read-only health report
   and `installer.py` must not import anything heavier.
 - **Nothing under `/etc` except systemd units.** SteamOS wipes the rest on OS updates.
   Never edit `/etc/bluetooth/main.conf`, never rename the adapter, never make it discoverable.
+- **The install address ends in `tcl-me-remo.zip`.** People type
+  `github.com/tiltbob/tcl-me-remo/releases/latest/download/tcl-me-remo.zip` into Decky's
+  "Install Plugin from URL". Decky takes the plugin's name from the last part of the address
+  and tells an update from a fresh install by it, so the release asset is always the `name`
+  in `plugin.json` plus `.zip`, with no version in it. The address is also in the README,
+  `src/text.ts` and the docs; a test holds them together.
+- **A release is made by raising the version on `main`** (`package.json` and
+  `py_modules/tcl_me_remo/__init__.py`, which must agree). The Release workflow publishes
+  `v<version>` once CI has passed for that commit. Nobody pushes tags.
+- **The Decky route must not need a terminal.** Whatever the panel can show (installer and
+  doctor messages included) names the panel's way first and a command second. Removal is
+  uninstalling the plugin: the service removes itself when the plugin that installed it is
+  gone (`installer.uninstall_if_orphaned`), and never when that cannot be told for certain.
 - **Power keys are discrete** (`WAKE`, `SLEEP`). Do not introduce a toggle into an automatic
   path; a toggle sent twice undoes itself and a long or repeated press opens TCL's shutdown
   dialog.
