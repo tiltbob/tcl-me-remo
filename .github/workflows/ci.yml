@@ -46,3 +46,40 @@ jobs:
           scripts/vendor.sh
           git diff --exit-code -- py_modules/tcl_me_remo/_vendor
           test -z "$(git status --porcelain -- py_modules/tcl_me_remo/_vendor)"
+
+  plugin:
+    name: Decky plugin (build, UI checks, package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm run typecheck
+      - name: Build
+        run: pnpm run build
+      - name: UI checks in a browser preview
+        # Renders the real components against mocked Decky modules and a fake backend and
+        # clicks through them.  Playwright is not a project dependency; the script loads it
+        # through NODE_PATH.
+        run: |
+          npm install --global playwright@1
+          npx playwright install --with-deps chromium
+          NODE_PATH="$(npm root --global)" pnpm run preview
+      - name: Package
+        run: python3 scripts/build_zip.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcl-me-remo-plugin
+          path: out/tcl-me-remo.zip
+          if-no-files-found: error

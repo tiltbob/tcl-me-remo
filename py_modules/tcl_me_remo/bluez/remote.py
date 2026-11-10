@@ -1206,7 +1206,7 @@ class BleRemote:
         self._raw.detach()
         try:
             await dbus.call(
-                self._bus, BLUEZ, path, DEVICE, "Disconnect", timeout=max(0.2, until - time.monotonic())
+                self._bus, BLUEZ, path, DEVICE, "Disconnect", timeout=max(MIN_CALL_TIMEOUT, until - time.monotonic())
             )
         except TimeoutError:
             pass  # bluetoothd answers only once the link is down, about two seconds later

@@ -1,0 +1,44 @@
+name: Release
+
+# Pushing a tag such as v0.1.0 builds the plugin and publishes it as a release asset named
+# tcl-me-remo.zip.  The name must stay exactly that: Decky compares it with the plugin's
+# name to tell an update from a fresh install.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: The tag must match the version in the code
+        run: |
+          version="$(python3 -c "import json; print(json.load(open('package.json'))['version'])")"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $version" >&2
+            exit 1
+          fi
+      - name: Build
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run typecheck
+          pnpm run build
+          python3 scripts/build_zip.py
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/tcl-me-remo.zip --title "$GITHUB_REF_NAME" --generate-notes

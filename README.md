@@ -10,6 +10,14 @@ The machine pairs with the TV once, as a Bluetooth remote control. From then on:
 - a panel in **Game Mode** (a Decky Loader plugin) configures all of it, and a command line
   tool does the same from a terminal.
 
+<p>
+  <img src="docs/images/panel.png" alt="The Quick Access panel: status, TV on, TV off, switch input, and the automatic toggles" width="230">
+  <img src="docs/images/setup.png" alt="The Setup page of the settings: service, TV preparation, pairing" width="560">
+</p>
+
+*The panel and the settings page, rendered in a browser preview (the plugin has not been run
+inside Steam yet).*
+
 > **Not yet confirmed on real hardware.** This was written without access to a TV. The
 > design follows Android's and BlueZ's source code and TV owners' reports, and the software
 > is tested against simulated system services, but which standby modes a TCL TV can be woken
@@ -44,6 +52,10 @@ Bluetooth both sides already have.
    **Developer** choose **Install plugin from ZIP file** and pick the download.
 
 The plugin installs and starts the background service by itself.
+
+If there is no release yet, every CI run on GitHub builds the same file: open the latest
+run under *Actions*, download the `tcl-me-remo-plugin` artifact and unzip it once to get
+`tcl-me-remo.zip`. Or build it yourself (see [Development](#development)).
 
 The plugin is not in Decky's plugin store, and will not be: the store does not take plugins
 written mostly with AI assistance, which this one was.
