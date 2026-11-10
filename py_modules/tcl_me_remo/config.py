@@ -94,11 +94,44 @@ class DisplayConfig:
 
 @dataclass
 class PowerConfig:
-    on_key: str = field(default="WAKE", metadata=_meta(check="key", help="Key sent to turn the TV on."))
-    off_key: str = field(default="SLEEP", metadata=_meta(check="key", help="Key sent to turn the TV off."))
-    on_repeat: int = field(default=1, metadata=_meta(min=1, max=5, help="How many times to send the on key."))
-    off_repeat: int = field(default=1, metadata=_meta(min=1, max=5, help="How many times to send the off key."))
-    repeat_gap: float = field(default=3.0, metadata=_meta(min=0.1, max=10, help="Seconds between repeats."))
+    on_key: str = field(
+        default="WAKE",
+        metadata=_meta(
+            check="key",
+            help="Key sent to turn the TV on. If it is a power toggle (POWER or the same usage written raw), "
+            "start-up and wake send it only when the last power key this service sent turned the TV off; "
+            "'TV on' by hand always sends it.",
+        ),
+    )
+    off_key: str = field(
+        default="SLEEP",
+        metadata=_meta(
+            check="key",
+            help="Key sent to turn the TV off. A power toggle turns a TV that is already off on.",
+        ),
+    )
+    on_repeat: int = field(
+        default=1,
+        metadata=_meta(min=1, max=5, help="How many times to send the on key. A power toggle is sent once."),
+    )
+    off_repeat: int = field(
+        default=1,
+        metadata=_meta(
+            min=1,
+            max=5,
+            help="How many times to send the off key. A power toggle is sent once. Before suspend and shutdown "
+            "only the repeats that fit into the time the machine waits are sent.",
+        ),
+    )
+    repeat_gap: float = field(
+        default=3.0,
+        metadata=_meta(
+            min=0.1,
+            max=10,
+            help="Seconds between repeats. Before suspend and shutdown the machine waits about 3.5 seconds in "
+            "all, so a repeat of the off key only goes out there with a gap well under 3 seconds.",
+        ),
+    )
 
 
 @dataclass

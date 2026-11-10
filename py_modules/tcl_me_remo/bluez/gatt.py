@@ -371,7 +371,14 @@ class HidApplication:
 
     @property
     def subscribed(self) -> bool:
+        """The TV has subscribed to at least one of the report characteristics."""
         return any(char.notifying for char in self.reports.values())
+
+    @property
+    def fully_subscribed(self) -> bool:
+        """...to every one of them.  A host writes these subscriptions one after another, and
+        bluetoothd forwards a report only once the one of its own characteristic has arrived."""
+        return all(char.notifying for char in self.reports.values())
 
     def expected_handles(self, service_handle: int) -> dict[str, int]:
         """Handles bluetoothd allocates when the service sits at ``service_handle``.

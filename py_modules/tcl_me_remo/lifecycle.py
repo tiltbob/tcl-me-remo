@@ -84,6 +84,8 @@ class Logind:
         self._owner: str | None = None
         self._stop_signals: Callable[[], None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        # PrepareForSleep signals are handled one at a time, in the order they arrived.
+        self._sleep_order = asyncio.Lock()
         self._pending_kind = ""
         self._metadata_seen = asyncio.Event()
         self._shutdown_in_progress = False
@@ -212,20 +214,26 @@ class Logind:
         task.add_done_callback(self._tasks.discard)
 
     async def _handle_sleep(self, going_down: bool) -> None:
-        if going_down:
-            try:
-                await self._on_sleep(True)
-            except Exception:  # noqa: BLE001 - the lock must be released whatever happens
-                log.exception("pre-suspend handler failed")
-            finally:
-                self._release("sleep")
-        else:
-            # Take the lock back first so a quick second suspend is still delayed for us.
-            await self._retake("sleep")
-            try:
-                await self._on_sleep(False)
-            except Exception:  # noqa: BLE001
-                log.exception("resume handler failed")
+        # In arrival order.  Each signal is handled in a task of its own, and reporting a
+        # resume starts with a round trip to logind (the lock is taken back), so without this
+        # the "suspend" of a machine sent back to sleep at once would be reported before the
+        # "resume" it followed, and the TV would be turned on just as the machine goes down.
+        # (An asyncio.Lock serves its waiters first come, first served.)
+        async with self._sleep_order:
+            if going_down:
+                try:
+                    await self._on_sleep(True)
+                except Exception:  # noqa: BLE001 - the lock must be released whatever happens
+                    log.exception("pre-suspend handler failed")
+                finally:
+                    self._release("sleep")
+            else:
+                # Take the lock back first so a quick second suspend is still delayed for us.
+                await self._retake("sleep")
+                try:
+                    await self._on_sleep(False)
+                except Exception:  # noqa: BLE001
+                    log.exception("resume handler failed")
 
     async def _handle_shutdown(self, going_down: bool) -> None:
         if going_down:

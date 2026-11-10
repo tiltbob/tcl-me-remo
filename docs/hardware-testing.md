@@ -153,8 +153,23 @@ This is the assumption the whole design leans on: Android's `KEYCODE_SLEEP` and
 them on a TCL set.
 
 If `SLEEP` does nothing: try `tcl-me-remo key S:82` (the other sleep usage). If only a
-toggle works (`tcl-me-remo key POWER`), set `power.on_key` and `power.off_key` to `POWER` and
-note it; the service never repeats a toggle.
+toggle works (`tcl-me-remo key POWER`), note it; that result matters more than anything
+else in this plan, because nothing automatic is safe with a toggle. To go on testing you can
+set `power.on_key` and `power.off_key` to `POWER`, knowing what then happens:
+
+- The service cannot see the TV, and a toggle does the opposite of what was meant whenever
+  the TV is not in the state the service assumes. That is the case every time the TV was
+  switched with its own remote: the next suspend turns a TV that is off **on**, and it
+  stays on while the machine sleeps.
+- At boot and wake the toggle is sent only if the last power key the service sent turned the
+  TV off. After a reboot (which leaves the TV on), on a wake that follows a suspend without
+  "TV off", and before the service has turned the TV off for the first time, "TV on" is
+  skipped and `tcl-me-remo status` shows the reason. `tcl-me-remo on` always sends the key.
+- A toggle is sent once, whatever `power.on_repeat` and `power.off_repeat` say, and however
+  it is written (`POWER`, `S:81`, `C:0030`, `K:66`).
+
+Record how often the TV ended up in the wrong state over a day of normal use, and what
+preceded it.
 
 Also record what `SLEEP` leaves behind: the home screen or the previous input when the TV
 comes back.

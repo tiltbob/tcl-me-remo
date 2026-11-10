@@ -42,6 +42,30 @@ Discrete keys matter because the service cannot see the TV's state. A toggle sen
 that is already off would turn it on. `SLEEP` uses the consumer usage because Android 16
 remaps the Generic Desktop sleep usage to "lock".
 
+A toggle is never the default, and nothing chooses one for you. It can be set by hand
+(`power.on_key`, `power.off_key`) for a set on which only a toggle works, and then these
+rules apply. What makes a key a toggle is its usage, not its name: `POWER`, the same key
+written raw (`S:81`), and the other usages Android turns into `KEYCODE_POWER` (`C:0030`,
+`K:66`, `C:019E`).
+
+- A toggle is sent once, whatever `power.on_repeat` and `power.off_repeat` say. Twice would
+  undo it.
+- **Turning the TV on automatically** (boot, wake) sends a toggle only if the last power key
+  the service sent turned the TV off, since that is the one moment the TV is known to be
+  off. Otherwise the step is skipped, and the action record says why: after a reboot that
+  left the TV on, on a second wake without a "TV off" in between, and until the service has
+  turned the TV off for the first time. Which way the last power key went is kept in
+  `/var/lib/tcl-me-remo/power.json`, so it is still known after a reboot. A power key
+  pressed from the on-screen remote or in a macro counts too.
+- **Turning it off automatically** always sends the off key. With a toggle, a TV that is
+  already off is turned on by it.
+- "TV on" and "TV off" by hand always send the key.
+- The service cannot know about the TV's own remote. Whenever the TV was switched with it,
+  a toggle does the opposite of what was meant, until both agree again.
+- When the off key is a toggle, the Wi-Fi assist is not tried at the same time as Bluetooth
+  (see [Lifecycle events](#lifecycle-events)): its discrete "sleep" followed by a toggle
+  would turn the TV off and on again. Bluetooth goes first; Wi-Fi only once it has given up.
+
 The mapping holds while the TV applies its generic key layout to us, which it does because
 our Bluetooth identity (BlueZ's own vendor and product id) matches no vendor layout.
 Pretending to be the TCL remote would switch the TV to TCL's layout, which has no discrete
@@ -74,12 +98,37 @@ Events reach the service by three independent routes, and it acts once per real 
 3. **A clock watchdog.** `CLOCK_BOOTTIME` advances during suspend and `CLOCK_MONOTONIC` does
    not; a growing gap proves a resume even if nothing announced the suspend.
 
-The time before sleep is short. The service spends at most `InhibitDelayMaxSec` minus 1.5 s
-(3.5 s by default). If the Bluetooth link is up, `SLEEP` goes out immediately. If it is
-down, the service calls the TV and, when the Wi-Fi assist is set up, tries that at the same
-time; the first to succeed wins. The lock is held a little longer than the key itself: the
-key-up must be on the air, and the service then closes the link on its own terms (up to
-another half second, see [The link](#the-link)) before it lets the machine go.
+The time before sleep is short. The attempt to turn the TV off gets `InhibitDelayMaxSec`
+minus 1.5 s (3.5 s by default). If the Bluetooth link is up, `SLEEP` goes out immediately.
+If it is down, the service calls the TV and, when the Wi-Fi assist is set up, tries that at
+the same time; the first to succeed wins. The attempt includes a pause after the key, so
+that the key-up is on the air. What counts is whether the key went out: an attempt whose
+time ends after that is a success, and one that is to send the key several times
+(`power.off_repeat`) only starts the repeats that still fit.
+
+When the attempt is over, however it ended, the service closes the link on its own terms
+(see [The link](#the-link)) and only then lets the machine go. That takes up to another
+half second and is not part of the attempt's time. So the machine is held for at most
+3.5 s + 0.5 s = 4 s of logind's 5 s, plus the moment it takes to cancel an action that was
+running when the suspend came. Nothing that was in progress is waited for: an action is
+cancelled, and a key that is being held from the on-screen remote or with `key --hold` is
+released (its sender gets a `busy` error).
+
+Every route reports the same event, and the service acts on the first report. A second
+report normally changes nothing, with one exception. If the first attempt could not get the
+TV on the line in its time, and the link was down because the settings have it down
+(`bluetooth.reconnect_on_drop` off, or `bluetooth.idle_disconnect_seconds` set), the second
+route tries once more with time of its own: the sleep hook has 6 s, the stop signal at
+shutdown 8 s. The first attempt's last step stopped calling the TV, so the second starts
+the call again. With such settings and a TV that does not answer at all, a suspend is
+therefore held for up to 3.5 + 0.5 + 6 + 0.5 = 10.5 s, and a shutdown for up to 12.5 s. With
+the default settings the link is kept up, so a link that is down means the TV is not
+answering (already off, unplugged, out of range); there is no second attempt, and the 4 s
+above are the limit.
+
+A down event is taken to be followed by the machine going down. If the service is still
+running two minutes after it handled one, and the clocks show no sleep, it concludes that
+the machine stayed up and counts the next suspend or shutdown as a new one.
 
 A handheld that wakes on the sofa must not turn the TV on. The **display check** looks at the
 kernel's display connectors: with a built-in panel (eDP, DSI, LVDS), TV actions run only
@@ -161,7 +210,27 @@ A notification for a peer without a subscription record is dropped silently.
 - **Android 11 to 13** load their stored description of the remote and never write the
   subscription again. They are listening; BlueZ will not talk.
 
-For the second case the service has a **direct delivery** path (`bluetooth.raw_notify`):
+There is not one subscription but three, one per key report (keyboard, consumer keys, system
+control), and BlueZ decides for each report by its own. Going by Android's source the TV
+writes them one after another, each once the previous one was answered. A key is therefore
+never handed to BlueZ for a report the TV has not subscribed to: `WAKE`, the first key of
+every boot, travels in the report that is subscribed last, and BlueZ would drop it while
+`tcl-me-remo` reported it as sent. The link counts as ready through BlueZ once all three
+subscriptions are there; while only some are, the service waits for the rest inside the same
+`bluetooth.resubscribe_wait`.
+
+If that time passes with some subscriptions still missing, each report takes the way that
+reaches the TV: the subscribed ones through BlueZ, the others by direct delivery (below)
+where it is allowed. Where it is not, the keys of the subscribed reports are sent and a key
+in one of the others fails with the same error as for a TV that did not subscribe at all,
+saying that this key is not among those the TV subscribed for. No Android version does this
+by design; by the source it can happen when the link drops between the TV's first and last
+write, after which the TV writes nothing more until the next reboot of this machine. The
+service then waits the full time once and only a moment on later links. None of this has
+been observed on a TV.
+
+For a TV that does not subscribe again (Android 11 to 13) the service has a **direct
+delivery** path (`bluetooth.raw_notify`):
 it writes the notification itself through a raw HCI socket, addressed to the connection and
 attribute handle the TV already knows. The controller encrypts it like any other packet.
 One detail makes this work: the Service Changed indication makes those Android versions
@@ -169,10 +238,11 @@ drop their notification registrations for the rest of that connection, so the fi
 after each start the service disconnects once and lets the TV reconnect before using direct
 delivery. While the service keeps calling the TV (`bluetooth.reconnect_on_drop`), that
 one-off reconnect happens in the background as soon as the TV has connected and stayed
-silent, not when the first key is due: before a suspend there would be no time for it.
+silent (or stopped after some of its subscriptions), not when the first key is due: before a
+suspend there would be no time for it.
 `tcl-me-remo status --json` shows `"delivery": "raw"` when this path is in use, and
 `tcl-me-remo doctor` says "direct delivery" on its TV link line. If the TV subscribes later
-after all, delivery switches back at once.
+after all, delivery switches back at once, report by report.
 
 Direct delivery has a side effect on Linux kernels before 6.17. (To be exact: on mainline
 kernels up to 6.17-rc3, and on the stable releases before 6.16.5, 6.12.45, 6.6.104, 6.1.150

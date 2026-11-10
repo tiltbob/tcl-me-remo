@@ -55,9 +55,48 @@ DBUS_PATH = "/org/freedesktop/DBus"
 DEFAULT_TIMEOUT = 10.0
 
 
+def _write_failure_seen(future: asyncio.Future) -> None:
+    if not future.cancelled():
+        future.exception()  # asking for it is what tells asyncio that somebody has looked
+
+
+class _Bus(MessageBus):
+    """The library's bus, without the traceback it leaves in the log when the bus is lost.
+
+    The library reports a failed write in a future of its own, and its method calls throw
+    that future away.  A write that fails (the first sign of a bus that has gone, or a call
+    made after it, such as the clean-up on the way out) then comes back from the garbage
+    collector as "Future exception was never retrieved" with a traceback.  Nothing is lost
+    by looking at the future here: a failed write ends the connection, which every pending
+    call and ``wait_for_disconnect`` are told about, and whoever awaits the future still
+    gets the exception.  A send on a connection that is known to be gone is refused before
+    it reaches the socket; callers got an ``OSError`` for that before, and still do.
+
+    ``send`` is the library's own (aio/message_bus.py), plus the additions.
+    """
+
+    def send(self, msg: Message) -> asyncio.Future:
+        if self._disconnected:
+            raise ConnectionError("the D-Bus connection is closed")
+        if not msg.serial:
+            msg.serial = self.next_serial()
+        future = self._loop.create_future()
+        future.add_done_callback(_write_failure_seen)
+        try:
+            self._writer.schedule_write(msg, future)
+        except Exception:
+            # A write that fails closes the connection, and the library then stumbles over
+            # its own closed socket.  The failure is in the future by then, and in the reply
+            # of every pending call (this one included): that is where callers get it from.
+            # Raising here as well would make the library's ``call`` drop that reply unseen.
+            if not future.done() or future.cancelled() or future.exception() is None:
+                raise
+        return future
+
+
 async def connect_system_bus() -> MessageBus:
     """Connect to the system bus (honours ``DBUS_SYSTEM_BUS_ADDRESS``, which tests use)."""
-    return await MessageBus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
+    return await _Bus(bus_type=BusType.SYSTEM, negotiate_unix_fd=True).connect()
 
 
 def unwrap(value: Any) -> Any:

@@ -38,6 +38,14 @@ class FakeRemote:
         self.forgotten = 0
         self.config: Any = None
         self.key_delay = 0.0
+        # Like the real transport: one key at a time.  With ``honour_hold`` a key also takes
+        # as long as it is held, and a press that is cancelled is not counted as sent.
+        self.honour_hold = False
+        self._send_lock = asyncio.Lock()
+        # For tests that need "while a key is being sent" without racing a timer: a key waits
+        # at ``key_gate`` (an asyncio.Event the test sets) and says so in ``key_waiting``.
+        self.key_gate: asyncio.Event | None = None
+        self.key_waiting = asyncio.Event()
 
     @property
     def state(self) -> BleState:
@@ -63,8 +71,12 @@ class FakeRemote:
     async def send_key(self, spec: str, hold: float) -> None:
         if not self._state.ready:
             raise TransportError("not_connected", "the TV is not connected")
-        await asyncio.sleep(self.key_delay)
-        self.keys.append((spec, hold))
+        async with self._send_lock:
+            if self.key_gate is not None:
+                self.key_waiting.set()
+                await self.key_gate.wait()
+            await asyncio.sleep(self.key_delay + (hold if self.honour_hold else 0.0))
+            self.keys.append((spec, hold))
 
     async def start_pairing(self, timeout: float) -> None:
         self.pairing_calls.append(timeout)

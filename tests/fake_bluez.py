@@ -216,6 +216,12 @@ class FakeDevice:
         self.service_changed_pending = False
         #: The HID host has registered for input notifications on this connection.
         self.listening = False
+        #: Value handles of the reports whose subscription the host wrote on this connection,
+        #: when it is one on which an Android 14+ host rediscovered the service: until the link
+        #: ends it listens to exactly those (bta_hh_le_register_input_notif registers a report
+        #: after a discovery only if its CCC write succeeded).  None on every other link,
+        #: where a bonded host listens to all the reports it remembers.
+        self.wrote: set[int] | None = None
         self.received: list[tuple[int, bytes, str]] = []   # (value handle, value, "bluez" | "raw")
         self.ignored: list[tuple[int, bytes, str]] = []    # arrived while the HID host was not listening
         self.connections = 0
@@ -263,6 +269,10 @@ class FakeDevice:
             raise AttError("no GATT application is registered")
         return next(iter(apps.values()))
 
+    def hears(self, handle: int) -> bool:
+        """Whether the HID host accepts a notification for this value handle right now."""
+        return self.listening and (self.wrote is None or handle in self.wrote)
+
     def keys(self, via: str | None = None) -> list[tuple[int, bytes]]:
         """Notifications the TV's HID host accepted, optionally only those that came one way."""
         return [(handle, value) for handle, value, how in self.received if via is None or how == via]
@@ -284,10 +294,12 @@ class FakeDevice:
             # the service and write the CCCs again.
             self.service_changed_pending = False
             self.listening = False
+            self.wrote = set() if self.android >= 14 else None
             if self.android >= 14:
                 self._spawn(self._resubscribe_later())
         else:
             self.listening = self.bonded
+            self.wrote = None
 
     async def _resubscribe_later(self) -> None:
         await asyncio.sleep(self.resubscribe_delay)
@@ -417,6 +429,8 @@ class FakeDevice:
             flags = app.chrcs[path]["flags"]
             if "encrypt-notify" in flags and not self.props["Paired"]:
                 raise AttError("insufficient encryption")
+            if self.wrote is not None:
+                self.wrote.add(app.chrcs[path]["value_handle"])
             subscribers = app.ccc.setdefault(path, set())
             if self.identity in subscribers:
                 continue  # "If value is identical, then just succeed": no StartNotify
@@ -425,8 +439,9 @@ class FakeDevice:
             await dbus.call(self.bluez.bus, app.owner, path, GATT_CHRC, "StartNotify", timeout=2.0)
         self.listening = True
 
-    async def unsubscribe(self) -> None:
-        await self.bluez.clear_ccc(self)
+    async def unsubscribe(self, only: str | None = None) -> None:
+        """Write the CCCs to "off"; ``only`` (a path suffix such as "c5_consumer") just that one."""
+        await self.bluez.clear_ccc(self, only)
 
 
 class _Adapter:
@@ -611,20 +626,25 @@ class FakeBluez:
     def device_at(self, path: str) -> FakeDevice | None:
         return next((device for device in self.devices if device.present and device.path == path), None)
 
-    async def clear_ccc(self, device: FakeDevice) -> None:
-        """Drop the device's subscriptions; StopNotify where it was the last subscriber."""
+    async def clear_ccc(self, device: FakeDevice, only: str | None = None) -> None:
+        """Drop the device's subscriptions; StopNotify where it was the last subscriber.
+
+        ``only`` (a path suffix) drops the one of that characteristic and keeps the others.
+        """
         for adapter in self.adapters.values():
             for app in adapter.apps.values():
-                for path in self._drop_device_state(app, device.identity):
+                for path in self._drop_device_state(app, device.identity, only):
                     if self.bus is not None:
                         with contextlib.suppress(DBusError, TimeoutError):
                             await dbus.call(self.bus, app.owner, path, GATT_CHRC, "StopNotify", timeout=2.0)
 
     @staticmethod
-    def _drop_device_state(app: _App, address: str) -> list[str]:
+    def _drop_device_state(app: _App, address: str, only: str | None = None) -> list[str]:
         """Forget every CCC of one device; returns the characteristics left without a subscriber."""
         orphaned = []
         for path, subscribers in app.ccc.items():
+            if only is not None and not path.endswith("/" + only):
+                continue
             if address in subscribers:
                 subscribers.discard(address)
                 if not subscribers:
@@ -837,7 +857,7 @@ class FakeBluez:
                     # send_notification_to_device(): no CCC state for the device -> return.
                     device = known.get(address)
                     if device is not None and device.connected:
-                        (device.received if device.listening else device.ignored).append((handle, value, "bluez"))
+                        (device.received if device.hears(handle) else device.ignored).append((handle, value, "bluez"))
                         delivered = True
                     elif device is None or not device.bonded:
                         # "Remove device state if device no longer exists or is not paired":
@@ -1129,7 +1149,9 @@ class FakeRawHub:
         value_handle = int.from_bytes(packet[10:12], "little")
         for device in self.bluez.devices:
             if device.adapter == f"{ROOT}/hci{dev_id}" and device.connected and device.conn_handle == conn_handle:
-                (device.received if device.listening else device.ignored).append((value_handle, packet[12:], "raw"))
+                (device.received if device.hears(value_handle) else device.ignored).append(
+                    (value_handle, packet[12:], "raw")
+                )
 
 
 class _FakeRawBackend:

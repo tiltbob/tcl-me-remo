@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 # A first start later than this after power-on is an install or a manual start, not a boot.
 BOOT_WINDOW_SECONDS = 600.0
 WATCHDOG_INTERVAL = 2.0
+# Seconds for "TV off" when systemd stops the service because the machine is going down.
+# The unit has TimeoutStopSec=20 (installer.py): this, the final disconnect and the rest of
+# the clean-up fit into it with room to spare.
+STOP_BUDGET = 8.0
 
 RemoteFactory = Callable[[Any, config.Config], Awaitable[Remote]]
 WifiFactory = Callable[[config.Config], WifiAssist | None]
@@ -124,6 +128,7 @@ class Daemon:
                 on_config_changed=lambda new_cfg: logsetup.set_level(new_cfg.log_level),
                 recent_logs=ring.tail,
                 config_problems=problems,
+                power_state_path=paths.state_dir() / "power.json",
             )
             self.service = service
             remote.on_paired = service.on_paired
@@ -200,7 +205,12 @@ class Daemon:
             # Awaited: logind keeps the machine awake until this returns.
             await self.service.handle_event("suspend", budget=self._budget())
         else:
+            # Not awaited: turning the TV on can take a minute, and the next suspend must
+            # not wait for it.  But let the service take note of the resume before this
+            # returns (one turn of the loop does it), so that a suspend reported right
+            # behind it finds the bookkeeping in the order things happened.
             self._spawn(self.service.handle_event("resume"))
+            await asyncio.sleep(0)
 
     async def _on_shutdown(self, going_down: bool, kind: str) -> None:
         assert self.service is not None
@@ -224,7 +234,10 @@ class Daemon:
             log.info("service stop requested (the system is not shutting down)")
             return
         log.info("the system is going down (%s)", kind)
-        await self.service.handle_event(kind, budget=self._budget())
+        # Usually logind's route has dealt with this shutdown already and this is a
+        # duplicate.  If it is the first word of it, or that attempt may be made again (see
+        # Service._second_attempt_due), systemd's stop time-out is what limits us here.
+        await self.service.handle_event(kind, budget=STOP_BUDGET)
 
     async def _watch_bus(self, bus: Any) -> None:
         try:
@@ -232,11 +245,13 @@ class Daemon:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the library reports the reason by raising
-            log.error("lost the connection to the system D-Bus: %s", exc)
+            # The usual reason is an EOFError without text: the bus went away.
+            reason = str(exc) or ("the bus closed it" if isinstance(exc, EOFError) else type(exc).__name__)
+            log.error("lost the connection to the system D-Bus (%s): stopping, to be started afresh", reason)
         else:
             if self._stop.is_set():
                 return
-            log.error("the system D-Bus closed the connection")
+            log.error("the system D-Bus closed the connection: stopping, to be started afresh")
         self._bus_lost = True
         self._stop.set()
 
@@ -247,6 +262,9 @@ class Daemon:
             if self.service.slept_since_last_event():
                 log.info("clock jump detected: the machine was suspended")
                 self._spawn(self.service.handle_event("resume"))
+            else:
+                # A suspend or shutdown that was handled long ago, and here we still are.
+                self.service.check_still_up()
 
     async def _orphan_check(self) -> None:
         """Some minutes after start-up: was the Decky plugin removed while nobody checked?

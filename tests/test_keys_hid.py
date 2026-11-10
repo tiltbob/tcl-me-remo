@@ -45,6 +45,22 @@ def test_discrete_power_reports():
     assert hid.release_report(hid.REPORT_ID_SYSTEM) == b"\x00"
 
 
+def test_a_power_toggle_is_recognised_by_its_usage_however_it_is_spelled():
+    # Every usage that reaches Android as KEYCODE_POWER, named or raw, in any spelling.
+    for spec in ("POWER", "power", "S:81", "s:0x81", "C:0030", "c:30", "K:66", "C:019E", keys.resolve("POWER")):
+        assert keys.is_power_toggle(spec), spec
+        assert keys.power_effect(spec) == "unknown", spec
+    for spec in ("WAKE", "SLEEP", "S:83", "S:82", "C:0032", "C:0031", "K:65", "HOME", "", "no such key"):
+        assert not keys.is_power_toggle(spec), spec
+    # The discrete keys say which way they switch; System Sleep is LOCK on Android 16.
+    assert [keys.power_effect(spec) for spec in ("WAKE", "S:83", "SLEEP", "c:32", "S:82")] == [
+        "on", "on", "off", "off", "unknown",
+    ]  # fmt: skip
+    assert [keys.power_effect(spec) for spec in ("HOME", "K:3C", "no such key")] == ["", "", ""]
+    # Raw specs keep their spelling: saved macros and settings are not rewritten to names.
+    assert keys.resolve("S:81").spec == "S:81" and keys.resolve("c:30").spec == "C:0030"
+
+
 def test_keyboard_and_consumer_reports():
     assert hid.press_report(keys.resolve("DOWN")) == (hid.REPORT_ID_CONSUMER, b"\x43\x00\x00\x00")
     assert hid.press_report(keys.resolve("OK")) == (hid.REPORT_ID_CONSUMER, b"\x41\x00\x00\x00")

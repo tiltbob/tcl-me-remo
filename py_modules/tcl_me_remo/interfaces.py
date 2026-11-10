@@ -36,7 +36,11 @@ class BleState:
     """Snapshot of the Bluetooth remote, shown verbatim in the UI.
 
     ``subscribed`` is about the paired TV only: it is False whenever no TV is paired, even if
-    BlueZ still holds the subscription of a TV that has been forgotten since.
+    BlueZ still holds the subscription of a TV that has been forgotten since.  A TV has three
+    subscriptions, one per key report, and writes them one after another; ``subscribed`` is
+    True from the first.  Whether every key has a way to the TV is not read from it: ``ready``
+    with ``delivery`` "bluez" normally means all three are there (the exception is a TV that
+    stopped after some, with direct delivery not allowed: see :meth:`Remote.send_key`).
 
     ``error`` is one human-readable sentence, "" when there is nothing to say.  It carries,
     in this order of precedence: the last problem that stopped the TV from being reached
@@ -106,6 +110,12 @@ class Remote(Protocol):
         """Press the key, keep it down ``hold`` seconds, release it.
 
         Raises :class:`TransportError` (``not_connected``) if the link is not ready.
+
+        Returning means the key was handed to something that delivers it.  It is never handed
+        to BlueZ for a report the TV has not subscribed to (BlueZ would drop it silently): on
+        a link that is ready although the TV subscribed to some of its three key reports only
+        and direct delivery is not allowed, a key in one of the others raises
+        ``not_subscribed`` and nothing is sent, while the link stays ready for the rest.
         """
 
     async def start_pairing(self, timeout: float) -> None:

@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -39,7 +40,12 @@ SERVICE = "tcl-me-remo.service"
 SLEEP_HOOK = "tcl-me-remo-sleep.service"
 UNITS = (SERVICE, SLEEP_HOOK)
 MIN_PYTHON = (3, 11)
-HOOK_BUDGET = 3.5
+# Seconds the sleep hook gives "TV off".  Normally the service has dealt with the suspend
+# through logind by the time the hook runs, and the hook returns at once; this is for the
+# cases in which it is the first to report it, or the attempt may be made a second time
+# (service.py, _second_attempt_due).  With the final disconnect it must stay well inside the
+# hook's TimeoutStartSec=10, and the CLI itself waits 3 s longer than the budget.
+HOOK_BUDGET = 6
 # What "systemctl is-active" prints for a unit that runs or is on its way to running.
 RUNNING_STATES = ("active", "activating", "reloading")
 
@@ -50,8 +56,8 @@ PLUGIN_NAME = "tcl-me-remo"
 REMOVED_MARKER = "plugin-removed.json"
 #   and the links to the command that were made, so that uninstall removes exactly those.
 LINKS_RECORD = "command-links.json"
-# In the install directory: the boot in which code or units were replaced, until the service
-# has been restarted with them.
+# In the install directory: the boot in which code or units were replaced and the moment
+# within it (CLOCK_MONOTONIC, microseconds), until the service has been restarted with them.
 RESTART_PENDING = "RESTART-PENDING"
 # Seconds between "the plugin was removed" and the check whether it is really gone (Decky
 # removes a plugin and puts it back when it updates one), and how old the note must be
@@ -59,6 +65,19 @@ RESTART_PENDING = "RESTART-PENDING"
 # waits before it looks for a note that a reboot left unanswered.
 ORPHAN_CHECK_DELAY = 180
 ORPHAN_MIN_AGE = 120
+# Decky unpacks a plugin folder by folder: a plugins directory that changed within this many
+# seconds may be in the middle of that, and what is missing from it proves nothing yet.
+PLUGINS_SETTLE = 60
+# How the check runs under systemd-run: as a unit of its own, gone when it has ended, and
+# never there for good should it hang.  (main.py carries the same options.)
+ORPHAN_CHECK_OPTIONS = (
+    "--collect",
+    "--quiet",
+    "--property=RuntimeMaxSec=600",
+    "--description=tcl-me-remo: remove the service if the plugin is gone",
+)
+# More of a plugin.json than this is not read.
+MANIFEST_LIMIT = 64 * 1024
 
 # Runs this module from a given py_modules directory.  -I: no user site-packages and no
 # environment influence; it runs as root.  (main.py carries the same text.)
@@ -254,23 +273,54 @@ def _boot_id() -> str:
         return ""
 
 
+def _properties(text: str) -> dict[str, str]:
+    """What "systemctl show -p ..." printed, as a dictionary."""
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
 def _mark_restart_pending(tree: Path) -> None:
     """Note that the running service is older than what is being installed.
 
     The note names the current boot, because a reboot starts the service with the new files
-    just as a restart does; a note from an earlier boot means nothing.
+    just as a restart does; a note from an earlier boot means nothing.  It also names the
+    moment, on the clock systemd uses for a service's start time: a service that was started
+    after it (the panel's "Restart service", systemd after a crash) runs the new files too.
     """
-    (tree / RESTART_PENDING).write_text(_boot_id() + "\n", encoding="ascii")
+    moment = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+    (tree / RESTART_PENDING).write_text(f"{_boot_id()} {moment}\n", encoding="ascii")
 
 
-def _restart_pending(target: Path | None) -> bool:
-    """True if code or units were replaced in this boot and the service was not restarted since."""
+def _restart_pending(target: Path | None, run: Run) -> bool:
+    """True if code or units were replaced in this boot and the service was not restarted since.
+
+    Asks systemd only when there is a note from this boot, which is rare.  Whatever cannot
+    be found out counts as "not restarted": one restart too many is the smaller mistake.
+    """
     if target is None:
         return False
     try:
-        return (target / RESTART_PENDING).read_text(encoding="ascii").strip() == _boot_id()
+        boot, _, moment = (target / RESTART_PENDING).read_text(encoding="ascii").strip().partition(" ")
     except (OSError, ValueError):
         return False
+    if boot != _boot_id():
+        return False
+    shown = _properties(
+        run(["systemctl", "show", "-p", "NeedDaemonReload", "-p", "ExecMainStartTimestampMonotonic", SERVICE], 5.0)[1]
+    )
+    if shown.get("NeedDaemonReload") != "no":
+        return True  # systemd has not even read the unit that was written (or cannot be asked)
+    try:
+        return int(shown["ExecMainStartTimestampMonotonic"]) <= int(moment)
+    except (KeyError, ValueError):
+        return True
+
+
+def _mark_again(target: Path) -> None:
+    """Move the note's moment forward to now; if that fails, the earlier one stands."""
+    try:
+        _mark_restart_pending(target)
+    except OSError:
+        pass
 
 
 def _own_by_root(tree: Path) -> None:
@@ -323,6 +373,7 @@ def _copy_code(source: Path, target: Path, stamp: str) -> None:
     if target.exists():
         os.replace(target, retired)
     os.replace(staging, target)
+    _mark_again(target)  # only a service started from here on has the new files
     shutil.rmtree(retired, ignore_errors=True)
 
 
@@ -508,9 +559,37 @@ def _remove_links(layout: Layout, log: list[str]) -> None:
         pass
 
 
+def _start_trouble(run: Run) -> str:
+    """For a unit that "is-active" calls "activating": what is wrong if it is not simply starting.
+
+    systemd calls a service "activating" while it starts, and also while it waits to start a
+    service again that has failed (Restart=on-failure).  One that fails at every start is
+    therefore "activating" nearly all the time, and never "failed".
+    """
+    shown = _properties(run(["systemctl", "show", "-p", "SubState", "-p", "NRestarts", SERVICE], 5.0)[1])
+    try:
+        restarts = int(shown.get("NRestarts", "0"))
+    except ValueError:
+        restarts = 0
+    # NRestarts counts the restarts that were begun; in "auto-restart" one more is due.
+    failures = restarts + shown.get("SubState", "").startswith("auto-restart")
+    if failures >= 2:
+        return (
+            f"the service keeps failing (systemd has had to start it again {failures} times);"
+            " to see why: journalctl -b -u tcl-me-remo"
+        )
+    if failures:
+        return "the service failed and systemd is starting it again; if this goes on, see: journalctl -b -u tcl-me-remo"
+    return ""
+
+
 def info(layout: Layout | None = None, run: Run = run_command, *, source: Path | None = None) -> dict[str, Any]:
     """Describe what is installed.  Never raises."""
-    layout = layout or Layout()
+    return _describe(layout or Layout(), run, source)[0]
+
+
+def _describe(layout: Layout, run: Run, source: Path | None) -> tuple[dict[str, Any], str]:
+    """What ``info()`` returns, and separately the trouble the service has starting, if any."""
     source = source or source_root()
     stamp = installed_stamp(layout)
     try:
@@ -524,11 +603,12 @@ def info(layout: Layout | None = None, run: Run = run_command, *, source: Path |
     enabled = run(["systemctl", "is-enabled", SERVICE], 5.0)[1].strip()
     hook_enabled = run(["systemctl", "is-enabled", SLEEP_HOOK], 5.0)[1].strip()
     installed = target is not None and units_present
-    restart_pending = installed and _restart_pending(target)
+    restart_pending = installed and _restart_pending(target, run)
+    trouble = _start_trouble(run) if installed and active == "activating" else ""
     if target is not None and not units_present:
         problems.append("the service files are in place but the systemd units are missing (an OS update?)")
     if installed and active == "activating":
-        problems.append("the service is still starting")
+        problems.append(trouble or "the service is still starting")
     elif installed and active != "active":
         problems.append(f"the service is {active or 'not running'}")
     elif restart_pending:
@@ -540,7 +620,7 @@ def info(layout: Layout | None = None, run: Run = run_command, *, source: Path |
         problems.append("the service is not enabled, so it will not start at boot")
     if installed and hook_enabled != "enabled":
         problems.append("the sleep hook is not enabled")
-    return {
+    state = {
         "installed": installed,
         "active": active == "active",
         "enabled": enabled == "enabled",
@@ -552,6 +632,7 @@ def info(layout: Layout | None = None, run: Run = run_command, *, source: Path |
         "install_dir": str(target) if target else "",
         "problems": problems,
     }
+    return state, trouble
 
 
 def install(
@@ -575,7 +656,7 @@ def install(
 
     target = _pick_target(layout)
     # An earlier install may have replaced code or units and ended before its restart.
-    unfinished = _restart_pending(target)
+    unfinished = _restart_pending(target, run)
     stamp = bundled_stamp(source)
     code_changed = installed_stamp(layout) != stamp or not (target / "bin" / "tcl-me-remo").is_file()
     if code_changed:
@@ -608,6 +689,7 @@ def install(
         raise InstallError(f"could not write the systemd units: {exc}") from None
     if units_changed or unfinished:  # the earlier install may have ended before its reload, too
         run(["systemctl", "daemon-reload"], 30.0)
+        _mark_again(target)  # a service started before systemd read the units does not count
 
     for unit in UNITS:
         if run(["systemctl", "is-enabled", unit], 5.0)[1].strip() != "enabled":
@@ -651,7 +733,11 @@ def install(
     _link_command(layout, target, user_home, log, notes)
     if not log:
         log.append("already up to date")
-    state = info(layout, run, source=source)
+    state, trouble = _describe(layout, run, source)
+    if trouble:
+        # Nothing here restarts a service that is being started, but "already up to date"
+        # must not be all that Repair has to say about one that fails every time.
+        notes.append(trouble)
     return {"changed": code_changed or units_changed, "restarted": restarted, "log": log + notes, **state}
 
 
@@ -700,6 +786,7 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
     # Read before anything else: these files are the only record of which bonds are ours,
     # and both the service's "forget" and the purge erase them.
     bonds = _tv_addresses(layout.state_dir) if purge else []
+    forgotten = False
     if bonds and target is not None:
         # The pairing goes with the settings.  It consists of a bond that BlueZ keeps, and
         # with the settings gone nothing would know which bond that is, while BlueZ refuses
@@ -707,6 +794,7 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
         # best (it also stops calling the TV), so ask it first, through its own command.
         code, _out = run([layout.python, "-I", str(target / "bin" / "tcl-me-remo"), "forget"], 10.0)
         if code == 0:
+            forgotten = True
             log.append("the service removed its Bluetooth pairing with the TV")
     for unit in reversed(UNITS):
         if (layout.unit_dir / unit).exists():
@@ -726,7 +814,15 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
             code, out = run(["bluetoothctl", "--timeout", "5", "remove", address], 10.0)
             if code == 0:
                 log.append(f"removed the Bluetooth pairing with {address}")
-            elif "not available" not in out:  # "Device ... not available": BlueZ has no such bond
+            elif "not available" in out:  # "Device ... not available": BlueZ has no such bond
+                continue
+            elif forgotten:
+                # The service has reported the pairing removed; this was only to make sure.
+                log.append(
+                    f"could not check that no Bluetooth pairing with {address} is left;"
+                    f" if pairing that TV fails later, run: bluetoothctl remove {address}"
+                )
+            else:
                 log.append(
                     f"could not remove the Bluetooth pairing with {address};"
                     f" before pairing that TV again, run: bluetoothctl remove {address}"
@@ -735,9 +831,13 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
     for candidate in layout.install_dirs:
         for suffix in ("", ".new", ".old"):
             path = candidate.with_name(candidate.name + suffix)
-            if path.exists():
+            if path.is_symlink():
+                path.unlink(missing_ok=True)  # somebody's link to another place: the link goes, no more
+            elif path.exists():
                 shutil.rmtree(path, ignore_errors=True)
-                log.append(f"removed {path}")
+            else:
+                continue
+            log.append(f"could not remove {path}" if os.path.lexists(path) else f"removed {path}")
     _clear_removed_marker(layout)
     if purge and layout.state_dir.exists():
         shutil.rmtree(layout.state_dir, ignore_errors=True)
@@ -749,27 +849,57 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
     return {"log": log}
 
 
-def plugin_installed(plugins_dir: Path) -> bool | None:
-    """Whether Decky has the plugin in ``plugins_dir``: True, False, or None for "cannot tell".
+def _manifest_text(path: Path) -> str | None:
+    """The text of a plugin.json; None if there is no such file.  Raises OSError if it cannot be read.
 
-    Decky knows a plugin by the name in its plugin.json and unpacks an update into whatever
-    folder the zip names, so every folder is looked at, not one fixed path.  A plugins
-    directory that is not there (the home is not mounted yet, Decky was moved or removed)
-    proves nothing, and neither does a plugin.json that cannot be read.
+    The plugins folder belongs to the user and this runs as root, unattended: something
+    that is not a regular file (a FIFO would block for good) is not opened for reading, and
+    no more than a manifest's worth is read.
     """
     try:
-        if not plugins_dir.is_absolute() or not plugins_dir.parent.is_dir() or not plugins_dir.is_dir():
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
+        data = b""
+        while len(data) < MANIFEST_LIMIT:
+            chunk = os.read(fd, MANIFEST_LIMIT - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", "replace")
+
+
+def _changed_recently(path: Path, now: float) -> bool:
+    try:
+        return 0 <= now - os.stat(path).st_mtime < PLUGINS_SETTLE
+    except OSError:
+        return False
+
+
+def _look_for_plugin(plugins_dir: Path, now: float) -> tuple[bool | None, str]:
+    """``plugin_installed()``, and for "cannot tell" the reason in words."""
+    unreadable = f"{plugins_dir} is not there or cannot be read"
+    try:
+        if not plugins_dir.is_absolute() or not plugins_dir.parent.is_dir() or not plugins_dir.is_dir():
+            return None, unreadable
+        settled = not _changed_recently(plugins_dir, now)
         folders = sorted(plugins_dir.iterdir())
     except OSError:
-        return None
+        return None, unreadable
     for folder in folders:
         try:
-            text = (folder / "plugin.json").read_text(encoding="utf-8", errors="replace")
-        except (FileNotFoundError, NotADirectoryError):
-            continue
+            text = _manifest_text(folder / "plugin.json")
         except OSError:
-            return None
+            return None, f"{folder / 'plugin.json'} cannot be read"
+        if text is None:
+            if folder.is_dir() and _changed_recently(folder, now):
+                settled = False  # possibly ours, being unpacked: the manifest is not there yet
+            continue
         try:
             manifest = json.loads(text)
             name = manifest.get("name") if isinstance(manifest, dict) else None
@@ -777,16 +907,41 @@ def plugin_installed(plugins_dir: Path) -> bool | None:
             # Possibly ours, caught half-written during an update.
             name = PLUGIN_NAME if PLUGIN_NAME in text else None
         if name == PLUGIN_NAME:
-            return True
-    return False
+            return True, ""
+    if not settled:
+        return None, f"{plugins_dir} was changed moments ago; Decky may be installing a plugin"
+    return False, ""
 
 
-def _removed_marker(layout: Layout) -> dict[str, Any] | None:
+def plugin_installed(plugins_dir: Path, *, now: float | None = None) -> bool | None:
+    """Whether Decky has the plugin in ``plugins_dir``: True, False, or None for "cannot tell".
+
+    Decky knows a plugin by the name in its plugin.json and unpacks an update into whatever
+    folder the zip names, so every folder is looked at, not one fixed path.  A plugins
+    directory that is not there (the home is not mounted yet, Decky was moved or removed)
+    proves nothing, and neither does a plugin.json that cannot be read, nor the absence of
+    the plugin from a directory that was changed a moment ago.
+    """
+    return _look_for_plugin(plugins_dir, time.time() if now is None else now)[0]
+
+
+def _removed_marker(layout: Layout) -> tuple[bool, dict[str, Any] | None]:
+    """Whether the plugin left a note that it was removed, and what the note says.
+
+    ``(True, None)`` is a note that cannot be used: unreadable, or without the absolute path
+    of a plugins directory.
+    """
+    path = layout.state_dir / REMOVED_MARKER
+    if not path.is_file():
+        return False, None
     try:
-        data = json.loads((layout.state_dir / REMOVED_MARKER).read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+        return True, None
+    where = data.get("plugins_dir") if isinstance(data, dict) else None
+    if not isinstance(where, str) or not os.path.isabs(where):
+        return True, None
+    return True, data
 
 
 def uninstall_if_orphaned(
@@ -805,24 +960,36 @@ def uninstall_if_orphaned(
     there.  Any install removes the note.
 
     Without ``plugins_dir`` the note decides where to look, and without a note nothing
-    happens.  The service is removed only when the plugins directory is there and holds no
-    plugin of ours; when that cannot be told, the note stays for the next check.
+    happens.  (The hook passes the directory only when it could not write the note.)  The
+    service is removed only when the plugins directory is there and holds no plugin of ours;
+    when that cannot be told, the note stays for the next check.
     """
     layout = layout or Layout()
+    now = time.time() if now is None else now
     if plugins_dir is None:
-        marker = _removed_marker(layout)
-        if marker is None:
+        noted, marker = _removed_marker(layout)
+        if not noted:
             return {"orphaned": False, "log": ["no removed plugin is on record; leaving the service alone"]}
+        if marker is None:
+            # Kept, it would have the service start this check after every start, for nothing.
+            _clear_removed_marker(layout)
+            return {
+                "orphaned": None,
+                "log": [
+                    f"the note that the plugin was removed ({layout.state_dir / REMOVED_MARKER}) cannot be"
+                    " read; discarding it and leaving the service alone (if the plugin is gone, remove the"
+                    " service with: tcl-me-remo uninstall)"
+                ],
+            }
         written = marker.get("time")
-        age = (time.time() if now is None else now) - (written if isinstance(written, (int, float)) else 0)
+        age = now - (written if isinstance(written, (int, float)) else 0)
         if 0 <= age < ORPHAN_MIN_AGE:
             # Decky may be in the middle of an update: the old folder is gone, the new one
             # not there yet.  The timer set together with this note comes back later.
             return {"orphaned": None, "log": ["the plugin was removed moments ago; a later check decides"]}
-        plugins_dir = Path(str(marker.get("plugins_dir") or ""))
-    present = plugin_installed(plugins_dir)
+        plugins_dir = Path(marker["plugins_dir"])
+    present, why = _look_for_plugin(plugins_dir, now)
     if present is None:
-        why = f"{plugins_dir} is not there or cannot be read"
         return {
             "orphaned": None,
             "log": [f"cannot tell whether the plugin is still installed ({why}); leaving the service alone"],
@@ -849,13 +1016,7 @@ def orphan_check_command(state_dir: Path) -> list[str] | None:
     """
     if not (state_dir / REMOVED_MARKER).is_file():
         return None
-    return [
-        "systemd-run",
-        "--collect",
-        "--quiet",
-        "--description=tcl-me-remo: remove the service if the plugin is gone",
-        *self_command("uninstall-if-orphaned"),
-    ]
+    return ["systemd-run", *ORPHAN_CHECK_OPTIONS, *self_command("uninstall-if-orphaned")]
 
 
 def _spawn(argv: list[str]) -> int:
@@ -917,7 +1078,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("uninstall", help="stop and remove the service")
     p.add_argument("--purge", action="store_true", help="also delete settings and state")
     sub.add_parser("status", help="show what is installed")
-    sub.add_parser("uninstall-if-orphaned", help=argparse.SUPPRESS)
+    p = sub.add_parser("uninstall-if-orphaned", help=argparse.SUPPRESS)
+    p.add_argument("--plugins-dir", type=Path, help="where to look when there is no note from the plugin")
     args = parser.parse_args(argv)
 
     def emit(result: dict[str, Any], code: int) -> int:
@@ -935,7 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "uninstall":
             result = uninstall(purge=args.purge)
         elif args.command == "uninstall-if-orphaned":
-            result = uninstall_if_orphaned()
+            result = uninstall_if_orphaned(args.plugins_dir)
         else:
             result = info(source=args.source)
             if not args.json:
@@ -951,7 +1113,8 @@ def main(argv: list[str] | None = None) -> int:
         for line in result.get("log", []):
             print(line)
         for problem in result.get("problems", []):
-            print(f"warning: {problem}")
+            if problem not in result.get("log", []):
+                print(f"warning: {problem}")
     return emit(result, 0)
 
 

@@ -4,6 +4,8 @@ import asyncio
 import importlib
 import json
 import logging
+import os
+import stat
 import sys
 import time
 import types
@@ -32,6 +34,7 @@ def backend(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "SYSTEM_PYTHON", sys.executable)
     monkeypatch.setattr(module, "SOCKET_PATH", str(tmp_path / "control.sock"))
     monkeypatch.setattr(module, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(module, "INSTALLED_MODULES", (str(tmp_path / "opt" / "py_modules"), str(tmp_path / "app")))
     yield module
     sys.modules.pop("main", None)
 
@@ -140,6 +143,11 @@ async def test_installing_is_reported_and_concurrent_requests_share_one_install(
     assert len(runs) == 2
 
 
+def _service_installed(tmp_path):
+    (tmp_path / "state").mkdir()
+    (tmp_path / "opt" / "py_modules" / "tcl_me_remo").mkdir(parents=True)
+
+
 async def test_uninstall_hook_leaves_a_note_and_schedules_a_check(backend, monkeypatch, tmp_path):
     commands = []
 
@@ -149,7 +157,7 @@ async def test_uninstall_hook_leaves_a_note_and_schedules_a_check(backend, monke
         return 0, "", ""
 
     monkeypatch.setattr(backend, "_run", fake_run)
-    (tmp_path / "state").mkdir()  # the service is installed
+    _service_installed(tmp_path)
     plugin = backend.Plugin()
     await plugin._uninstall()
     # the note outlives a reboot, which the timer does not; the installed service finds it
@@ -157,10 +165,39 @@ async def test_uninstall_hook_leaves_a_note_and_schedules_a_check(backend, monke
     assert note["plugins_dir"] == str(REPO.parent)  # where Decky keeps its plugins, not this one's folder
     assert abs(note["time"] - time.time()) < 5
     (argv,) = commands
-    assert argv[0] == "systemd-run" and f"--on-active={installer.ORPHAN_CHECK_DELAY}" in argv
-    assert argv[-2:] == ["/opt/tcl-me-remo/py_modules", "uninstall-if-orphaned"]
+    assert argv[:2] == ["systemd-run", f"--on-active={installer.ORPHAN_CHECK_DELAY}"]
+    # the note decides, so that an install in the meantime calls the check off
+    assert argv[-2:] == [str(tmp_path / "opt" / "py_modules"), "uninstall-if-orphaned"]
+    # the same kind of unit as the one the service starts for this
+    assert tuple(argv[2 : argv.index(sys.executable)]) == installer.ORPHAN_CHECK_OPTIONS
     # nothing was stopped or removed directly: an update must not interrupt the service
     assert not any("systemctl" in part for part in argv)
+
+
+async def test_the_note_is_on_the_disk_before_it_has_its_name(backend, monkeypatch, tmp_path):
+    # "Uninstall, then the machine goes off": a note that is renamed into place before its
+    # contents are written out can come back empty after a power cut.
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        events.append("sync " + ("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"))
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        events.append("rename")
+        return real_replace(src, dst)
+
+    async def fake_run(argv, timeout):
+        return 0, "", ""
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    _service_installed(tmp_path)
+    await backend.Plugin()._uninstall()
+    assert events == ["sync file", "rename", "sync directory"]
+    assert os.listdir(tmp_path / "state") == [installer.REMOVED_MARKER]
 
 
 async def test_uninstall_hook_does_nothing_without_an_installed_service(backend, monkeypatch, tmp_path):
@@ -170,6 +207,10 @@ async def test_uninstall_hook_does_nothing_without_an_installed_service(backend,
     monkeypatch.setattr(backend, "_run", fake_run)
     await backend.Plugin()._uninstall()
     assert not (tmp_path / "state").exists()  # and no state directory is made for the note
+    # settings that were kept when the service was removed are not a service either
+    (tmp_path / "state").mkdir()
+    await backend.Plugin()._uninstall()
+    assert os.listdir(tmp_path / "state") == []
 
 
 async def test_uninstall_hook_survives_a_failing_systemd_run(backend, monkeypatch, tmp_path):
@@ -177,9 +218,35 @@ async def test_uninstall_hook_survives_a_failing_systemd_run(backend, monkeypatc
         return 1, "", "Failed to connect to bus"
 
     monkeypatch.setattr(backend, "_run", fake_run)
-    (tmp_path / "state").mkdir()
+    _service_installed(tmp_path)
     await backend.Plugin()._uninstall()
     assert (tmp_path / "state" / installer.REMOVED_MARKER).exists()  # the service checks after its next start
+
+
+async def test_the_check_is_scheduled_even_if_the_note_cannot_be_written(backend, monkeypatch, tmp_path, caplog):
+    commands = []
+
+    async def fake_run(argv, timeout):
+        commands.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    _service_installed(tmp_path)
+    # as a full or read-only /var would: the note's temporary file cannot be made
+    (tmp_path / "state" / (installer.REMOVED_MARKER + ".tmp")).mkdir()
+    with caplog.at_level(logging.WARNING, logger="decky-test"):
+        await backend.Plugin()._uninstall()
+    assert not (tmp_path / "state" / installer.REMOVED_MARKER).exists()
+    assert "could not note the removal" in caplog.text
+    # then the timer is all there is, and it is told where to look
+    (argv,) = commands
+    assert argv[-3:] == ["uninstall-if-orphaned", "--plugins-dir", str(REPO.parent)]
+    # ... in words the installer understands
+    arguments = argv[argv.index("uninstall-if-orphaned") :]
+    seen = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(installer, "uninstall_if_orphaned", lambda where=None: seen.append(where) or {"log": []})
+    assert installer.main(arguments) == 0 and seen == [REPO.parent]
 
 
 def test_backend_and_installer_agree(backend):
@@ -189,6 +256,7 @@ def test_backend_and_installer_agree(backend):
     assert fresh.STATE_DIR == str(installer.Layout().state_dir)
     assert fresh.REMOVED_MARKER == installer.REMOVED_MARKER
     assert fresh.ORPHAN_CHECK_DELAY == installer.ORPHAN_CHECK_DELAY
+    assert fresh.ORPHAN_CHECK_OPTIONS == installer.ORPHAN_CHECK_OPTIONS
     assert fresh.INSTALLER_SNIPPET == installer.INSTALLER_SNIPPET
     assert fresh.SOCKET_PATH == "/run/tcl-me-remo/control.sock"
     assert fresh.INSTALLED_MODULES == tuple(str(path / "py_modules") for path in installer.Layout().install_dirs)

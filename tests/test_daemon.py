@@ -1,12 +1,17 @@
 import asyncio
+import contextlib
+import gc
 import json
+import logging
 
 import pytest
 from fake_logind import FakeLogind, eventually
 from fakes import FakeRemote
 
 from tcl_me_remo import config as C
-from tcl_me_remo import installer, ipc
+from tcl_me_remo import daemon as daemon_module
+from tcl_me_remo import dbus, installer, ipc
+from tcl_me_remo import service as service_module
 from tcl_me_remo.daemon import Daemon
 from tcl_me_remo.service import Phase
 
@@ -40,7 +45,8 @@ class Rig:
         C.save(cfg, self.config_path)
 
     async def start(self):
-        async def make_remote(_bus, _cfg):
+        async def make_remote(bus, _cfg):
+            self.bus = bus  # the service's own connection to the (private) system bus
             return self.remote
 
         async def shutdown_kind():
@@ -230,13 +236,154 @@ async def test_damaged_config_still_starts(rig):
 
 async def test_losing_the_system_bus_ends_the_service_with_an_error(rig, kill_private_bus):
     # systemd restarts on failure; a process that silently lost BlueZ and logind is useless.
+    stop_errors = []
+
+    class Remote(FakeRemote):
+        async def stop(self):
+            # Like the real transport: it takes its objects off the bus on the way out,
+            # best effort, whatever state the bus is in.
+            try:
+                await dbus.call(rig.bus, "org.bluez", "/org/bluez/hci0", "org.bluez.GattManager1", "X", timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                stop_errors.append(exc)
+
+    class Records(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    rig.remote = Remote()
     rig.uptime = 5000.0
     await rig.start()
+    seen = Records()
+    logging.getLogger().addHandler(seen)  # after the start: the service sets logging up afresh
+    try:
+        kill_private_bus()
+        code = await asyncio.wait_for(rig.task, 10)
+        rig.task = None
+        assert code == 1
+        assert rig.remote.keys == []  # no TV action is attempted on the way out
+
+        # The exit is quiet: one line that says what happened.  A call on the dead bus fails
+        # at once with an OSError, and leaves nothing behind for the garbage collector to
+        # report as "Future exception was never retrieved" with a traceback.
+        assert len(stop_errors) == 1 and isinstance(stop_errors[0], OSError)
+        gc.collect()
+        await asyncio.sleep(0)
+        loud = [record.getMessage() for record in seen.records if record.levelno >= logging.WARNING]
+        assert len(loud) == 1 and loud[0].startswith("lost the connection to the system D-Bus (the bus closed it)")
+    finally:
+        logging.getLogger().removeHandler(seen)
+        # The fake logind of this test lost its bus as well; take note of that here, or the
+        # library's "disconnected" future is reported when the test run ends.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(rig.logind.bus.wait_for_disconnect(), 5)
+
+
+async def test_calls_on_a_lost_bus_fail_at_once_and_leave_no_failure_behind(private_bus, kill_private_bus):
+    """The D-Bus library keeps the failure of a write in a future nobody looks at; it used to
+    come back as "Future exception was never retrieved", with a traceback, when the service
+    exited after losing the bus."""
+    loop = asyncio.get_running_loop()
+
+    def unseen_failures():
+        # What asyncio will report when the garbage collector gets to them: futures of this
+        # loop that hold an exception nobody has asked for.
+        gc.collect()
+        return [
+            future
+            for future in gc.get_objects()
+            if isinstance(future, asyncio.Future)
+            and future.get_loop() is loop
+            and future.done()
+            and not future.cancelled()
+            and future._log_traceback
+        ]
+
+    bus = await dbus.connect_system_bus()
+    name_of = (bus, dbus.DBUS_NAME, dbus.DBUS_PATH, dbus.DBUS_NAME, "GetNameOwner", "s", [dbus.DBUS_NAME])
+    assert await dbus.call(*name_of) == [dbus.DBUS_NAME]
+
     kill_private_bus()
-    code = await asyncio.wait_for(rig.task, 10)
-    rig.task = None
-    assert code == 1
-    assert rig.remote.keys == []  # no TV action is attempted on the way out
+    # Our side has not noticed yet: this write is what finds out.
+    with pytest.raises(OSError):
+        await dbus.call(*name_of, timeout=30)
+    with pytest.raises(Exception):  # noqa: B017 - the library says how the connection ended, in its own words
+        await asyncio.wait_for(bus.wait_for_disconnect(), 10)
+    # And once it is known to be gone (what the clean-up on the way out runs into).
+    with pytest.raises(OSError):
+        await dbus.call(*name_of, timeout=30)
+    await asyncio.sleep(0)
+    assert unseen_failures() == []
+
+
+async def test_a_suspend_right_behind_a_resume_is_handled_after_it(rig):
+    """The machine wakes and is sent back to sleep at once.  Reporting the resume takes a
+    round trip to logind first; the suspend must not overtake it, or "TV on" is sent when
+    the "TV off" is through and the machine asleep."""
+    rig.uptime = 5000.0
+    await rig.start()
+    service = rig.daemon.service
+    offset = {"value": service._sleep_offset()}
+    service._sleep_offset = lambda: offset["value"]
+    service._offset_seen = offset["value"]
+    rig.remote.state.connected = rig.remote.state.ready = True
+    rig.logind.prepare_for_sleep(True)
+    await eventually(lambda: rig.logind.held("sleep") == 0)
+    assert rig.remote.key_names() == ["SLEEP"]
+
+    offset["value"] += 100.0  # it slept
+    rig.logind.prepare_for_sleep(False)
+    rig.logind.prepare_for_sleep(True)
+    await eventually(lambda: rig.remote.key_names().count("SLEEP") == 2)
+    await eventually(lambda: service.phase == Phase.DOWN and rig.logind.held("sleep") == 0)
+    await asyncio.sleep(0.5)  # nothing follows
+    assert rig.remote.key_names()[-1] == "SLEEP" and service.phase == Phase.DOWN
+    assert (await rig.call("status"))["busy"] == ""
+
+
+@pytest.mark.parametrize("by_design", [True, False])
+async def test_the_stop_signal_tries_tv_off_again_when_the_link_was_down_by_design(rig, by_design):
+    """logind's route had three seconds for a TV that had to be called first.  When systemd
+    then stops the service there is more time, but it is only worth taking if the link was
+    down because the settings have it down."""
+    cfg, _ = C.load(rig.config_path)
+    patch = {"bluetooth": {"off_connect_timeout": 0.3, "reconnect_on_drop": not by_design}}
+    C.save(C.apply_patch(cfg, patch), rig.config_path)
+    rig.remote = FakeRemote(connect_after=None)
+    rig.uptime = 5000.0
+    await rig.start()
+    rig.logind.prepare_for_shutdown(True, "power-off")
+    await eventually(lambda: rig.logind.held("shutdown") == 0)
+    record = (await rig.call("status"))["last_action"]
+    assert record["trigger"] == "shutdown" and not record["ok"] and rig.remote.keys == []
+
+    rig.remote.connect_after = 0.0  # the TV would answer now
+    rig.kind = "shutdown"
+    assert await rig.stop() == 0
+    if by_design:
+        assert rig.remote.key_names() == ["SLEEP"]
+        assert rig.remote.ensure_calls == [0.3, pytest.approx(daemon_module.STOP_BUDGET - 0.08 - 0.4 - 0.1)]
+    else:
+        assert rig.remote.keys == [] and rig.remote.ensure_calls == [0.3]
+
+
+async def test_a_down_event_the_machine_did_not_follow_is_forgotten_after_a_while(rig, monkeypatch):
+    """"tcl-me-remo event suspend" typed by hand is a real event to the service.  The next
+    genuine suspend must not be taken for its duplicate for ever."""
+    monkeypatch.setattr(service_module, "STALE_DOWN_SECONDS", 0.5)
+    rig.uptime = 5000.0
+    await rig.start()
+    rig.remote.state.connected = rig.remote.state.ready = True
+    assert (await rig.call("event", {"name": "suspend"}))["ok"]
+    assert rig.remote.key_names() == ["SLEEP"]
+    await eventually(lambda: rig.daemon.service.phase == Phase.RUNNING)  # the watchdog saw to it
+    assert rig.remote.resumes >= 1  # and the link the down action closed may come back
+    rig.logind.prepare_for_sleep(True)
+    await eventually(lambda: rig.remote.key_names() == ["SLEEP", "SLEEP"])
 
 
 async def test_a_removed_plugin_is_looked_into_some_time_after_start(rig):

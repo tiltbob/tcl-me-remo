@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -99,7 +100,8 @@ def test_fresh_install_lays_everything_out(env, tmp_path):
     assert f"Environment=TCL_ME_REMO_CONFIG={layout.state_dir}/config.json" in service
     hook = (layout.unit_dir / SLEEP_HOOK).read_text()
     assert "Before=sleep.target" in hook and "WantedBy=sleep.target" in hook
-    assert "event suspend --budget 3.5" in hook and "event resume --no-wait" in hook
+    assert "event suspend --budget 6\n" in hook and "event resume --no-wait" in hook
+    assert "TimeoutStartSec=10" in hook and "TimeoutStopSec=20" in service
 
     assert systemd.enabled == {SERVICE, SLEEP_HOOK}
     assert systemd.active == {SERVICE}
@@ -193,6 +195,50 @@ def test_a_service_that_is_still_starting_is_left_alone(tmp_path):
     assert result["problems"] == ["the service is still starting"]
 
 
+class CrashLoop(StartingSystemd):
+    """A unit that fails at every start: "activating" to is-active, between attempts too."""
+
+    sub_state, restarts = "auto-restart", 7
+
+    def __call__(self, argv, timeout):
+        if argv[:2] == ["systemctl", "show"] and "SubState" in argv:
+            self.calls.append(list(argv))
+            return 0, f"NRestarts={self.restarts}\nSubState={self.sub_state}\n"
+        return super().__call__(argv, timeout)
+
+
+def test_a_service_that_fails_at_every_start_is_not_called_starting(tmp_path):
+    # With Restart=on-failure systemd never calls such a unit "failed": it is "activating"
+    # while it waits for the next attempt.  Still nothing to restart, but the one place that
+    # tells the user the service cannot start must not read "already up to date".
+    layout, systemd = _layout(tmp_path), CrashLoop()
+    installer.install(layout, systemd, source=REPO)
+    systemd.calls.clear()
+    systemd.starting = True
+    result = installer.install(layout, systemd, source=REPO)
+    assert systemd.count("restart") == 0 and systemd.count("start") == 0
+    (trouble,) = result["problems"]
+    assert "keeps failing" in trouble and "8 times" in trouble and "journalctl -b -u tcl-me-remo" in trouble
+    assert result["log"] == ["already up to date", trouble] and result["active"] is False
+    assert installer.info(layout, systemd, source=REPO)["problems"] == [trouble]
+    # the first restart after a failure is under way: not "keeps failing" yet, but not just "starting"
+    systemd.sub_state, systemd.restarts = "start", 1
+    (trouble,) = installer.info(layout, systemd, source=REPO)["problems"]
+    assert trouble.startswith("the service failed and systemd is starting it again")
+    # an ordinary start
+    systemd.restarts = 0
+    assert installer.info(layout, systemd, source=REPO)["problems"] == ["the service is still starting"]
+    assert installer.install(layout, systemd, source=REPO)["log"] == ["already up to date"]
+
+
+def test_the_command_line_does_not_say_a_thing_twice(monkeypatch, capsys):
+    result = {"log": ["already up to date", "it keeps failing"], "problems": ["it keeps failing", "not enabled"]}
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(installer, "install", lambda **_kwargs: result)
+    assert installer.main(["install"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["already up to date", "it keeps failing", "warning: not enabled"]
+
+
 def test_a_state_that_could_not_be_read_does_not_cause_a_restart(tmp_path):
     class Unanswered(StartingSystemd):
         def __call__(self, argv, timeout):
@@ -226,9 +272,9 @@ class EnableFails(FakeSystemd):
         return super().__call__(argv, timeout)
 
 
-def _interrupted_update(tmp_path):
+def _interrupted_update(tmp_path, systemd=None):
     """Version 1 runs; the update to version 2 replaces the code and fails before the restart."""
-    layout, systemd = _layout(tmp_path), EnableFails()
+    layout, systemd = _layout(tmp_path), systemd or EnableFails()
     installer.install(layout, systemd, source=REPO)
     newer = _newer_release(tmp_path)
     systemd.broken = True
@@ -264,6 +310,83 @@ def test_a_reboot_also_finishes_an_interrupted_update(tmp_path, monkeypatch):
     assert installer.info(layout, systemd, source=newer)["restart_pending"] is False
     result = installer.install(layout, systemd, source=newer)
     assert result["log"] == ["already up to date"] and systemd.count("restart") == 0
+
+
+class Clocked(EnableFails):
+    """Also answers "systemctl show": when the service's process was started (on the clock
+    systemd uses) and whether the unit file changed since systemd read it."""
+
+    started, need_reload = 0, "no"
+
+    def __call__(self, argv, timeout):
+        if argv[:2] == ["systemctl", "show"] and "ExecMainStartTimestampMonotonic" in argv:
+            self.calls.append(list(argv))
+            return 0, f"ExecMainStartTimestampMonotonic={self.started}\nNeedDaemonReload={self.need_reload}\n"
+        if argv[:2] == ["systemctl", "daemon-reload"]:
+            self.need_reload = "no"
+        if argv[:2] == ["systemctl", "restart"] or (argv[:2] == ["systemctl", "start"] and SERVICE not in self.active):
+            self.started = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+        return super().__call__(argv, timeout)
+
+
+def test_a_restart_by_other_means_finishes_an_interrupted_update(tmp_path):
+    layout, systemd, newer = _interrupted_update(tmp_path, Clocked())
+    assert installer.info(layout, systemd, source=newer)["restart_pending"] is True
+    # the panel's "Restart service", or systemd after a crash: the new code runs now
+    systemd(["systemctl", "restart", SERVICE], 60.0)
+    restarts = systemd.count("restart")
+    state = installer.info(layout, systemd, source=newer)
+    assert state["restart_pending"] is False and state["problems"] == []
+    result = installer.install(layout, systemd, source=newer)
+    assert result["log"] == ["already up to date"] and not result["restarted"]
+    assert systemd.count("restart") == restarts  # a second restart would only cost the TV's subscription
+    assert not (layout.install_dirs[0] / installer.RESTART_PENDING).exists()
+
+
+def test_a_restart_before_systemd_read_the_new_unit_does_not_finish_the_update(tmp_path):
+    layout, systemd, newer = _interrupted_update(tmp_path, Clocked())
+    systemd(["systemctl", "restart", SERVICE], 60.0)
+    systemd.need_reload = "yes"  # what systemd says of a unit file that is newer than what it has loaded
+    assert installer.info(layout, systemd, source=newer)["restart_pending"] is True
+    systemd.calls.clear()
+    assert installer.install(layout, systemd, source=newer)["log"] == ["service restarted to finish an earlier update"]
+    verbs = [call[1] for call in systemd.calls if call[0] == "systemctl"]
+    assert verbs.index("daemon-reload") < verbs.index("restart")
+    assert installer.install(layout, systemd, source=newer)["log"] == ["already up to date"]
+
+
+def test_a_restart_just_before_the_new_files_took_effect_does_not_count(tmp_path, monkeypatch):
+    # The note is written with the staged code and before a unit is replaced.  A service
+    # that happens to be restarted between that and the swap (or systemd's reload) still
+    # runs the old files, although it was started after the note's first moment.
+    class Unlucky(Clocked):
+        def __call__(self, argv, timeout):
+            if self.broken and argv[:2] == ["systemctl", "daemon-reload"]:
+                self.started = time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000  # restarted with the old unit
+            return super().__call__(argv, timeout)
+
+    layout, systemd = _layout(tmp_path), Unlucky()
+    installer.install(layout, systemd, source=REPO)
+    (layout.unit_dir / SERVICE).write_text("[Service]\nExecStart=/bin/false\n")
+    systemd.broken = True
+    with pytest.raises(InstallError, match="could not enable"):
+        installer.install(layout, systemd, source=REPO)
+    assert installer.info(layout, systemd, source=REPO)["restart_pending"] is True
+    systemd.broken = False
+    assert installer.install(layout, systemd, source=REPO)["restarted"]
+
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if str(dst).endswith(".old"):  # the new code is staged, the old about to be moved away
+            systemd(["systemctl", "restart", SERVICE], 60.0)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    systemd.broken = True
+    with pytest.raises(InstallError, match="could not enable"):
+        installer.install(layout, systemd, source=_newer_release(tmp_path))
+    assert installer.info(layout, systemd, source=REPO)["restart_pending"] is True
 
 
 def test_an_install_that_ended_before_the_reload_is_finished_with_one(tmp_path):
@@ -348,6 +471,20 @@ def test_uninstall_keeps_settings_unless_purged(env):
     assert installer.uninstall(layout, systemd, purge=True)["log"][-1].startswith("removed settings")
     assert not layout.state_dir.exists()
     assert installer.uninstall(layout, systemd)["log"] == ["nothing was installed"]
+
+
+def test_uninstall_says_removed_only_of_what_is_gone(env, tmp_path):
+    # An install directory that is a link to another place: the link is removed, and
+    # "removed" is not said of something that is still there.
+    layout, systemd = env
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "VERSION").write_text("0.0.1 x\n")
+    layout.install_dirs[0].parent.mkdir(parents=True)
+    layout.install_dirs[0].symlink_to(elsewhere)
+    log = installer.uninstall(layout, systemd)["log"]
+    assert f"removed {layout.install_dirs[0]}" in log
+    assert not os.path.lexists(layout.install_dirs[0]) and (elsewhere / "VERSION").exists()
 
 
 class Tools(FakeSystemd):
@@ -439,6 +576,20 @@ def test_purge_says_what_to_do_when_the_bond_could_not_be_removed(tmp_path):
     assert not any("Bluetooth" in line for line in installer.uninstall(layout, tools, purge=True)["log"])
 
 
+def test_purge_does_not_contradict_the_service(tmp_path):
+    # The service reported the pairing removed, and the pass that makes sure could not be
+    # made (no bluetoothctl, or bluetoothd gone): that is not "could not remove".
+    layout, tools = _layout(tmp_path), Tools(forget=0, bluetoothctl=(-1, "[Errno 2] No such file: 'bluetoothctl'"))
+    installer.install(layout, tools, source=REPO)
+    _paired(layout)
+    log = [line for line in installer.uninstall(layout, tools, purge=True)["log"] if "Bluetooth" in line]
+    assert log[0] == "the service removed its Bluetooth pairing with the TV"
+    assert len(log) == 2
+    assert log[1].startswith("could not check that no Bluetooth pairing with AA:BB:CC:DD:EE:FF is left")
+    assert log[1].endswith("run: bluetoothctl remove AA:BB:CC:DD:EE:FF")
+    assert not any("could not remove" in line for line in log)
+
+
 def test_plain_uninstall_leaves_the_pairing_alone(tmp_path):
     layout, tools = _layout(tmp_path), Tools()
     installer.install(layout, tools, source=REPO)
@@ -492,6 +643,22 @@ def test_uninstall_removes_the_links_it_made(env, tmp_path):
     assert not link.is_symlink() and f"removed {link}" in log
     assert not (layout.link_dirs[0] / "tcl-me-remo").is_symlink()
     assert not (layout.state_dir / installer.LINKS_RECORD).exists()
+
+
+def test_uninstall_leaves_links_that_no_longer_point_at_the_command(env, tmp_path):
+    # Ours when they were made and on record, then replaced by their owners: no longer ours.
+    layout, systemd = env
+    home = tmp_path / "home" / "deck"
+    home.mkdir(parents=True)
+    installer.install(layout, systemd, source=REPO, user_home=home)
+    links = [home / ".local" / "bin" / "tcl-me-remo", layout.link_dirs[0] / "tcl-me-remo"]
+    for link in links:
+        assert link.is_symlink()
+        link.unlink()
+        link.symlink_to("/usr/bin/true")
+    log = installer.uninstall(layout, systemd)["log"]
+    assert [os.readlink(link) for link in links] == ["/usr/bin/true", "/usr/bin/true"]
+    assert not any(str(link) in line for link in links for line in log)
 
 
 def test_a_read_only_link_directory_is_not_reported(env, tmp_path, monkeypatch):
@@ -555,6 +722,25 @@ def test_the_link_in_the_home_is_made_as_its_owner(user_world):
     assert not link.is_symlink()
 
 
+def test_the_link_is_made_without_roots_groups(user_world):
+    # Giving up root means its supplementary groups as well: with them the child could still
+    # write where the user cannot.  Here ~/.local can be written by one of root's groups only.
+    layout, home = user_world
+    group = USER + 1
+    local = home / ".local"
+    local.mkdir()
+    os.chown(local, 0, group)
+    os.chmod(local, 0o770)
+    before = os.getgroups()
+    os.setgroups([*before, group])
+    try:
+        result = installer.install(layout, FakeSystemd(), source=REPO, user_home=home)
+    finally:
+        os.setgroups(before)
+    assert not (local / "bin").exists()
+    assert result["log"][-1].startswith(f"could not link the command into {local / 'bin'}: ")
+
+
 def test_root_does_not_follow_a_path_the_user_controls(user_world):
     # ~/.local pointing into the install directory: root once deleted the launcher there,
     # put a link to itself in its place and gave the directory to the user.
@@ -577,12 +763,20 @@ def test_root_does_not_follow_a_path_the_user_controls(user_world):
 # ---------------------------------------------------------------------- the plugin was removed
 
 
+def _settled(*paths):
+    """Give the directories the age of something Decky is not working on at the moment."""
+    for path in paths:
+        os.utime(path, (time.time() - 600, time.time() - 600))
+
+
 def _plugins(tmp_path, *folders):
     plugins = tmp_path / "home" / "deck" / "homebrew" / "plugins"
     plugins.mkdir(parents=True, exist_ok=True)
     for folder, name in folders:
         (plugins / folder).mkdir()
         (plugins / folder / "plugin.json").write_text(json.dumps({"name": name}))
+        _settled(plugins / folder)
+    _settled(plugins)
     return plugins
 
 
@@ -645,6 +839,88 @@ def test_orphan_check_waits_while_decky_may_be_updating_the_plugin(env, tmp_path
     assert installer.ORPHAN_MIN_AGE < installer.ORPHAN_CHECK_DELAY
 
 
+def test_orphan_check_decides_on_a_note_from_the_future(env, tmp_path):
+    # The clock was ahead when the plugin was removed.  Waiting for the note to "age" could
+    # take for ever; the timer that runs the check has waited long enough by itself.
+    layout, systemd = env
+    installer.install(layout, systemd, source=REPO)
+    _note_removal(layout, _plugins(tmp_path), age=-3600)
+    assert installer.uninstall_if_orphaned(None, layout, systemd)["orphaned"] is True
+    assert not _installed(layout, systemd)
+
+
+@pytest.mark.parametrize("text", ["", "{not json", "[1, 2]", '{"time": 5}', '{"plugins_dir": "plugins"}'])
+def test_a_note_that_cannot_be_used_is_discarded(env, text):
+    # Nothing can be decided from it, and left in place it would have the service start
+    # the check after each of its starts, for good.
+    layout, systemd = env
+    installer.install(layout, systemd, source=REPO)
+    (layout.state_dir / installer.REMOVED_MARKER).write_text(text)
+    assert installer.orphan_check_command(layout.state_dir) is not None
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is None and _installed(layout, systemd)
+    assert "cannot be read" in result["log"][0] and "tcl-me-remo uninstall" in result["log"][0]
+    assert not (layout.state_dir / installer.REMOVED_MARKER).exists()
+    assert installer.orphan_check_command(layout.state_dir) is None
+
+
+def test_orphan_check_can_be_told_where_to_look(env, tmp_path, monkeypatch):
+    # The plugin's uninstall hook passes the directory when it could not write the note.
+    layout, systemd = env
+    installer.install(layout, systemd, source=REPO)
+    plugins = _plugins(tmp_path, ("tcl-me-remo", installer.PLUGIN_NAME))
+    assert installer.uninstall_if_orphaned(plugins, layout, systemd)["orphaned"] is False
+    shutil.rmtree(plugins / "tcl-me-remo")
+    _settled(plugins)
+    assert installer.uninstall_if_orphaned(plugins, layout, systemd)["orphaned"] is True
+    assert not _installed(layout, systemd)
+    # and that is what the command line hands on
+    seen = []
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(installer, "uninstall_if_orphaned", lambda where=None: seen.append(where) or {"log": []})
+    assert installer.main(["uninstall-if-orphaned", "--plugins-dir", str(plugins)]) == 0
+    assert installer.main(["uninstall-if-orphaned"]) == 0
+    assert seen == [plugins, None]
+
+
+def test_a_plugin_that_decky_is_unpacking_is_not_taken_for_gone(env, tmp_path):
+    # A reinstall caught half-way: the folder is there, its plugin.json not yet.
+    layout, systemd = env
+    installer.install(layout, systemd, source=REPO)
+    plugins = _plugins(tmp_path, ("some-other-plugin", "Other"))
+    (plugins / "tcl-me-remo").mkdir()
+    _settled(plugins)  # even if only the new folder shows it
+    _note_removal(layout, plugins, age=500)
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is None and _installed(layout, systemd)
+    assert "changed moments ago" in result["log"][0]
+    assert (layout.state_dir / installer.REMOVED_MARKER).exists()
+    # the same for a plugins directory something was just removed from or added to
+    shutil.rmtree(plugins / "tcl-me-remo")
+    assert installer.plugin_installed(plugins) is None
+    # a folder without a plugin.json that has been lying there is no plugin
+    assert installer.plugin_installed(plugins, now=time.time() + installer.PLUGINS_SETTLE) is False
+    assert installer.uninstall_if_orphaned(None, layout, systemd, now=time.time() + 600)["orphaned"] is True
+
+
+def test_the_search_for_the_plugin_cannot_be_held_up(tmp_path):
+    # The plugins folder is the user's; the check runs as root with nobody watching.
+    plugins = _plugins(tmp_path, ("some-other-plugin", "Other"))
+    for name in ("pipe", "folder", "big"):
+        (plugins / name).mkdir()
+    os.mkfifo(plugins / "pipe" / "plugin.json")  # opening it for reading waits for a writer
+    (plugins / "folder" / "plugin.json").mkdir()
+    (plugins / "big" / "plugin.json").write_text(" " * installer.MANIFEST_LIMIT + '{"name": "tcl-me-remo"}')
+    _settled(plugins, plugins / "pipe", plugins / "folder", plugins / "big")
+    answer = []
+    thread = threading.Thread(target=lambda: answer.append(installer.plugin_installed(plugins)), daemon=True)
+    thread.start()
+    thread.join(10)
+    if not answer:  # let the thread go before failing
+        os.close(os.open(plugins / "pipe" / "plugin.json", os.O_WRONLY | os.O_NONBLOCK))
+    assert answer == [False]  # none of these is a plugin's manifest, and no more than a manifest is read
+
+
 def test_an_install_cancels_the_orphan_check(env, tmp_path):
     layout, systemd = env
     installer.install(layout, systemd, source=REPO)
@@ -664,6 +940,7 @@ def test_orphan_check_command_for_the_service(env):
     argv = installer.orphan_check_command(layout.state_dir)
     assert argv[0] == "systemd-run"  # not a child of the service, which the check may stop
     assert not any(part.startswith("--on-") for part in argv)
+    assert "--property=RuntimeMaxSec=600" in argv  # and not a unit that can stay for good
     modules = str(REPO / "py_modules")
     assert argv[-6:] == [sys.executable, "-I", "-c", installer.INSTALLER_SNIPPET, modules, "uninstall-if-orphaned"]
     # the snippet runs the installer from the directory it is given

@@ -50,7 +50,24 @@ echo '{"id":1,"method":"status"}' | sudo socat - UNIX-CONNECT:/run/tcl-me-remo/c
 
 `event` with `simulate: true` runs exactly what the real event would run, without touching
 the bookkeeping that de-duplicates real events. It is what "test wake" / "test sleep" in the
-UI use.
+UI use, and the form to use by hand (`tcl-me-remo event suspend --simulate`).
+
+Without `simulate`, `event` is for the systemd units: it tells the service that the machine
+*is* booting, waking, suspending or going down, and the service believes it. After a
+`suspend`, `shutdown` or `reboot` it considers the machine down: further down events are
+duplicates and are skipped, until a `resume` arrives, the clocks show that the machine
+slept, or two minutes have passed with the service still running (it then concludes that
+the machine stayed up). A real suspend inside those two minutes would leave the TV on.
+
+`budget` (seconds) limits the attempt to turn the TV off on a down event; closing the
+Bluetooth link afterwards takes up to half a second more. Without it the attempt has 3.5 s.
+A second `suspend` or `shutdown` for the same event is normally a duplicate. It makes one
+more attempt, within its own `budget`, only when the first could not reach the TV in time
+and the Bluetooth link was down by the settings' choice (`bluetooth.reconnect_on_drop` off
+or `bluetooth.idle_disconnect_seconds` set); see [how it works](how-it-works.md#lifecycle-events).
+
+`send_key` fails with `busy` when a suspend or shutdown cuts the key short: a key that is
+being held is released so that the "TV off" key does not have to wait for it.
 
 ## Error codes
 
@@ -58,7 +75,7 @@ UI use.
 |---|---|
 | `bad_request` | Malformed request or parameter |
 | `unknown_method` | No such method |
-| `busy` | Another action is running; manual requests are not queued |
+| `busy` | Another action is running; manual requests are not queued. Also: a key was cut short because the machine is suspending or shutting down |
 | `invalid_config` | A setting was rejected; the message names it (`input.hdmi_port: must be at most 4`) |
 | `save_failed` | The setting is in effect but could not be written to disk |
 | `bad_key`, `bad_macro` | Unknown key name / invalid macro text |
@@ -95,7 +112,8 @@ always gets the trace of what was tried.
 ```
 
 `trigger` is the lifecycle event that caused the action, or `manual`. `skipped` means the
-action decided there was nothing to do (disabled, display gate closed, duplicate event) and
+action decided there was nothing to do (disabled, display gate closed, duplicate event, an
+on key that is a toggle and may not be sent automatically) and
 `detail` says why; a skipped action has `ok: true`.
 
 ## Status

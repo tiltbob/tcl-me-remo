@@ -327,6 +327,179 @@ async def test_partial_resubscription_keeps_each_report_on_the_path_that_reaches
     assert len(h.raw.packets) == 2
 
 
+async def partly_subscribed(h, **overrides):
+    """An Android 14 TV on its first link after a reboot, with the first of its three subscriptions written.
+
+    The keyboard report is subscribed; the consumer report (HOME, SLEEP) and the system control
+    report (WAKE, the first key of every boot) are not.  The test writes the rest itself.
+    """
+    remote, tv = await rebooted(h, android=14, **overrides)
+    tv.resubscribe_delay = 3600.0
+    await tv.connect()
+    await eventually(lambda: remote.state.connected, what="the link")
+    await tv.subscribe(only="c4_kbd")
+    await eventually(lambda: remote._app.reports[1].notifying, what="the first subscription")
+    assert [report.notifying for report in remote._app.reports.values()] == [True, False, False]
+    return remote, tv
+
+
+async def test_a_link_is_not_ready_through_bluez_before_every_report_is_subscribed(h):
+    """bluetoothd drops a report without a subscription, silently: "sent" would be a lie."""
+    # A wait far longer than the test: what ends the first attempt is its own budget.
+    remote, tv = await partly_subscribed(h, resubscribe_wait=30.0)
+    assert await remote.ensure_ready(0.5) is False
+    state = remote.state
+    assert state.connected and state.subscribed and not state.ready and state.delivery == ""
+    assert state.error == "the TV connected but was not ready for keys in time"
+    with pytest.raises(TransportError) as err:
+        await remote.send_key("WAKE", 0.01)
+    assert err.value.code == "not_connected"
+    assert remote.bounces == 0 and h.bluez.dropped_notifications == 0 and h.raw.packets == []
+
+    # The TV gets round to the other two: ready a moment later, not at the end of the wait.
+    await tv.subscribe()
+    started = time.monotonic()
+    assert await remote.ensure_ready(40.0) is True
+    assert time.monotonic() - started < SLOW
+    assert remote.state.delivery == "bluez" and remote.state.error == ""
+    for key in ("WAKE", "HOME", "ENTER"):
+        await remote.send_key(key, 0.01)
+    await eventually(lambda: len(tv.received) == 6)
+    assert tv.keys("bluez") == [
+        (SYSTEM, b"\x04"), (SYSTEM, b"\x00"),
+        (CONSUMER, HOME), (CONSUMER, bytes(4)),
+        (KBD, b"\x28\x00"), (KBD, bytes(2)),
+    ]  # fmt: skip
+    assert h.bluez.dropped_notifications == 0 and h.raw.packets == [] and remote.bounces == 0
+
+
+async def test_without_direct_delivery_a_key_in_an_unsubscribed_report_fails_instead_of_vanishing(h):
+    remote, tv = await partly_subscribed(h, raw_notify="off")
+    assert await remote.ensure_ready(10.0) is True  # once resubscribe_wait is over
+    state = remote.state
+    assert state.ready and state.delivery == "bluez" and state.error == ""
+    await remote.send_key("ENTER", 0.01)  # its report is subscribed
+    await eventually(lambda: len(tv.received) == 2)
+    for key in ("WAKE", "HOME"):
+        with pytest.raises(TransportError) as err:
+            await remote.send_key(key, 0.01)
+        assert err.value.code == "not_subscribed"
+        assert err.value.message.startswith(fake_bluez.remote_module.NOT_SUBSCRIBED)
+    assert remote.state.ready and remote.state.error == err.value.message
+    assert tv.received == [(KBD, b"\x28\x00", "bluez"), (KBD, bytes(2), "bluez")]
+    assert h.bluez.dropped_notifications == 0 and h.raw.packets == [] and h.raw.opened == 0
+    assert remote.bounces == 0  # nothing would use the second link
+    assert hint(h) is True  # it does renew subscriptions by itself: the next boot gives it its full time again
+
+    await tv.subscribe()  # the other two arrive after all
+    await eventually(lambda: all(report.notifying for report in remote._app.reports.values()))
+    assert remote.state.ready and remote.state.error == ""
+    await remote.send_key("HOME", 0.01)
+    await eventually(lambda: len(tv.received) == 4)
+    assert tv.received[2:] == [(CONSUMER, HOME, "bluez"), (CONSUMER, bytes(4), "bluez")]
+    assert h.bluez.dropped_notifications == 0
+
+
+async def test_allowing_direct_delivery_reaches_a_link_that_is_ready_with_some_reports_only(h):
+    remote, tv = await partly_subscribed(h, raw_notify="off")
+    assert await remote.ensure_ready(10.0) is True and remote.state.delivery == "bluez"
+    remote.apply_config(dataclasses.replace(remote._cfg, raw_notify="on"))
+    assert not remote.state.ready  # the next ensure_ready looks again
+    assert await remote.ensure_ready(10.0) is True and remote.state.delivery == "raw"
+    await remote.send_key("HOME", 0.01)
+    assert tv.keys("raw") == [(CONSUMER, HOME), (CONSUMER, bytes(4))] and h.bluez.dropped_notifications == 0
+
+
+async def test_partial_subscription_on_the_first_link_is_completed_by_direct_delivery_after_the_bounce(h, caplog):
+    caplog.set_level(logging.INFO)
+    remote, tv = await partly_subscribed(h)
+    assert await remote.ensure_ready(10.0) is True
+    assert remote.state.delivery == "raw" and remote.state.subscribed
+    # The host listens, on the link it wrote them on, to the reports whose subscription it
+    # wrote: the others can only be delivered directly on the next link.
+    assert remote.bounces == 1 and tv.connections == 3  # pairing, the first link (bounced), this one
+    assert "the TV subscribed to some key reports only" in caplog.text
+    for key in ("WAKE", "HOME", "ENTER"):
+        await remote.send_key(key, 0.01)
+    await eventually(lambda: len(tv.received) == 6)
+    assert tv.received == [
+        (SYSTEM, b"\x04", "raw"), (SYSTEM, b"\x00", "raw"),
+        (CONSUMER, HOME, "raw"), (CONSUMER, bytes(4), "raw"),
+        (KBD, b"\x28\x00", "bluez"), (KBD, bytes(2), "bluez"),
+    ]  # fmt: skip
+    assert h.bluez.dropped_notifications == 0 and tv.ignored == []
+    assert hint(h) is True  # not "a TV that never re-subscribes"
+
+
+async def test_subscriptions_cut_short_by_a_drop_are_waited_for_once_per_registration(h):
+    """The link went down between the TV's first and last write; on later links it writes nothing."""
+    remote, tv = await partly_subscribed(h)
+    await tv.drop()
+    await eventually(lambda: not remote.state.connected)
+    assert remote._resubscribe_wait() == 0.3  # the TV renews subscriptions: it is given the configured time
+
+    assert await remote.ensure_ready(10.0) is True
+    assert remote.state.delivery == "raw" and remote.bounces == 0 and tv.connections == 3
+    await remote.send_key("HOME", 0.01)
+    await remote.send_key("ENTER", 0.01)
+    await eventually(lambda: len(tv.received) == 4)
+    assert [how for _handle, _value, how in tv.received] == ["raw", "raw", "bluez", "bluez"]
+    assert h.bluez.dropped_notifications == 0
+
+    # That wait is not repeated on every link (before suspend there would be no time for it),
+    # and what is remembered about the TV across boots is left alone.
+    assert remote._resubscribe_wait() < 0.3 and hint(h) is True
+    await tv.drop()
+    await eventually(lambda: not remote.state.connected)
+    assert await remote.ensure_ready(10.0) is True and remote.state.delivery == "raw" and remote.bounces == 0
+    # A subscription that arrives after all starts the full wait for the others afresh.
+    await tv.subscribe(only="c5_consumer")
+    await eventually(lambda: remote._app.reports[2].notifying)
+    assert remote._resubscribe_wait() == 0.3
+    await remote.send_key("HOME", 0.01)
+    await eventually(lambda: len(tv.received) == 6)
+    assert tv.received[4:] == [(CONSUMER, HOME, "bluez"), (CONSUMER, bytes(4), "bluez")]
+    assert remote.state.delivery == "raw" and h.bluez.dropped_notifications == 0  # WAKE still travels directly
+
+
+async def test_background_policy_prepares_direct_delivery_for_a_partly_subscribed_tv_too(h):
+    # Time enough for the one write below to arrive before the wait for it is over, on any machine.
+    remote, tv = await h.paired_remote(android=14, reconnect_on_drop=True, resubscribe_wait=SLOW)
+    tv.resubscribe_delay = 3600.0
+    await h.bluez.restart()
+    await eventually(lambda: tv.connections == 2 and remote.state.connected, what="the TV to be called and to connect")
+    await tv.subscribe(only="c4_kbd")
+    await eventually(
+        lambda: remote.bounces == 1 and tv.connections == 3 and remote.state.connected,
+        timeout=SLOW + 3.0,
+        what="the bounce",
+    )
+    await asyncio.sleep(0.15)
+    assert remote.bounces == 1 and tv.connections == 3 and not remote.state.ready
+    assert await remote.ensure_ready(3.0) is True and remote.state.delivery == "raw" and remote.bounces == 1
+    await remote.send_key("WAKE", 0.01)
+    assert tv.keys("raw") == [(SYSTEM, b"\x04"), (SYSTEM, b"\x00")] and h.bluez.dropped_notifications == 0
+
+
+async def test_losing_one_subscription_while_ready_moves_that_report_to_direct_delivery(h):
+    remote, tv = await h.paired_remote(android=12)
+    assert await remote.ensure_ready(2.0) and remote.state.delivery == "bluez"
+    await tv.unsubscribe(only="c5_consumer")
+    await eventually(lambda: not remote._app.reports[2].notifying)
+    state = remote.state
+    assert state.connected and state.subscribed and not state.ready
+    with pytest.raises(TransportError) as err:
+        await remote.send_key("HOME", 0.01)
+    assert err.value.code == "not_connected" and h.bluez.dropped_notifications == 0
+
+    assert await remote.ensure_ready(5.0) is True and remote.state.delivery == "raw"
+    await remote.send_key("HOME", 0.01)
+    await remote.send_key("ENTER", 0.01)
+    await eventually(lambda: len(tv.received) == 4)
+    assert [how for _handle, _value, how in tv.received] == ["raw", "raw", "bluez", "bluez"]
+    assert h.bluez.dropped_notifications == 0
+
+
 async def test_losing_the_subscription_while_ready_is_not_papered_over(h):
     """Without it bluetoothd drops every report; "ready" would send keys into the void."""
     remote, tv = await h.paired_remote(android=12)
