@@ -42,12 +42,13 @@ def test_dev_setup_help_prints_the_header_and_nothing_else():
     out = subprocess.run(["bash", str(script), "--help"], capture_output=True, text=True, timeout=30)
     assert out.returncode == 0
     lines = out.stdout.splitlines()
-    assert lines[0].startswith("Prepare a SteamOS") and lines[-1].lstrip().startswith("6. tells you how to start")
+    assert lines[0].startswith("Prepare a SteamOS") and lines[-1].lstrip().startswith("7. tells you how to start")
     assert "set -euo pipefail" not in out.stdout and not any(line.startswith("#") for line in lines)
     # every numbered step of the script is announced in the header (the sudo check was missing)
     announced = [line.strip() for line in script.read_text().splitlines() if line.strip().startswith('say "')]
-    assert len(announced) == 6 and announced[4] == 'say "5. sudo"'
+    assert len(announced) == 7 and announced[4] == 'say "5. sudo"' and announced[5] == 'say "6. test tools"'
     assert "5. checks whether sudo can work" in out.stdout
+    assert "6. makes a private Python environment" in out.stdout
 
 
 def test_dev_setup_help_works_when_piped_into_bash():

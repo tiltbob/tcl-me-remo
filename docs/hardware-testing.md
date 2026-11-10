@@ -406,9 +406,13 @@ not, set `bluetooth.idle_disconnect_seconds` to `30` and repeat.
 ```sh
 tcl-me-remo wifi discover
 tcl-me-remo wifi pair <tv-ip>        # type the code the TV shows
-tcl-me-remo config input.method wifi
-tcl-me-remo input
+tcl-me-remo input --via wifi         # with the TV showing some other input
 ```
+
+`--via wifi` tries the Wi-Fi route alone, whatever `input.method` says, so nothing else is
+sent if it fails. The service reports `ok` as soon as the TV accepted the request; the
+protocol has no answer that says the input really changed, so watch the TV. Only when it
+works: `tcl-me-remo config input.method wifi`.
 
 If the input does not change, find the TV's input ids
 (`adb shell dumpsys tv_input | grep -i inputId`), try the other built-in link sets
@@ -419,22 +423,81 @@ Also check whether the assist answers while the TV is in standby (T4's time poin
 
 ## T11. Wake beacon (only if T4 shows the TV cannot be woken)
 
-MediaTek-based sets listen, while suspended, for an advertisement their own remote sends.
-Capture it: put the TV in the standby state that would not wake, cover the remote's infrared
-LED with tape, then
+MediaTek's reference design lets a suspended set wake on an advertisement that its own
+remote sends. Whether TCL's sets and remotes do this is not known.
+
+First try the built-in pattern, which is MediaTek's default with the TV's address in it:
 
 ```sh
-sudo btmon | grep -B2 -A12 "LE Advertising Report"
+tcl-me-remo config bluetooth.wake_beacon mediatek
 ```
 
-and press Power on the remote. Record the advertising reports that appear only when the
-button is pressed: the event type, the address, and the full data, especially any
-"Company" / manufacturer-specific field. If the TV wakes with the infrared LED covered, the
-remote woke it over Bluetooth and that data is the pattern to replay.
+Put the TV in the standby state that would not wake and repeat T4 (`tcl-me-remo on`). Record
+whether it wakes. If it does not, capture what the TV's own remote sends. Cover the remote's
+infrared LED with tape, then in one terminal start a scan (btmon only listens; without a
+scan nothing is reported) and in another record everything:
+
+```sh
+bluetoothctl scan le                 # terminal 1; leave it running
+sudo btmon -w /tmp/t11.btsnoop       # terminal 2
+```
+
+Press Power on the remote, wait ten seconds, stop both, and look through the trace:
+
+```sh
+btmon -r /tmp/t11.btsnoop | grep -B4 -A14 "Advertising Report" | less
+```
+
+("Advertising Report" matches both the old and the extended form.) Record the reports that
+appear only when the button is pressed: the event type, the address, and the full data,
+especially any "Company" / manufacturer-specific field. If the TV wakes with the infrared
+LED covered, the remote woke it over Bluetooth. Keep the `.btsnoop` file with the results.
+Seeing nothing is not proof of the opposite: a remote that advertises directly at the TV
+is filtered out by this machine's controller.
+
+To replay a captured pattern, give its manufacturer data as hex in the order it is sent,
+company id first. For a btmon line `Company: MediaTek, Inc. (70)` followed by
+`Data: 00ffeeddccbbaa0000000043524b544d` that is `4600` (70 as two bytes, low byte first)
+followed by the data:
+
+```sh
+tcl-me-remo config bluetooth.wake_beacon_data 460000ffeeddccbbaa0000000043524b544d
+tcl-me-remo config bluetooth.wake_beacon custom
+```
+
+Then repeat T4 and record the result.
+
+## T12. The plugin in Game Mode, and removal
+
+Nothing of the Decky plugin has run inside Steam; only a browser preview of its screens
+exists. Record each step:
+
+1. Build the ZIP (`python3 scripts/build_zip.py`) and install it through Decky's developer
+   settings (*Install plugin from ZIP file*). Does the panel appear, and does it install and
+   start the service by itself (the Setup page says so; `systemctl is-active tcl-me-remo`)?
+2. Walk through every page of the settings and the Quick Access panel. Note anything that
+   does not fit the screen, cannot be reached with a controller, or shows an error.
+3. Pair, TV off, TV on from the panel (as T1 to T3, but with the buttons).
+4. Uninstall the plugin in Decky and leave the machine on. After about three minutes the
+   service should be gone (`systemctl status tcl-me-remo`, `ls /opt/tcl-me-remo`).
+5. Install it again, uninstall it, and restart the machine within a minute. A few minutes
+   after the restart the service should be gone as well.
+6. Install it once more, then `tcl-me-remo uninstall --purge`, install again and pair the
+   same TV. Pairing must work: the purge is meant to remove the Bluetooth bond too.
 
 ## When a test fails
 
 Capture first, change code second: `tcl-me-remo doctor`, `tcl-me-remo logs -n 200`, the btmon
 trace of the failing attempt, and what the TV did. Put them in the results file. If the fix
-is small and local (a timing value, a default, a macro), make it, run
-`python3 -m pytest -q --timeout 60`, reinstall with `./install.sh`, and re-run the test.
+is small and local (a timing value, a default, a macro), make it, run the tests, reinstall
+with `./install.sh`, and re-run the test.
+
+SteamOS itself has no pytest. `scripts/steamos-dev-setup.sh` makes a private environment in
+the checkout for it, so on the machine the tests are run with
+
+```sh
+.venv/bin/python -m pytest -q --timeout 60
+```
+
+If that environment could not be made, do not install an untested change as a root
+service: commit it to a branch and have it tested elsewhere first.

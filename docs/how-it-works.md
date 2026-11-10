@@ -34,8 +34,8 @@ usage that Linux, and therefore Android, turns into a wake key.
 
 | | HID usage | Android key | Behaviour |
 |---|---|---|---|
-| `WAKE` | Generic Desktop 0x83 | `KEYCODE_WAKEUP` | wakes; does nothing if already awake |
-| `SLEEP` | Consumer 0x32 | `KEYCODE_SLEEP` | sleeps on key-up; does nothing if already asleep |
+| `WAKE` | Generic Desktop 0x83 | `KEYCODE_WAKEUP` | wakes; does nothing if already awake (stock Android; not observed on a TCL set) |
+| `SLEEP` | Consumer 0x32 | `KEYCODE_SLEEP` | sleeps on key-up; does nothing if already asleep (the same) |
 | `POWER` | Generic Desktop 0x81 | `KEYCODE_POWER` | toggle; avoided |
 
 Discrete keys matter because the service cannot see the TV's state. A toggle sent to a TV
@@ -326,9 +326,9 @@ it to sleep would leave it on.
 1. **Let the TV do it.** With "Power On Behavior: Last Input Used" the TV returns to the
    input it showed last. This needs no key presses and is the recommended set-up.
 2. **A key macro over Bluetooth.** Android has no remote key for "HDMI 2" that a generic
-   remote can send. A macro opens TCL's source list and walks to the entry. The list does not
-   wrap around, so a macro can run to one end and count back, which makes it independent of
-   where focus started. Presets cover the reported layouts; `F3` is reported to open the
+   remote can send. A macro opens TCL's source list and walks to the entry. The list is
+   reported not to wrap around (one owner's report), so a macro can run to one end and count
+   back, which makes it independent of where focus started. Presets cover the reported layouts; `F3` is reported to open the
    list on one TCL model. Input switching is off until you have watched a macro work.
 3. **The Wi-Fi assist** asks the TV to open the input directly by its internal id.
 

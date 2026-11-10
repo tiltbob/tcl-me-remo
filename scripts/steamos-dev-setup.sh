@@ -13,7 +13,9 @@
 #   3. clones this repository to ~/tcl-me-remo if you are not already in a checkout
 #   4. with --adb: downloads Google's Android platform-tools so the TV can be inspected
 #   5. checks whether sudo can work (it only looks; installing the service needs sudo once)
-#   6. tells you how to start the session
+#   6. makes a private Python environment in the checkout (.venv) with the test tools, so
+#      that a change made on this machine can be tested before it is installed
+#   7. tells you how to start the session
 set -euo pipefail
 
 usage() {
@@ -131,6 +133,21 @@ elif [[ "$(passwd -S 2>/dev/null | awk '{print $2}')" == "NP" ]]; then
     note "Installing the service needs sudo once."
 else
     note "sudo will ask for your password when the service is installed."
+fi
+
+# ---------------------------------------------------------------- 6. test tools
+say "6. test tools"
+# SteamOS has no pip and no pytest; a virtual environment inside the checkout touches
+# nothing on the system (.venv/ is ignored by git).  It needs the network once.
+if [[ -x "$CHECKOUT/.venv/bin/python" ]] && "$CHECKOUT/.venv/bin/python" -c "import pytest, pytest_asyncio, pytest_timeout" 2>/dev/null; then
+    note "already there: $CHECKOUT/.venv"
+elif python3 -m venv "$CHECKOUT/.venv" 2>/dev/null \
+    && "$CHECKOUT/.venv/bin/python" -m pip install --quiet pytest pytest-asyncio pytest-timeout; then
+    note "made $CHECKOUT/.venv  (run the tests with: .venv/bin/python -m pytest -q --timeout 60)"
+else
+    note "could not make a test environment (no network, or this Python has no venv/pip)."
+    note "Changes made on this machine then cannot be tested here: commit them to a branch and"
+    note "let them be tested elsewhere before installing them."
 fi
 
 # ---------------------------------------------------------------- next steps
