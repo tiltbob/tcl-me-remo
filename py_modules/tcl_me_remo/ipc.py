@@ -16,7 +16,6 @@ entirely so it can be imported from any Python the caller happens to run in.
 from __future__ import annotations
 
 import asyncio
-import grp
 import json
 import logging
 import os
@@ -82,8 +81,10 @@ class IpcServer:
         mode = self._mode
         if self._group:
             try:
+                import grp  # server side only: keeps the client usable on minimal interpreters
+
                 os.chown(self.path, -1, grp.getgrnam(self._group).gr_gid)
-            except (KeyError, PermissionError, OSError) as exc:
+            except (ImportError, KeyError, PermissionError, OSError) as exc:
                 log.debug("control socket stays owner-only (%s)", exc)
                 mode &= 0o700
         os.chmod(self.path, mode)

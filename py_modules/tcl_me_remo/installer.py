@@ -454,10 +454,13 @@ def uninstall_if_orphaned(plugin_dir: Path, layout: Layout | None = None, run: R
 
 def main(argv: list[str] | None = None) -> int:
     import argparse
+    import json
 
     parser = argparse.ArgumentParser(
         prog="tcl-me-remo-install", description="Install or remove the tcl-me-remo service."
     )
+    parser.add_argument("--json", action="store_true", help="print the result as one JSON object")
+    parser.add_argument("--source", type=Path, help="directory that holds py_modules/ (default: this copy)")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("install", help="install or update the service and start it")
     p.add_argument("--user-home", type=Path, help="also link the command into this user's ~/.local/bin")
@@ -468,30 +471,37 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("plugin_dir", type=Path)
     args = parser.parse_args(argv)
 
+    def emit(result: dict[str, Any], code: int) -> int:
+        if args.json:
+            print(json.dumps(result))
+        return code
+
     if args.command != "status" and os.geteuid() != 0:
-        print("this needs root: run it with sudo", file=sys.stderr)
-        return 1
+        message = "this needs root: run it with sudo"
+        print(message, file=sys.stderr)
+        return emit({"error": message}, 1)
     try:
         if args.command == "install":
-            result = install(user_home=args.user_home)
+            result = install(source=args.source, user_home=args.user_home)
         elif args.command == "uninstall":
             result = uninstall(purge=args.purge)
         elif args.command == "uninstall-if-orphaned":
             result = uninstall_if_orphaned(args.plugin_dir)
         else:
-            result = info()
-            state = "installed" if result["installed"] else "not installed"
-            running = "running" if result["active"] else "not running"
-            print(f"tcl-me-remo {result['installed_version'] or result['bundled_version']}: {state}, {running}")
-            result = {"log": result["problems"]}
+            result = info(source=args.source)
+            if not args.json:
+                state = "installed" if result["installed"] else "not installed"
+                running = "running" if result["active"] else "not running"
+                print(f"tcl-me-remo {result['installed_version'] or result['bundled_version']}: {state}, {running}")
     except InstallError as exc:
         print(f"tcl-me-remo: {exc}", file=sys.stderr)
-        return 1
-    for line in result.get("log", []):
-        print(line)
-    for problem in result.get("problems", []):
-        print(f"warning: {problem}")
-    return 0
+        return emit({"error": str(exc)}, 1)
+    if not args.json:
+        for line in result.get("log", []):
+            print(line)
+        for problem in result.get("problems", []):
+            print(f"warning: {problem}")
+    return emit(result, 0)
 
 
 if __name__ == "__main__":

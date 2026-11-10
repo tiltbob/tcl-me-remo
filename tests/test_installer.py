@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -230,3 +231,14 @@ def test_cli_requires_root_for_changes(monkeypatch, capsys):
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     assert installer.main(["install"]) == 1
     assert "sudo" in capsys.readouterr().err
+    assert installer.main(["--json", "uninstall"]) == 1
+    assert json.loads(capsys.readouterr().out) == {"error": "this needs root: run it with sudo"}
+
+
+def test_cli_status_as_json(capsys):
+    assert installer.main(["--json", "--source", str(REPO), "status"]) == 0
+    state = json.loads(capsys.readouterr().out)
+    assert state["bundled_version"] == installer.bundled_version(REPO)
+    assert state["installed"] is False  # nothing is installed in the test environment
+    assert installer.main(["--source", str(REPO), "status"]) == 0
+    assert "not installed" in capsys.readouterr().out
