@@ -209,7 +209,7 @@ async def call(path: Path | str, method: str, params: dict[str, Any] | None = No
 
     try:
         return await asyncio.wait_for(exchange(), timeout)
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError:  # noqa: UP041 - also correct on Python 3.10 (Decky's interpreter)
         raise RpcError("timeout", f"the service did not answer {method!r} within {timeout:g}s") from None
 
 

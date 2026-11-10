@@ -22,7 +22,7 @@ import logging
 import re
 import time
 from collections import deque
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -64,7 +64,7 @@ Trace = list
 _METHOD_RE = re.compile(r"^[a-z][a-z_]*$")
 
 
-class Phase(str, Enum):
+class Phase(StrEnum):
     RUNNING = "running"        # normal operation
     GOING_DOWN = "going_down"  # a down event is being handled
     DOWN = "down"              # down event handled; waiting for resume (or power loss)
@@ -396,7 +396,7 @@ class Service:
                 else:
                     detail = await fn(trace)
                 ok = True
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 detail = f"ran out of time ({budget:g}s)" if budget is not None else "timed out"
             except asyncio.CancelledError:
                 # Only a newer action (or service shutdown) cancels this task.  Swallowing the

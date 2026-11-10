@@ -139,16 +139,52 @@ class BluetoothConfig:
     tv_address: str = field(default="", metadata=_meta(check="mac", help="Address of the bonded TV (set by pairing)."))
     tv_name: str = field(default="", metadata=_meta(maxlen=64, help="Name of the bonded TV (set by pairing)."))
     connect_timeout: float = field(
-        default=20.0,
+        default=30.0,
         metadata=_meta(min=1, max=120, help="Seconds to wait for the TV to connect when turning it on."),
     )
     off_connect_timeout: float = field(
         default=3.0,
         metadata=_meta(min=0, max=30, help="Seconds to wait for the TV to connect when turning it off."),
     )
+    settle_ms: int = field(
+        default=1200,
+        metadata=_meta(min=0, max=10000, help="Pause after the TV connects before the first key is sent."),
+    )
+    resubscribe_wait: float = field(
+        default=4.0,
+        metadata=_meta(
+            min=0,
+            max=30,
+            help="After a reboot, seconds to wait for the TV to re-subscribe before using direct delivery.",
+        ),
+    )
+    raw_notify: str = field(
+        default="auto",
+        metadata=_meta(
+            choices=("auto", "off", "always"),
+            help="Deliver keys straight to the radio when BlueZ has lost the TV's subscription (after a reboot).",
+        ),
+    )
     reconnect_on_drop: bool = field(
         default=False,
-        metadata=_meta(help="Advertise again whenever the TV drops the link (may wake some TVs)."),
+        metadata=_meta(help="Call the TV again whenever it drops the link (may wake some TVs)."),
+    )
+    idle_disconnect_seconds: float = field(
+        default=0.0,
+        metadata=_meta(
+            min=0,
+            max=3600,
+            help="Drop the link after this long without a key (0 = keep it). Helps adapters that cannot "
+            "reconnect Bluetooth LE controllers while the TV is connected.",
+        ),
+    )
+    gatt_security: str = field(
+        default="encrypt",
+        metadata=_meta(
+            choices=("encrypt", "plain"),
+            help="'plain' drops the encryption requirement from the HID attributes (bring-up aid; "
+            "takes effect when the service restarts).",
+        ),
     )
     key_press_ms: int = field(default=80, metadata=_meta(min=10, max=1000, help="How long a key tap is held."))
     key_gap_ms: int = field(default=350, metadata=_meta(min=20, max=5000, help="Pause between macro keys."))

@@ -78,7 +78,7 @@ async def test_boot_wakes_tv_then_switches_input(tmp_path):
     assert h.sleeps.index(0.8) < h.sleeps.index(2.0)  # the repeat gap comes before the wait
     assert "TV on (Bluetooth)" in record["detail"] and "input switched (Bluetooth macro)" in record["detail"]
     assert any("playing macro" in step for step in record["steps"])
-    assert h.remote.ensure_calls[0] == 20.0  # connect_timeout
+    assert h.remote.ensure_calls[0] == 30.0  # connect_timeout
 
 
 async def test_boot_is_handled_once(tmp_path):

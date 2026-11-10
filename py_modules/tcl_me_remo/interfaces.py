@@ -24,8 +24,9 @@ class TransportError(RpcError):
     """A transport cannot do what was asked, for a reason the user can act on.
 
     Codes used: ``not_paired``, ``no_adapter``, ``bluetooth_off``, ``not_connected``,
-    ``bluetooth_error``, ``wifi_not_configured``, ``wifi_not_paired``, ``wifi_unreachable``,
-    ``wifi_error``, ``pairing_failed``.
+    ``not_subscribed`` (the TV is connected but will not receive keys until it is paired
+    again), ``bluetooth_error``, ``wifi_not_configured``, ``wifi_not_paired``,
+    ``wifi_unreachable``, ``wifi_error``, ``pairing_failed``.
     """
 
 
@@ -45,7 +46,9 @@ class BleState:
     tv_address: str = ""
     tv_name: str = ""
     connected: bool = False        # the TV currently holds a link to us
-    ready: bool = False            # connected and subscribed: keys can be sent right now
+    ready: bool = False            # connected and settled: keys can be sent right now
+    subscribed: bool = False       # BlueZ holds the TV's notification subscription
+    delivery: str = ""             # how keys travel while ready: "bluez" or "raw" ("" if not ready)
     error: str = ""                # last problem, human readable ("" when fine)
 
     def to_dict(self) -> dict[str, Any]:

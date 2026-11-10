@@ -4,9 +4,9 @@ A key is identified by a *spec* string.  Named keys (``WAKE``, ``DOWN``, ``HOME`
 what a TV remote needs; raw specs reach any other usage without a code change, which matters
 because the right key for a given TV firmware sometimes has to be found by experiment:
 
-    K:52      Keyboard/Keypad page (0x07) usage 0x52
-    C:0223    Consumer page (0x0C) usage 0x0223
-    S:82      Generic Desktop System Control usage 0x82
+    K:3C      Keyboard/Keypad page (0x07) usage 0x3C (F3); 0x1E-0xF1, no letters
+    C:0223    Consumer page (0x0C) usage 0x0223 (AC Home); 0x0001-0x03FF
+    S:83      Generic Desktop System Control usage 0x83 (Wake Up); 0x81-0x83
 
 The chain on the TV is: HID usage -> Linux key code (drivers/hid/hid-input.c) -> Android key
 code (frameworks/base/data/keyboards/Generic.kl).  The ``android`` column below records the
@@ -25,9 +25,11 @@ PAGE_SYSTEM = "system"
 _PAGE_PREFIX = {"K": PAGE_KEYBOARD, "C": PAGE_CONSUMER, "S": PAGE_SYSTEM}
 _PREFIX_OF_PAGE = {v: k for k, v in _PAGE_PREFIX.items()}
 
-# Inclusive usage ranges each report in the report map can carry (see hid.py).
+# Inclusive usage ranges each report in the report map can carry (see hid.py).  The keyboard
+# range deliberately has no letters: Android treats a device with a Q key as a full keyboard
+# and then hides the on-screen keyboard for the TV's real remote.
 USAGE_RANGE = {
-    PAGE_KEYBOARD: (0x04, 0xE7),
+    PAGE_KEYBOARD: (0x1E, 0xF1),
     PAGE_CONSUMER: (0x0001, 0x03FF),
     PAGE_SYSTEM: (0x81, 0x83),
 }
@@ -55,25 +57,26 @@ def _k(name: str, page: str, usage: int, android: str, label: str) -> Key:
 
 # fmt: off
 _NAMED: tuple[Key, ...] = (
-    # --- power (Generic Desktop System Control): discrete, not a toggle
+    # --- power: discrete and idempotent, never a toggle.
+    # WAKE is Generic Desktop "System Wake Up", the only standard usage Linux maps to
+    # KEY_WAKEUP.  SLEEP is Consumer "Sleep" rather than Generic Desktop "System Sleep",
+    # because Android 16 remaps the latter to LOCK.
     _k("WAKE",        PAGE_SYSTEM,   0x83,   "KEYCODE_WAKEUP",            "Wake (discrete on)"),
-    _k("SLEEP",       PAGE_SYSTEM,   0x82,   "KEYCODE_SLEEP",             "Sleep (discrete off)"),
-    _k("POWER",       PAGE_SYSTEM,   0x81,   "KEYCODE_POWER",             "Power (toggle)"),
-    # --- navigation
-    _k("UP",          PAGE_KEYBOARD, 0x52,   "KEYCODE_DPAD_UP",           "Up"),
-    _k("DOWN",        PAGE_KEYBOARD, 0x51,   "KEYCODE_DPAD_DOWN",         "Down"),
-    _k("LEFT",        PAGE_KEYBOARD, 0x50,   "KEYCODE_DPAD_LEFT",         "Left"),
-    _k("RIGHT",       PAGE_KEYBOARD, 0x4F,   "KEYCODE_DPAD_RIGHT",        "Right"),
+    _k("SLEEP",       PAGE_CONSUMER, 0x0032, "KEYCODE_SLEEP",             "Sleep (discrete off)"),
+    _k("POWER",       PAGE_SYSTEM,   0x81,   "KEYCODE_POWER",             "Power (toggle - avoid)"),
+    # --- navigation: the Consumer page, as Google's reference Android TV remote sends it
+    _k("UP",          PAGE_CONSUMER, 0x0042, "KEYCODE_DPAD_UP",           "Up"),
+    _k("DOWN",        PAGE_CONSUMER, 0x0043, "KEYCODE_DPAD_DOWN",         "Down"),
+    _k("LEFT",        PAGE_CONSUMER, 0x0044, "KEYCODE_DPAD_LEFT",         "Left"),
+    _k("RIGHT",       PAGE_CONSUMER, 0x0045, "KEYCODE_DPAD_RIGHT",        "Right"),
     _k("OK",          PAGE_CONSUMER, 0x0041, "KEYCODE_DPAD_CENTER",       "OK / Select"),
-    _k("ENTER",       PAGE_KEYBOARD, 0x28,   "KEYCODE_ENTER",             "Enter"),
     _k("BACK",        PAGE_CONSUMER, 0x0224, "KEYCODE_BACK",              "Back"),
-    _k("ESC",         PAGE_KEYBOARD, 0x29,   "KEYCODE_ESCAPE",            "Escape"),
     _k("HOME",        PAGE_CONSUMER, 0x0223, "KEYCODE_HOME",              "Home"),
     _k("MENU",        PAGE_CONSUMER, 0x0040, "KEYCODE_MENU",              "Menu"),
+    _k("ENTER",       PAGE_KEYBOARD, 0x28,   "KEYCODE_ENTER",             "Enter"),
+    _k("ESC",         PAGE_KEYBOARD, 0x29,   "KEYCODE_ESCAPE",            "Escape"),
     # --- TV functions
     _k("TV",          PAGE_CONSUMER, 0x0089, "KEYCODE_TV",                "TV"),
-    _k("SETTINGS",    PAGE_CONSUMER, 0x019F, "KEYCODE_SETTINGS",          "Settings"),
-    _k("INFO",        PAGE_CONSUMER, 0x0060, "KEYCODE_INFO",              "Info"),
     _k("GUIDE",       PAGE_CONSUMER, 0x008D, "KEYCODE_GUIDE",             "Guide"),
     _k("SEARCH",      PAGE_CONSUMER, 0x0221, "KEYCODE_SEARCH",            "Search"),
     _k("CH_UP",       PAGE_CONSUMER, 0x009C, "KEYCODE_CHANNEL_UP",        "Channel up"),
@@ -88,7 +91,7 @@ _NAMED: tuple[Key, ...] = (
     _k("PREVIOUS",    PAGE_CONSUMER, 0x00B6, "KEYCODE_MEDIA_PREVIOUS",    "Previous"),
     _k("REWIND",      PAGE_CONSUMER, 0x00B4, "KEYCODE_MEDIA_REWIND",      "Rewind"),
     _k("FAST_FORWARD", PAGE_CONSUMER, 0x00B3, "KEYCODE_MEDIA_FAST_FORWARD", "Fast forward"),
-    # --- digits and function keys (keyboard page)
+    # --- digits and function keys (keyboard page).  F3 opens the input list on some TCL sets.
     _k("NUM0", PAGE_KEYBOARD, 0x27, "KEYCODE_0", "0"),
     *(_k(f"NUM{n}", PAGE_KEYBOARD, 0x1D + n, f"KEYCODE_{n}", str(n)) for n in range(1, 10)),
     *(_k(f"F{n}", PAGE_KEYBOARD, 0x39 + n, f"KEYCODE_F{n}", f"F{n}") for n in range(1, 13)),
@@ -146,7 +149,7 @@ def resolve(spec: str) -> Key:
         width = 4 if page == PAGE_CONSUMER else 2
         return Key(spec=f"{raw.group(1)}:{usage:0{width}X}", page=page, usage=usage, label=f"raw {page} 0x{usage:X}")
     raise UnknownKey(
-        f"unknown key {spec!r} (use a name such as HOME, DOWN, OK, WAKE, SLEEP or a raw usage like C:0223, K:52, S:82)"
+        f"unknown key {spec!r} (use a name such as HOME, DOWN, OK, WAKE, SLEEP or a raw usage like C:0223, K:3C, S:83)"
     )
 
 
