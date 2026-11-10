@@ -84,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("logs", help="show recent service log lines")
     p.add_argument("-n", "--lines", type=int, default=50)
+
+    p = sub.add_parser("uninstall", help="remove the service from this machine (asks sudo)")
+    p.add_argument("--purge", action="store_true", help="also delete the settings and the Bluetooth pairing")
     return parser
 
 
@@ -291,6 +294,10 @@ def run(
         from . import doctor  # works with the service stopped, so it is not a control-socket client
 
         return doctor.main(as_json=args.json, out=out)
+    if args.command == "uninstall":
+        from . import installer  # the installed copy removes itself; works with the service stopped
+
+        return installer.uninstall_from_command_line(args.purge, out, err)
     if args.command == "keys":
         for row in keys.catalog():
             print(f"{row['name']:<13} {row['label']:<22} {row['android']}", file=out)

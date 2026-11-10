@@ -1,6 +1,7 @@
 """What happens around bluetoothd restarts: lost subscriptions, direct delivery, recovery."""
 
 import asyncio
+import dataclasses
 import errno
 import json
 import logging
@@ -776,6 +777,45 @@ async def test_stop_never_raises_when_bluetoothd_is_gone(h):
     await h.bluez.stop()
     await remote.stop()
     await remote.stop()
+
+
+@pytest.mark.parametrize("kernel, injects", [(fake_bluez.OLD_KERNEL, False), (fake_bluez.NEW_KERNEL, True)])
+async def test_shipped_defaults_inject_nothing_on_a_kernel_they_would_disturb(h, tmp_path, kernel, injects):
+    """The other tests choose ``raw_notify`` themselves (quick_config says "on").  This one takes
+    the settings a new installation has, cut down only in their waits, through a reboot."""
+    shipped = config_mod.default_config()
+    shipped.bluetooth = dataclasses.replace(shipped.bluetooth, settle_ms=40, resubscribe_wait=0.3, key_press_ms=10)
+    remote = await h.remote(shipped.bluetooth, kernel=kernel)
+    tv = h.bluez.add_device(android=12)
+    tv.auto_connect = True
+    await h.pair(remote, tv)
+    shipped.bluetooth = dataclasses.replace(shipped.bluetooth, tv_address=TV, tv_name="Living Room TV")
+    service = Service(shipped, remote=remote, sys_root=tmp_path)
+    assert remote._cfg.raw_notify == "auto" == config_mod.BluetoothConfig().raw_notify
+    assert remote._cfg.reconnect_on_drop is True
+
+    await h.bluez.restart()  # the reboot: bluetoothd has lost the TV's subscription
+    await eventually(lambda: remote.state.registered and remote.state.connected, what="the TV to be called back")
+    if injects:
+        # Background calling gets the one-off reconnect out of the way where direct delivery will be used.
+        await eventually(lambda: remote.bounces == 1 and tv.connections == 3, what="the reconnect ahead of time")
+    else:
+        await asyncio.sleep(0.6)  # resubscribe_wait and more: nothing is done about the silent TV
+        assert remote.bounces == 0 and tv.connections == 2
+
+    record = await service.tv_on(switch_input=False)
+    if injects:
+        assert record["ok"], record
+        assert tv.keys("raw") == [(SYSTEM, b"\x04"), (SYSTEM, b"\x00")] and remote.state.delivery == "raw"
+        assert debt(h) == ""  # nothing to repair there
+    else:
+        assert not record["ok"]
+        assert "not used automatically on this kernel (Linux 6.11.11-valve19-1-neptune-611" in record["detail"]
+        assert "'on'" in record["detail"] and "pair the TV again" in record["detail"]
+        assert service.status()["bluetooth"]["error"] in record["detail"]
+        assert h.raw.opened == 0 and h.raw.packets == [] and h.raw.commands == [] and tv.keys("raw") == []
+        assert remote.bounces == 0 and tv.connections == 2 and tv.connected
+    await service.rpc("disconnect", {})
 
 
 # --------------------------------------------------------------------------- with the service core

@@ -168,9 +168,31 @@ hooks, and says what is wrong in plain words.
 
 ## Remove
 
-Uninstall the plugin in Decky; a few minutes later the service removes itself. Without Decky:
-`./install.sh uninstall` (add `--purge` to delete settings as well). On the TV, remove
-*SteamOS Remote* under Remotes & Accessories.
+From a terminal, however the service was installed:
+
+```sh
+tcl-me-remo uninstall            # stops and removes the service; settings and the pairing stay
+tcl-me-remo uninstall --purge    # also deletes the settings and the Bluetooth pairing
+```
+
+It asks `sudo` (on SteamOS, set a password first with `passwd`). If the shell does not find
+the command, it is `/opt/tcl-me-remo/bin/tcl-me-remo`. `./install.sh uninstall` in a
+checkout does the same. With `--purge` the machine forgets the TV; on the TV, remove
+*SteamOS Remote* under Remotes & Accessories as well, or the two cannot be paired again.
+
+With Decky, uninstalling the plugin is enough in the usual case. Decky runs the same step
+when it only updates a plugin, so the service is not removed at that moment: about three
+minutes later it is checked whether the plugin is really gone, and only then is the service
+removed (settings and the pairing stay). If the machine is restarted or switched off before
+that, the check is made a few minutes after the service next starts. The check removes
+nothing when it cannot see Decky's plugins folder. That, and these two cases, are what the
+command above is for:
+
+- **Decky Loader itself was removed.** Its uninstaller does not tell the plugins, so the
+  service stays, and keeps turning the TV on and off, until you run `tcl-me-remo uninstall`.
+- **The plugin is still installed.** It puts the service back whenever it loads, so
+  uninstall it in Decky too. To delete the settings and the pairing from the panel instead,
+  use *Remove service* with *Also delete settings*, then uninstall the plugin.
 
 ## More
 

@@ -6,7 +6,7 @@ from fake_logind import FakeLogind, eventually
 from fakes import FakeRemote
 
 from tcl_me_remo import config as C
-from tcl_me_remo import ipc
+from tcl_me_remo import installer, ipc
 from tcl_me_remo.daemon import Daemon
 from tcl_me_remo.service import Phase
 
@@ -28,6 +28,7 @@ class Rig:
         self.kind = None
         self.daemon = None
         self.task = None
+        self.options = {}  # further Daemon(...) arguments
         cfg = C.apply_patch(
             C.default_config(),
             {
@@ -51,6 +52,7 @@ class Rig:
             uptime=lambda: self.uptime,
             shutdown_kind=shutdown_kind,
             watchdog_interval=0.05,
+            **self.options,
         )
         self.task = asyncio.create_task(self.daemon.run())
         await asyncio.wait_for(self.daemon.ready.wait(), 5)
@@ -235,6 +237,34 @@ async def test_losing_the_system_bus_ends_the_service_with_an_error(rig, kill_pr
     rig.task = None
     assert code == 1
     assert rig.remote.keys == []  # no TV action is attempted on the way out
+
+
+async def test_a_removed_plugin_is_looked_into_some_time_after_start(rig):
+    # Decky's uninstall hook leaves a note and a timer; a reboot discards the timer.  The
+    # service then has its installer decide (outside the service, which that may remove).
+    rig.uptime = 5000.0
+    commands = []
+
+    async def run_command(argv, timeout):
+        commands.append(argv)
+        return 0, ""
+
+    rig.options = {"run_command": run_command, "orphan_check_delay": 0.05}
+    state = rig.tmp_path / "state"
+    state.mkdir()
+    await rig.start()
+    await asyncio.sleep(0.25)
+    assert commands == []  # no note: nothing is started, ever
+    assert await rig.stop() == 0
+
+    (state / installer.REMOVED_MARKER).write_text(json.dumps({"plugins_dir": "/home/deck/homebrew/plugins", "time": 0}))
+    await rig.start()
+    await eventually(lambda: len(commands) == 1)
+    assert commands[0][0] == "systemd-run" and commands[0][-1] == "uninstall-if-orphaned"
+    assert commands[0] == installer.orphan_check_command(state)
+    await asyncio.sleep(0.25)
+    assert len(commands) == 1  # once per start
+    assert rig.remote.keys == []  # and the TV is not involved
 
 
 async def test_no_system_bus_is_a_clean_failure(tmp_path, monkeypatch):

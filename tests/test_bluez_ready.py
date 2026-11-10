@@ -11,6 +11,7 @@ from fake_bluez import eventually, quick_config
 
 from tcl_me_remo import keys
 from tcl_me_remo.bluez import advert as advert_module
+from tcl_me_remo.bluez import rawhci
 from tcl_me_remo.bluez import remote as remote_module
 from tcl_me_remo.interfaces import TransportError
 
@@ -753,6 +754,7 @@ async def test_fast_disconnect_does_not_wait_for_a_tv_that_stopped_answering(h):
         ("unknown link", "no such link"),
         ("no address type", "what kind of address"),
         ("two candidates", "none is listed as the TV"),
+        ("already closing", "already closing the TV's link"),
     ],
 )
 async def test_fast_disconnect_falls_back_to_bluetoothd(h, fault, why, caplog):
@@ -770,6 +772,13 @@ async def test_fast_disconnect_falls_back_to_bluetoothd(h, fault, why, caplog):
     elif fault == "no address type":
         tv._set(AddressType="")
         await asyncio.sleep(0.05)
+    elif fault == "already closing":
+        # The kernel has sent the TV's Disconnect already (bluetoothd's timer after an earlier
+        # request) and a phone happens to be connected to us too: the phone's link is the only
+        # one that is "up", and it must not be taken for the TV's.
+        tv.hci_state = rawhci.BT_DISCONN
+        other = h.bluez.add_device("5B:00:00:00:00:01", name="Phone")
+        await other.connect()
     else:
         # Somebody else's device is connected to us as well and the kernel lists neither link
         # under the TV's address: nothing says which one is the TV, so nothing is guessed.
@@ -780,7 +789,7 @@ async def test_fast_disconnect_falls_back_to_bluetoothd(h, fault, why, caplog):
     assert h.bluez.disconnect_calls == 1 and not tv.connected and not remote.state.connected
     assert why in caplog.text and "asking BlueZ, which takes two seconds" in caplog.text
     assert h.mgmt.opened == h.mgmt.closed
-    if fault == "two candidates":
+    if fault in ("two candidates", "already closing"):
         assert h.mgmt.commands == [] and other.connected
 
 
@@ -900,6 +909,63 @@ async def test_resume_link_lets_background_calling_start_again(h):
     assert await remote.ensure_ready(3.0) is True  # the next suspend finds the link up
 
 
+async def test_a_wake_action_takes_over_from_the_calling_that_resume_link_has_just_started(h, caplog):
+    """What every wake does: resume_link(), and in the same breath the action that turns the TV
+    on.  With a bluetoothd that answers slowly, the background registration is still in
+    flight when it is called off and the same advertisement is registered anew, with the fast
+    interval.  Exactly one advertisement must come of it, and none must be left behind."""
+    caplog.set_level(logging.INFO)
+    remote, tv = await h.paired_remote(reconnect_on_drop=True)
+    assert await remote.ensure_ready(2.0)
+    await remote.disconnect(fast=True)
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    tv.auto_connect = False
+    h.bluez.events.clear()
+    h.bluez.advert_register_delay = 0.15
+
+    remote.resume_link()
+    await asyncio.sleep(0.03)  # the background RegisterAdvertisement is in flight
+    waiting = asyncio.ensure_future(remote.ensure_ready(5.0, wake=True))
+    await eventually(lambda: h.bluez.advert is not None, what="the wake action's advertisement")
+    await asyncio.sleep(0.3)  # the registration that was called off has been answered by now
+    adverts = h.bluez.adapter.adverts
+    assert len(adverts) == 1 and h.bluez.advert["MinInterval"] == 30, adverts  # the fast one, and only it
+    assert remote.state.advertising
+    assert "refused the advertising interval settings" not in caplog.text
+
+    h.bluez.advert_register_delay = 0.0
+    await tv.connect()
+    assert await waiting is True
+    await eventually(lambda: h.bluez.advert is None and not h.bluez.adapter.adverts, what="nothing left on air")
+    assert tv.connections == 2 and remote.state.ready
+
+
+async def test_background_calling_wanted_again_while_it_winds_down_starts_again(h):
+    """The policy task ends by itself when it stops applying, and takes a moment to (it takes
+    the advertisement off air).  If it applies again in that moment - resume_link() right
+    after the idle time-out parked the link, the option switched off and on - the request
+    finds a task that is still there and must not be lost with it."""
+    h.bluez.add_device(TV, bonded=True)  # a TV that does not answer: calling goes on
+    remote = await h.remote(tv_address=TV, reconnect_on_drop=True)
+    await eventually(lambda: h.bluez.advert is not None, what="background advertisement")
+    old_task = remote._reconnect_task
+
+    remote.apply_config(quick_config(tv_address=TV, reconnect_on_drop=False))
+    for _ in range(200):  # until the task is past its loop and waiting for bluetoothd's answer
+        if not remote.state.advertising:
+            break
+        await asyncio.sleep(0)
+    assert not remote.state.advertising
+    remote.apply_config(quick_config(tv_address=TV, reconnect_on_drop=True))
+
+    await eventually(lambda: h.bluez.advert is not None and remote.state.advertising, what="calling to start again")
+    assert old_task.done() and remote._reconnect_task is not old_task
+    # ... and a task that is called off (not run out) starts nothing behind the caller's back.
+    await remote.disconnect()
+    await asyncio.sleep(0.1)
+    assert h.bluez.advert is None and remote._reconnect_task is None
+
+
 async def test_resume_link_does_nothing_without_reconnect_on_drop(h):
     remote, tv = await parted(h)  # reconnect_on_drop is off
     remote.resume_link()
@@ -910,17 +976,72 @@ async def test_resume_link_does_nothing_without_reconnect_on_drop(h):
     await eventually(lambda: remote.state.connected, what="background calling once it is wanted")
 
 
-async def test_resume_link_leaves_a_link_alone_that_is_meant_to_be_down_when_idle(h):
-    """With an idle time-out the user wants the radio free; only a key starts that time-out."""
-    remote, tv = await h.paired_remote(reconnect_on_drop=True, idle_disconnect_seconds=30)
+async def test_resume_link_with_an_idle_time_out_brings_the_link_up_and_the_time_out_takes_it_down(h):
+    """One rule after boot, after a wake and after a drop: with ``idle_disconnect_seconds`` a link
+    that carries no key is dropped after that time, however it came up.  (resume_link used to
+    leave the link down in this configuration while a boot brought it up for good.)"""
+    remote, tv = await h.paired_remote(reconnect_on_drop=True, idle_disconnect_seconds=0.3)
     assert await remote.ensure_ready(2.0)
-    await remote.disconnect(fast=True)
+    await remote.disconnect(fast=True)  # the machine goes to sleep
     await eventually(lambda: not remote.state.connected)
-    h.bluez.events.clear()
-    remote.resume_link()
-    await asyncio.sleep(0.1)
-    assert h.bluez.event_names() == [] and not tv.connected
+    assert tv.connections == 1
+
+    remote.resume_link()  # ... and wakes; nothing is sent to the TV
+    await eventually(lambda: remote.state.connected, what="the TV to be called after the wake")
+    came_up = remote._connected_at
+    assert tv.connections == 2 and not remote.state.ready
+    await eventually(lambda: not tv.connected and not remote.state.connected, what="the idle time-out")
+    assert time.monotonic() - came_up >= 0.3  # not before its time
+    await asyncio.sleep(0.15)
+    assert h.bluez.advert is None and tv.connections == 2  # dropped to free the radio: parked again
     assert await remote.ensure_ready(3.0) is True  # there is something to send: now it is called
+
+
+async def test_idle_time_out_also_ends_a_link_nothing_was_ever_sent_on(h):
+    """The link a boot (or a drop) brings up in the background was never subject to the time-out."""
+
+    def cfg(**changes):
+        # No direct delivery: this is about the time-out, not about the one-off reconnect.
+        return quick_config(tv_address=TV, reconnect_on_drop=True, raw_notify="off", **changes)
+
+    tv = h.bluez.add_device(TV, bonded=True)
+    tv.auto_connect = True
+    remote = await h.remote(cfg(idle_disconnect_seconds=0.3))
+    await eventually(lambda: remote.state.connected, what="the TV to be called after start-up")
+    came_up = remote._connected_at
+    await eventually(lambda: not tv.connected and not remote.state.connected, what="the idle time-out")
+    assert time.monotonic() - came_up >= 0.3  # not before its time
+    await asyncio.sleep(0.15)
+    assert h.bluez.advert is None and tv.connections == 1 and remote.bounces == 0  # and parked
+
+    # Somebody waiting for the TV is use: a wait that is longer than the time-out does not
+    # have the link pulled away under it, and the time counts again from the end of the wait.
+    remote.apply_config(cfg(idle_disconnect_seconds=0.3, resubscribe_wait=1.0))
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(8.0)  # connects, then waits a second for a subscription that never comes
+    ended = time.monotonic()
+    assert err.value.code == "not_subscribed"
+    assert tv.connections == 2  # one link for the whole wait, not a new one every 0.3 s
+    await eventually(lambda: not tv.connected, what="the idle time-out after the wait")
+    assert time.monotonic() - ended >= 0.3 - 0.05
+
+    # Switching the time-out off keeps an idle link; switching it on starts the clock.
+    remote.apply_config(cfg(idle_disconnect_seconds=0))
+    remote.resume_link()
+    await eventually(lambda: remote.state.connected)
+    await asyncio.sleep(0.5)
+    assert tv.connected and tv.connections == 3
+    remote.apply_config(cfg(idle_disconnect_seconds=0.2))
+    await eventually(lambda: not tv.connected, what="the idle time-out once it is switched on")
+
+
+async def test_idle_time_out_ends_the_link_pairing_left_behind(h):
+    remote, tv = await h.paired_remote(idle_disconnect_seconds=0.3)
+    assert tv.connected and remote.state.connected and not remote.state.ready
+    came_up = remote._connected_at
+    await eventually(lambda: not tv.connected and not remote.state.connected, what="the idle time-out after pairing")
+    assert time.monotonic() - came_up >= 0.3
+    assert await remote.ensure_ready(3.0) is True
 
 
 async def test_resume_link_never_raises(h, monkeypatch, caplog):

@@ -136,6 +136,8 @@ action decided there was nothing to do (disabled, display gate closed, duplicate
   `pairing` is true it can hold a warning that needs acting on at that moment (the machine
   is also discoverable over classic Bluetooth); after pairing mode closed without a TV it
   says how it ended. It is cleared when the TV becomes ready and when pairing mode opens.
+  A request that is refused only because pairing mode is open gets `not_paired` as its
+  answer and leaves this field alone.
 - `bluetooth.subscribed` is about the paired TV; it is `false` whenever no TV is paired.
 - `input.macro` is the macro that will run, with the preset resolved and `{port}` filled in.
 

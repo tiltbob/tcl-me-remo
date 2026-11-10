@@ -12,8 +12,20 @@
 #   2. makes sure ~/.local/bin is on your PATH
 #   3. clones this repository to ~/tcl-me-remo if you are not already in a checkout
 #   4. with --adb: downloads Google's Android platform-tools so the TV can be inspected
-#   5. tells you how to start the session
+#   5. checks whether sudo can work (it only looks; installing the service needs sudo once)
+#   6. tells you how to start the session
 set -euo pipefail
+
+usage() {
+    # The comment block at the top of this file.  Piped into bash there is no file to read.
+    local self="${BASH_SOURCE[0]:-}"
+    if [[ -n "$self" && -f "$self" && -r "$self" ]]; then
+        awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$self"
+    else
+        echo "usage: steamos-dev-setup.sh [--adb] [--yes] [--branch NAME]"
+        echo "Prepares a SteamOS machine for hardware testing with Claude Code; see the top of the script."
+    fi
+}
 
 REPO_URL="https://github.com/tiltbob/tcl-me-remo"
 BRANCH=""
@@ -25,7 +37,7 @@ while [[ $# -gt 0 ]]; do
         --adb) WANT_ADB=1 ;;
         --yes|-y) ASSUME_YES=1 ;;
         --branch) BRANCH="${2:?--branch needs a name}"; shift ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift

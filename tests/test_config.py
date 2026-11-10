@@ -17,6 +17,34 @@ def test_defaults_round_trip():
     assert cfg.power.on_key == "WAKE" and cfg.power.off_key == "SLEEP" and cfg.power.on_repeat == 1
 
 
+def test_direct_delivery_is_careful_unless_the_user_says_otherwise():
+    """The shipped default must be the one that cannot stall the user's controllers.
+
+    The transport's own tests run with ``raw_notify = "on"`` (they are about direct delivery
+    itself), so this is where the default is pinned.
+    """
+    assert C.default_config().bluetooth.raw_notify == "auto"
+    assert C.BluetoothConfig().raw_notify == "auto"
+    leaf = C.describe()["bluetooth"]["raw_notify"]
+    assert leaf["default"] == "auto" and leaf["choices"] == ("auto", "on", "off", "always")
+    for word in ("'auto'", "'on'", "'off'", "'always'", "6.17"):
+        assert word in leaf["help"]
+    # A settings file that does not mention it, or holds something this version does not know
+    # (an old file, a typo), ends up careful as well.
+    assert C.from_dict({"bluetooth": {"tv_address": "AA:BB:CC:DD:EE:FF"}})[0].bluetooth.raw_notify == "auto"
+    cfg, problems = C.from_dict({"bluetooth": {"raw_notify": "yes"}}, strict=False)
+    assert cfg.bluetooth.raw_notify == "auto" and len(problems) == 1
+
+
+@pytest.mark.parametrize("value", ["auto", "on", "off", "always"])
+def test_every_direct_delivery_choice_is_accepted_and_survives_a_round_trip(value):
+    cfg = C.apply_patch(C.default_config(), {"bluetooth": {"raw_notify": value}})
+    assert cfg.bluetooth.raw_notify == value
+    assert C.set_path(C.default_config(), "bluetooth.raw_notify", value).bluetooth.raw_notify == value
+    again, problems = C.from_dict(cfg.to_dict())
+    assert again.bluetooth.raw_notify == value and problems == []
+
+
 def test_apply_patch_merges_and_validates():
     cfg = C.default_config()
     new = C.apply_patch(cfg, {"input": {"hdmi_port": 3}, "events": {"boot_tv_on": False}})
@@ -38,6 +66,10 @@ def test_apply_patch_merges_and_validates():
         ({"input": {"preset": "nope"}}, "input.preset"),
         ({"wifi": {"link_preset": "nope"}}, "wifi.link_preset"),
         ({"bluetooth": {"wake_beacon": "loud"}}, "bluetooth.wake_beacon"),
+        ({"bluetooth": {"raw_notify": "On"}}, "bluetooth.raw_notify"),
+        ({"bluetooth": {"raw_notify": True}}, "bluetooth.raw_notify"),
+        ({"bluetooth": {"raw_notify": "needed"}}, "bluetooth.raw_notify"),
+        ({"bluetooth": {"raw_notify": ""}}, "bluetooth.raw_notify"),
         ({"bluetooth": {"wake_beacon_data": "46 0"}}, "bluetooth.wake_beacon_data"),
         ({"bluetooth": {"wake_beacon_data": "zz00ff"}}, "bluetooth.wake_beacon_data"),
         ({"bluetooth": {"wake_beacon_data": "4600"}}, "bluetooth.wake_beacon_data"),

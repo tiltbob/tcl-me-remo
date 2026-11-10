@@ -106,20 +106,39 @@ link is down, or closing it would be pointless. Parking ends when there is somet
 and when the machine boots or wakes: at every boot and resume the service lets calling
 resume before it decides anything else, so the link comes back even on a wake where nothing
 is sent to the TV (handheld without the TV attached, automatic actions off). Otherwise the
-next suspend would have to get the TV back within its three seconds. With
-`bluetooth.idle_disconnect_seconds` set, a parked link stays down until there is a key to
-send; that is what the setting asks for.
+next suspend would have to get the TV back within its three seconds.
+
+This means the TV is called, though not sent a key, also on a wake the display check keeps
+it out of. A TV that turns on merely because it is called would then turn on for a handheld
+that woke on the sofa; whether a TCL set does that has not been observed. If yours does,
+`bluetooth.reconnect_on_drop` is the setting to turn off, as above.
+
+With `bluetooth.idle_disconnect_seconds` set, one rule covers every link: a link that has
+carried no key for that long is closed and parked, whether it was used before or only came
+up because the TV was called (after a boot, a wake, a drop, or pairing). The link is then up
+for that long after each boot and wake and whenever something is sent, and down otherwise;
+a suspend that finds it down has to get the TV back within its three seconds.
 
 ### Before the machine sleeps
 
-How a link ends is visible to the TV as a reason code, and it matters. If the machine went
-to sleep or powered off with the link up, the kernel would end it with reason 0x15, "remote
-device terminated the connection due to power off". According to Android's source, the
-Bluetooth HID host of Android 13 and 14 re-arms its background connection to a remote after
-a disconnect for a few reasons only, and 0x15 is not among them; 0x13, "remote user
-terminated the connection", which a real remote sends, is. (Android 11 and 12 are stricter
-still, Android 16 re-arms for any reason.) Whether the TV connects by itself after the
-machine wakes may therefore depend on this code.
+How a link ends is visible to the TV as a reason code, and it may matter. If the machine
+went to sleep or powered off with the link up, the kernel would end it with reason 0x15,
+"remote device terminated the connection due to power off". A real remote sends 0x13,
+"remote user terminated the connection". What Android's source says about the two, none of
+it observed on a TV:
+
+- **Android 13 and 14.** The Bluetooth HID host re-arms its background connection to a
+  remote after a disconnect for a few reasons only; 0x13 is among them, 0x15 is not. A lower
+  layer of the same versions puts a device that is still on its background list back after
+  any disconnect, so these versions may well reconnect after either code.
+- **Android 11 and 12.** The HID host re-arms only after a link that timed out. Going by the
+  source, neither code makes it call back. (TVs with these versions do reconnect their own
+  remotes, so vendor builds presumably differ.)
+- **Android 16** re-arms for any reason.
+
+So 0x13 is nowhere worse than 0x15 and in one place better. Whether the TV connects by
+itself after the machine wakes may depend on the code, or may not; the hardware test plan
+compares the two.
 
 BlueZ's own disconnect sends 0x13 but only after a fixed two seconds, more than the service
 has. So before suspend and shutdown the service asks the kernel directly, through the same
@@ -151,18 +170,24 @@ after each start the service disconnects once and lets the TV reconnect before u
 delivery. While the service keeps calling the TV (`bluetooth.reconnect_on_drop`), that
 one-off reconnect happens in the background as soon as the TV has connected and stayed
 silent, not when the first key is due: before a suspend there would be no time for it.
-`tcl-me-remo status` shows `delivery: raw` when this path is in use. If the TV subscribes
-later after all, delivery switches back at once.
+`tcl-me-remo status --json` shows `"delivery": "raw"` when this path is in use, and
+`tcl-me-remo doctor` says "direct delivery" on its TV link line. If the TV subscribes later
+after all, delivery switches back at once.
 
-Direct delivery has a side effect on Linux kernels before 6.17. The kernel counts the packets
+Direct delivery has a side effect on Linux kernels before 6.17. (To be exact: on mainline
+kernels up to 6.17-rc3, and on the stable releases before 6.16.5, 6.12.45, 6.6.104, 6.1.150
+and 5.15.191, which received the part of the fix that matters. A vendor kernel's version
+does not say whether it has it; upstream 6.11.11, which SteamOS 3.7's kernel is built on,
+does not.) The kernel counts the packets
 it has handed to the controller; packets written past it are not counted on the way out but
 are counted when the controller reports them done, so the count ends up short by one transmit
 slot per key report once the link closes. Slots lost this way are shared by every Bluetooth
 LE device (on some controllers by classic devices too), and in the worst case sending stalls
 until Bluetooth is switched off and on. The service therefore repairs the count each time
 such a link has closed, by asking the controller for its buffer size again, which makes the
-kernel start counting afresh. Linux 6.17 and later refuse to miscount in the first place;
-there the only trace is a kernel log line per key report.
+kernel start counting afresh. Linux 6.17 and later (and the patched stable kernels) refuse
+to miscount in the first place; there the only trace is a kernel log line per key report,
+`sent 0 < count 1`, which is also how such a kernel can be recognised.
 
 The repair, like the path itself, comes from reading source code. Because a stalled
 controller or headset would be a worse failure than a TV that did not turn on, and much
@@ -170,7 +195,7 @@ harder to trace back to this service, the default is careful:
 
 | `bluetooth.raw_notify` | Direct delivery is used |
 |---|---|
-| `auto` (default) | when the TV needs it, on Linux 6.17 and later only. On an older kernel it is not used; the error then names the kernel and says that `on` enables it |
+| `auto` (default) | when the TV needs it, on Linux 6.17 and later only. On an older kernel it is not used; the error then names the kernel and says that `on` enables it. The rule goes by the version number alone, so on an older kernel that has the fix it is more careful than it needs to be |
 | `on` | when the TV needs it, on any kernel, with the repair described above |
 | `off` | never |
 | `always` | for every key, even when the TV has subscribed (for testing) |
@@ -194,10 +219,12 @@ anyone's Bluetooth list.
 Discoverability is put on the advertisement only. Making the adapter discoverable would turn
 on classic Bluetooth inquiry, and a TV that finds the machine that way pairs over classic
 Bluetooth, finds no HID service and gives up. The service never changes that setting, but
-other software does: a desktop Bluetooth settings page makes the adapter discoverable for as
-long as it is open. While pairing mode is open and the adapter is discoverable, the service
-says so (in the pairing dialog, in `status`, in the log), because closing the other page is
-something only the user can do.
+other software can: `bluetoothctl discoverable on` does (for three minutes by default), and
+so do some Bluetooth settings pages for as long as they are open. GNOME's does, going by its
+source; whether the page in SteamOS's Desktop Mode or Steam's own does has not been checked.
+While pairing mode is open and the adapter is discoverable, the service says so (in the
+pairing dialog, in `status`, in the log), because undoing it is something only the user can
+do.
 
 Pairing is complete when a newly bonded TV has also used the HID service (read it, or
 subscribed to it). A TV that bonds and stops there (pairing aborted on the TV half-way, the window timing out in between) is
@@ -253,7 +280,7 @@ It only works while the TV's network is up: on, or in standby with Screenless se
 | `/etc/systemd/system/tcl-me-remo.service` | the service |
 | `/etc/systemd/system/tcl-me-remo-sleep.service` | the suspend/resume hook |
 | `/var/lib/tcl-me-remo/config.json` | settings |
-| `/var/lib/tcl-me-remo/` | state: Wi-Fi pairing certificate, what was learned about the TV |
+| `/var/lib/tcl-me-remo/` | state: Wi-Fi pairing certificate, what was learned about the TV, the installer's notes (links it made, "the plugin was removed") |
 | `/run/tcl-me-remo/control.sock` | control socket (`root:wheel`, `0660`) |
 | `/var/lib/bluetooth/` | the Bluetooth bond itself (BlueZ's, not ours) |
 
@@ -265,6 +292,9 @@ remove the units, the plugin puts them back the next time it loads.
 
 - The service runs as root (it needs the system bus, logind locks, a raw HCI socket and the
   kernel's Bluetooth management socket) and runs only code from a root-owned directory.
+  The installer runs as root too, and does not write inside a home directory with that
+  identity: the `tcl-me-remo` link in `~/.local/bin` is made by a child process running as
+  the home's owner.
 - The control socket is limited to root and the `wheel` group. Anyone who can use it can
   send keys to the TV and change settings.
 - Any device can open a Bluetooth LE link to the machine while it is calling the TV, but the
@@ -283,7 +313,10 @@ Until `hardware-results/` says otherwise:
 - direct delivery after a reboot on Android 11–13, and on kernels before 6.17 the repair of
   the kernel's packet count that goes with it;
 - that the link is ended with reason 0x13 before suspend and shutdown, and that the TV then
-  reconnects after the machine wakes;
+  reconnects after the machine wakes (or that the reason code makes any difference to it);
+- whether the TV turns on when it is merely called after a wake;
+- which Bluetooth settings pages on SteamOS make the adapter discoverable while they are
+  open (the situation the pairing warning is for);
 - which key opens the source list from a generic remote, and the list's layout;
 - the wake beacon pattern on TCL sets.
 

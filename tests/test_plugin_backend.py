@@ -2,8 +2,10 @@
 
 import asyncio
 import importlib
+import json
 import logging
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -11,7 +13,7 @@ import pytest
 from fakes import FakeRemote
 
 from tcl_me_remo import config as C
-from tcl_me_remo import ipc
+from tcl_me_remo import installer, ipc
 from tcl_me_remo.service import Service
 
 REPO = Path(__file__).resolve().parents[1]
@@ -29,6 +31,7 @@ def backend(tmp_path, monkeypatch):
     module = importlib.import_module("main")
     monkeypatch.setattr(module, "SYSTEM_PYTHON", sys.executable)
     monkeypatch.setattr(module, "SOCKET_PATH", str(tmp_path / "control.sock"))
+    monkeypatch.setattr(module, "STATE_DIR", str(tmp_path / "state"))
     yield module
     sys.modules.pop("main", None)
 
@@ -137,7 +140,7 @@ async def test_installing_is_reported_and_concurrent_requests_share_one_install(
     assert len(runs) == 2
 
 
-async def test_uninstall_hook_only_schedules_a_check(backend, monkeypatch):
+async def test_uninstall_hook_leaves_a_note_and_schedules_a_check(backend, monkeypatch, tmp_path):
     commands = []
 
     async def fake_run(argv, timeout):
@@ -146,14 +149,49 @@ async def test_uninstall_hook_only_schedules_a_check(backend, monkeypatch):
         return 0, "", ""
 
     monkeypatch.setattr(backend, "_run", fake_run)
+    (tmp_path / "state").mkdir()  # the service is installed
     plugin = backend.Plugin()
     await plugin._uninstall()
+    # the note outlives a reboot, which the timer does not; the installed service finds it
+    note = json.loads((tmp_path / "state" / installer.REMOVED_MARKER).read_text())
+    assert note["plugins_dir"] == str(REPO.parent)  # where Decky keeps its plugins, not this one's folder
+    assert abs(note["time"] - time.time()) < 5
     (argv,) = commands
-    assert argv[0] == "systemd-run" and "--on-active=180" in argv
-    assert argv[-2:] == ["uninstall-if-orphaned", str(REPO)]
-    assert "/opt/tcl-me-remo/py_modules" in argv
+    assert argv[0] == "systemd-run" and f"--on-active={installer.ORPHAN_CHECK_DELAY}" in argv
+    assert argv[-2:] == ["/opt/tcl-me-remo/py_modules", "uninstall-if-orphaned"]
     # nothing was stopped or removed directly: an update must not interrupt the service
     assert not any("systemctl" in part for part in argv)
+
+
+async def test_uninstall_hook_does_nothing_without_an_installed_service(backend, monkeypatch, tmp_path):
+    async def fake_run(argv, timeout):
+        raise AssertionError("nothing to schedule")
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    await backend.Plugin()._uninstall()
+    assert not (tmp_path / "state").exists()  # and no state directory is made for the note
+
+
+async def test_uninstall_hook_survives_a_failing_systemd_run(backend, monkeypatch, tmp_path):
+    async def fake_run(argv, timeout):
+        return 1, "", "Failed to connect to bus"
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    (tmp_path / "state").mkdir()
+    await backend.Plugin()._uninstall()
+    assert (tmp_path / "state" / installer.REMOVED_MARKER).exists()  # the service checks after its next start
+
+
+def test_backend_and_installer_agree(backend):
+    # main.py cannot import the installer (it runs in Decky's own Python), so it repeats these.
+    sys.modules.pop("main", None)
+    fresh = importlib.import_module("main")  # without the fixture's replacements
+    assert fresh.STATE_DIR == str(installer.Layout().state_dir)
+    assert fresh.REMOVED_MARKER == installer.REMOVED_MARKER
+    assert fresh.ORPHAN_CHECK_DELAY == installer.ORPHAN_CHECK_DELAY
+    assert fresh.INSTALLER_SNIPPET == installer.INSTALLER_SNIPPET
+    assert fresh.SOCKET_PATH == "/run/tcl-me-remo/control.sock"
+    assert fresh.INSTALLED_MODULES == tuple(str(path / "py_modules") for path in installer.Layout().install_dirs)
 
 
 async def test_remove_and_restart(backend, monkeypatch):

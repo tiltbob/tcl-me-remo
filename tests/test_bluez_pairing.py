@@ -589,6 +589,33 @@ async def test_pairing_warns_while_the_adapter_itself_is_discoverable(h, caplog)
     assert not remote.state.pairing and remote.state.error == ""
 
 
+async def test_a_request_refused_because_pairing_is_open_does_not_become_the_state_s_error(h):
+    """Something else wants the TV while the window is open (a wake action, a key from a
+    shell).  It is told why not - and that is all: the refusal must neither show up in the
+    pairing dialog, nor hide the warning that matters there, nor outlive the window."""
+    remote = await h.remote()
+    await remote.start_pairing(30)
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(0.2)
+    assert err.value.code == "not_paired" and "pairing mode is open" in err.value.message
+    assert remote.state.pairing and remote.state.error == ""
+
+    # With the warning about classic visibility up, it stays what the dialog shows.
+    h.bluez.adapter.props["Discoverable"] = True
+    h.bluez.emit_properties(HCI0, ADAPTER, {"Discoverable": True})
+    await eventually(lambda: "discoverable over classic Bluetooth" in remote.state.error)
+    with pytest.raises(TransportError):
+        await remote.ensure_ready(0.2, wake=True)
+    assert remote.state.error.startswith("this machine is also discoverable over classic Bluetooth")
+
+    await remote.cancel_pairing()
+    assert not remote.state.pairing and remote.state.error == ""
+    # Outside a window the same call's problem is the state's error, as ever.
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(0.2)
+    assert err.value.code == "not_paired" and remote.state.error == "no TV is paired yet"
+
+
 # --------------------------------------------------------------------------- what bluetoothd keeps of a removed TV
 
 

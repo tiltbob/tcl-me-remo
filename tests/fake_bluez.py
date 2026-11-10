@@ -204,6 +204,9 @@ class FakeDevice:
         #: The kernel never resolved the TV's private address: it lists the link under that
         #: address although bluetoothd reports the device under its identity address.
         self.kernel_keeps_rpa = False
+        #: ``hci_conn.state`` as the kernel's connection list reports it while the link exists.
+        #: BT_DISCONN (8) is a link whose HCI Disconnect has been sent and not yet completed.
+        self.hci_state = rawhci.BT_CONNECTED
         #: Behave like the Android HID host: reconnect when bonded and a connectable advert appears.
         self.auto_connect = False
         self.connect_delay = 0.02
@@ -447,7 +450,10 @@ class _Adapter:
         """Everything bluetoothd keeps in memory for this adapter."""
         self.apps: dict[tuple[str, str], _App] = {}
         self.adverts: dict[tuple[str, str], dict[str, Any]] = {}
-        self.pending_adverts: set[tuple[str, str]] = set()   # registration received, not answered yet
+        #: Registrations received and not answered yet, each with a token of its own: bluetoothd
+        #: keeps one client object per registration, so a registration that was unregistered
+        #: while pending and a new one for the same path are two things (src/advertising.c).
+        self.pending_adverts: dict[tuple[str, str], object] = {}
         self.ranges: list[tuple[int, int, tuple[str, str]]] = []
         self.last_handle = BUILTIN_LAST_HANDLE
 
@@ -748,7 +754,7 @@ class FakeBluez:
             if interface == ADV_MANAGER and member == "UnregisterAdvertisement":
                 key = (msg.sender, body[0])
                 if key in adapter.pending_adverts:
-                    adapter.pending_adverts.discard(key)  # the registration under way fails
+                    del adapter.pending_adverts[key]  # the registration under way fails
                     return "", []
                 if adapter.adverts.pop(key, None) is None:
                     raise bluez_error("DoesNotExist")
@@ -1017,13 +1023,16 @@ class FakeBluez:
             raise bluez_error("AlreadyExists")
         if len(adapter.adverts) + len(adapter.pending_adverts) >= self.max_adverts:
             raise bluez_error("NotPermitted", "Maximum advertisements reached")
-        adapter.pending_adverts.add(key)
+        mine = adapter.pending_adverts[key] = object()
         try:
             props = await self._parse_advertisement(owner, path)
-            if key not in adapter.pending_adverts:
-                raise bluez_error("Failed", "Failed to complete registration")  # unregistered meanwhile
+            if adapter.pending_adverts.get(key) is not mine:
+                # Unregistered meanwhile (client_free: "Failed to complete registration"),
+                # whether or not the same path has been registered anew since.
+                raise bluez_error("Failed", "Failed to complete registration")
         finally:
-            adapter.pending_adverts.discard(key)
+            if adapter.pending_adverts.get(key) is mine:
+                del adapter.pending_adverts[key]
         adapter.adverts[key] = props
         self.events.append(("advert_registered", dict(props)))
         if props["Type"] == "peripheral":
@@ -1101,7 +1110,7 @@ class FakeRawHub:
     def connections(self, dev_id: int) -> list[rawhci.HciConnection]:
         adapter = f"{ROOT}/hci{dev_id}"
         return [
-            rawhci.HciConnection(device.conn_handle, device.hci_address, rawhci.LE_LINK, False, rawhci.BT_CONNECTED)
+            rawhci.HciConnection(device.conn_handle, device.hci_address, rawhci.LE_LINK, False, device.hci_state)
             for device in self.bluez.devices
             if device.adapter == adapter and device.connected
         ]

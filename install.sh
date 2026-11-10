@@ -2,8 +2,8 @@
 # Install (or update) the tcl-me-remo service from this checkout.
 #
 #   ./install.sh              install or update, then start the service
-#   ./install.sh uninstall    stop and remove the service (settings are kept)
-#   ./install.sh uninstall --purge
+#   ./install.sh uninstall    stop and remove the service (settings and the pairing are kept)
+#   ./install.sh uninstall --purge    ... and delete the settings and the Bluetooth pairing
 #   ./install.sh status
 #
 # The Decky plugin does the same thing on its own; this script is for using the service
@@ -27,7 +27,9 @@ if [[ "$command" != "status" && "$(id -u)" -ne 0 ]]; then
     fi
     echo "Root is needed to install a system service; asking sudo."
     echo "(On SteamOS, set a password first with: passwd)"
-    exec sudo -- "$0" "$command" "$@"
+    # Not "$0": started as "bash install.sh" that is a bare name, which sudo would look up
+    # in its own PATH.  And through bash, so that a lost execute bit does not matter.
+    exec sudo -- bash "$here/install.sh" "$command" "$@"
 fi
 
 args=("$command" "$@")

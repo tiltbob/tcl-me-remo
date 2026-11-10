@@ -16,7 +16,8 @@ The facts that shape it (BlueZ 5.79+ and Android sources, see the research notes
   seconds before suspend.  Never otherwise: with that option off a TV in standby is not
   poked unless there is something to send, and a link we closed on purpose (disconnect(),
   idle time-out) is "parked": it stays closed until the next ensure_ready, or until the
-  service says the machine has woken up again (resume_link).
+  service says the machine has woken up again (resume_link).  The idle time-out applies to
+  every link that carries no key, also to one that background calling brought up.
 * **Readiness cannot be observed.**  bluetoothd tells us the link is up (``Device1.Connected``)
   but neither that it is encrypted nor that the TV's HID host finished setting up, so a
   settle delay stands in for both.
@@ -212,6 +213,9 @@ class _Problem:
     code: str
     message: str
     transient: bool = False  # worth waiting for (registration under way, adapter still appearing)
+    #: Whether it becomes ``state.error``.  "Pairing mode is open" does not: it is an answer to
+    #: one caller, true only while the window is, and it would hide what the window has to say.
+    lasting: bool = True
 
 
 class BleRemote:
@@ -434,7 +438,7 @@ class BleRemote:
             log.info("adapter changed: takes effect when the service restarts")
         if self._started:
             self._evaluate()
-            if self._ready and old.idle_disconnect_seconds != cfg.idle_disconnect_seconds:
+            if old.idle_disconnect_seconds != cfg.idle_disconnect_seconds:
                 self._restart_idle_watch()
             if self._ready and self._delivery == "raw" and self._direct_delivery() == "off":
                 # Direct delivery was just forbidden: keys can no longer reach the TV.
@@ -630,10 +634,8 @@ class BleRemote:
         try:
             if not self._started or self._stopped or not self._parked:
                 return
-            if self._cfg.idle_disconnect_seconds > 0:
-                # The user wants the link down while nothing is sent; calling the TV now would
-                # bring up a link that no idle time-out ever closes (it starts with a key).
-                return
+            # With idle_disconnect_seconds the link this brings up is closed (and parked) again
+            # by the idle time-out like any other link that carries no key, see _idle_watch.
             self._parked = False
             if self._keeping_link():
                 log.info("the machine is awake again: calling the TV in the background")
@@ -766,6 +768,7 @@ class BleRemote:
         self._closing_at = None
         self._links += 1
         log.info("TV connected (%s), link %d since the HID service was registered", path, self._links)
+        self._restart_idle_watch()
 
     def _link_down(self, *, adapter_gone: bool = False) -> None:
         expected = self._closing_at is not None
@@ -1000,6 +1003,13 @@ class BleRemote:
             # A waiting ensure_ready or an opening pairing window takes the advertisement over.
             if self._pairing is None and self._ensure_active == 0:
                 await self._finish(self._advertiser.stop())
+            if self._reconnect_task is asyncio.current_task():
+                # Not called off but run out: the policy stopped applying (the link was parked,
+                # the option switched off).  It may apply again by now - resume_link() a moment
+                # after the idle time-out, say - and whoever noticed found this task still
+                # winding down and started none.
+                self._reconnect_task = None
+                self._call_in_background()
 
     async def _start_beacon(self, timeout: float = CALL_TIMEOUT) -> None:
         """Broadcast the configured wake beacon next to the connectable advertisement.
@@ -1036,8 +1046,8 @@ class BleRemote:
             )
         if self._pairing is not None:
             if self._pairing.closed:
-                return _Problem("not_paired", "pairing mode is closing", transient=True)
-            return _Problem("not_paired", "pairing mode is open; finish or cancel pairing first")
+                return _Problem("not_paired", "pairing mode is closing", transient=True, lasting=False)
+            return _Problem("not_paired", "pairing mode is open; finish or cancel pairing first", lasting=False)
         if not self._cfg.tv_address:
             return _Problem("not_paired", "no TV is paired yet")
         if not self._tv_path:
@@ -1175,6 +1185,8 @@ class BleRemote:
                     if problem.transient and remaining > 0 and grace > 0:
                         await self._wakeup.wait(min(remaining, grace), seen)
                         continue
+                    if not problem.lasting:
+                        raise TransportError(problem.code, problem.message)
                     raise self._fail(problem.code, problem.message)
 
                 if self._closing():
@@ -1261,6 +1273,7 @@ class BleRemote:
 
     async def _leave_ensure(self) -> None:
         """Take down what ensure_ready put on air and hand over to the background policy."""
+        self._last_activity = time.monotonic()  # the idle time-out counts from the end of the wait
         if not (self._beacon.active or self._advertiser.active):
             self._ensure_active -= 1
             self._call_in_background()
@@ -1397,16 +1410,36 @@ class BleRemote:
         task, self._idle_task = self._idle_task, None
         if task is not None and not task.done() and task is not asyncio.current_task():
             task.cancel()
-        if self._ready and self._cfg.idle_disconnect_seconds > 0 and not self._stopped:
+        if self._connected and self._cfg.idle_disconnect_seconds > 0 and not self._stopped:
             self._idle_task = asyncio.ensure_future(self._idle_watch())
 
+    def _link_in_use(self) -> bool:
+        """Somebody is sending on the link, waiting for it, pairing over it or closing it."""
+        return bool(
+            self._ensure_active
+            or self._send_lock.locked()
+            or self._pairing is not None
+            or self._pair_opening
+            or self._closing()
+        )
+
     async def _idle_watch(self) -> None:
-        while self._ready and self._connected:
+        """``idle_disconnect_seconds``: drop a link that has carried no key for that long.
+
+        That goes for every link, however it came up: one that was used, and equally one the
+        TV opened because it was called in the background (after boot, a wake or a drop) or
+        while pairing, on which nothing was sent at all.  The time counts from the last key,
+        or from the moment the link came up or was last waited for.
+        """
+        while self._connected:
             idle = self._cfg.idle_disconnect_seconds
             if idle <= 0:
                 return
-            due = self._last_activity + idle - time.monotonic()
-            if due <= 0 and not self._send_lock.locked():
+            now = time.monotonic()
+            if self._link_in_use():
+                self._last_activity = now
+            due = max(self._last_activity, self._connected_at) + idle - now
+            if due <= 0:
                 log.info("no key for %gs: dropping the TV link", idle)
                 self._parked = True  # the point is to free the radio, not to reconnect at once
                 await self._drop_link_quietly()
@@ -1755,6 +1788,7 @@ class BleRemote:
         finally:
             if self._pairing is window:
                 self._pairing = None
+            self._last_activity = time.monotonic()  # for the idle time-out, pairing was use
             if self._pairing_note == CLASSIC_VISIBLE:
                 # That was a warning about the open window.  How a window ended is a note of
                 # its own, and a window the user closed leaves none.

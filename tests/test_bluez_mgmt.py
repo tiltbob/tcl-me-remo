@@ -104,6 +104,44 @@ def test_target_follows_the_kernel_when_it_knows_the_link_under_a_private_addres
     assert mgmt.disconnect_target(TV, "public", [link(RPA)]) == (RPA, mgmt.BDADDR_LE_RANDOM)
 
 
+def test_a_link_listed_under_the_tv_s_address_rules_every_other_link_out():
+    """The kernel lists links in every state.  A TV link that is on its way down (BT_DISCONN = 8:
+    bluetoothd's own Disconnect has just gone out) must not make the only *other* incoming
+    link look like the TV's: ending somebody else's link cannot be taken back."""
+    phone = link("5B:00:00:00:00:01", handle=2)  # a resolvable private address, a real candidate otherwise
+    for state in (8, 9, 2):  # BT_DISCONN, BT_CLOSED, BT_OPEN
+        with pytest.raises(MgmtError, match="already closing the TV's link"):
+            mgmt.disconnect_target(TV, "public", [link(TV, state=state), phone])
+        with pytest.raises(MgmtError, match="already closing the TV's link"):
+            mgmt.disconnect_target(TV, "public", [phone, link(TV, state=state)])
+    # ... and while the TV's own link is up, it is the one, whoever else is connected.
+    assert mgmt.disconnect_target(TV, "public", [phone, link(TV)]) == (TV, mgmt.BDADDR_LE_PUBLIC)
+    assert mgmt.disconnect_target(TV, "public", [link(TV, state=7), phone]) == (TV, mgmt.BDADDR_LE_PUBLIC)  # BT_CONFIG
+
+
+def test_another_address_is_only_taken_for_the_tv_when_nothing_else_can_be_meant():
+    assert mgmt.is_resolvable_private(RPA) and mgmt.is_resolvable_private("7f:ff:ff:ff:ff:ff")
+    for other in ("C0:01:02:03:04:05", "3A:11:22:33:44:55", "80:11:22:33:44:55", "00:1A:7D:DA:71:13", "nonsense"):
+        assert not mgmt.is_resolvable_private(other)  # static random, non-resolvable, public-looking
+
+    # The only incoming link, but not under an address a TV's privacy would produce.
+    for other in ("C0:01:02:03:04:05", "3A:11:22:33:44:55", "00:1A:7D:DA:71:13"):
+        with pytest.raises(MgmtError, match="neither the TV's address nor a private address"):
+            mgmt.disconnect_target(TV, "public", [link(other)])
+    # A second incoming link in any state leaves a doubt, also one that is closing: it might
+    # be the TV's, and then the one that is up is not.
+    with pytest.raises(MgmtError, match="none is listed as the TV"):
+        mgmt.disconnect_target(TV, "public", [link(RPA), link("5B:00:00:00:00:01", handle=2, state=8)])
+    # The single candidate has to be up itself.
+    with pytest.raises(MgmtError, match="closing already"):
+        mgmt.disconnect_target(TV, "public", [link(RPA, state=8)])
+    # Links we opened (a gamepad) and classic links are nobody's candidates and no cause for doubt.
+    others = [link("5B:00:00:00:00:09", handle=1, out=True), link("22:22:22:22:22:22", handle=2, link_type=0x01)]
+    assert mgmt.disconnect_target(TV, "public", [*others, link(RPA)]) == (RPA, mgmt.BDADDR_LE_RANDOM)
+    with pytest.raises(MgmtError, match="no Bluetooth LE link from the TV"):
+        mgmt.disconnect_target(TV, "public", others)
+
+
 def test_target_without_the_kernel_list_is_what_bluetoothd_itself_would_send():
     assert mgmt.disconnect_target(TV, "public", None) == (TV, mgmt.BDADDR_LE_PUBLIC)
     with pytest.raises(MgmtError, match="what kind of address"):

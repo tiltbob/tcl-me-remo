@@ -29,7 +29,9 @@ when the session ends; it is how the next session, on any machine, learns what i
 ## Tools
 
 ```sh
-tcl-me-remo status            # link state: paired / connected / ready, delivery bluez or raw
+tcl-me-remo status            # one line on the link: no TV / calling / connected
+tcl-me-remo status --json | grep -E '"(connected|ready|subscribed|delivery|error)"'
+                              # the same in full; "delivery" is "bluez" or "raw" while ready
 tcl-me-remo logs -n 100       # what the service did, step by step
 journalctl -u tcl-me-remo -b  # the same, for the whole boot
 sudo btmon -w /tmp/t3.btsnoop # radio-level trace of one attempt (Ctrl+C to stop)
@@ -49,6 +51,12 @@ adb shell dumpsys tv_input | grep -i inputId      # input ids for the Wi-Fi assi
 adb is the only way for an unattended session to see what the TV did. Without it, ask the
 person.
 
+Reading the plain `status` line: `connected` means ready for keys. `connected, waiting for
+the TV to subscribe` means the link is up and no key has been asked for yet; that is the
+normal resting state after a boot or a wake and says nothing about the TV's subscription
+(the `subscribed` field of `status --json` does). How keys travel (`delivery`) is not in
+the plain output at all; `tcl-me-remo doctor` shows it on its `TV link` line.
+
 ## T1. Pairing
 
 1. `tcl-me-remo pair` (or Pair TV in the panel).
@@ -67,19 +75,36 @@ the question is whether `RequestAuthorization` reached this service's agent or S
 
 Two more runs, once plain pairing works. Forget the TV on both sides before each.
 
-**T1a. With another Bluetooth pairing screen open.** In Desktop Mode open the Bluetooth
-settings page (it makes the adapter discoverable over classic Bluetooth for as long as it is
-open), leave it open and start pairing mode.
+**T1a. While the machine itself is discoverable.** The warning this tests is for a machine
+that is discoverable over classic Bluetooth while pairing mode is open. Some Bluetooth
+settings pages cause that for as long as they are open; whether SteamOS's do is not known,
+so find out first. With pairing mode closed:
+
+```sh
+bluetoothctl show | grep Discoverable     # "no" is the normal state
+```
+
+Open the Bluetooth settings page in Desktop Mode and run it again; do the same with Steam's
+Bluetooth page in Game Mode. Record for each page whether it says `yes` while the page is
+open. Then start pairing mode with the machine discoverable: with such a page open, or, if
+neither page does it, by hand (ask first; it makes the machine visible to nearby devices for
+up to three minutes):
+
+```sh
+bluetoothctl discoverable on              # and "bluetoothctl discoverable off" to end it
+```
 
 Expected: the pairing dialog and `tcl-me-remo status` show a Bluetooth problem that says the
 machine is also discoverable over classic Bluetooth; the warning goes away within a second or
-two of closing the settings page, and comes back if it is opened again.
+two of the machine no longer being discoverable (page closed, or `discoverable off`), and
+comes back if it is again.
 
-Record: whether the warning appeared, what the TV's list showed while the page was open (the
-machine once, twice, as what kind of device), and whether pairing from the TV worked in that
-state. If it failed, a `btmon` trace shows whether the TV tried classic pairing (`Connect
-Request` / `IO Capability Request` instead of an LE connection). `bluetoothctl show | grep
-Discoverable` before and after confirms that the service did not change the setting.
+Record: which pages make the machine discoverable, whether the warning appeared, what the
+TV's list showed meanwhile (the machine once, twice, as what kind of device), and whether
+pairing from the TV worked in that state. If it failed, a `btmon` trace shows whether the TV
+tried classic pairing (`Connect Request` / `IO Capability Request` instead of an LE
+connection). `bluetoothctl show | grep Discoverable` after pairing mode has closed confirms
+that the service did not change the setting; leave it at `no`.
 
 **T1b. A pairing aborted half-way, then pairing again.** Start pairing mode, choose the
 machine on the TV, and as soon as the TV says it is pairing or connecting, leave the TV's
@@ -108,7 +133,7 @@ for key in HOME DOWN DOWN UP RIGHT LEFT OK BACK VOL_UP VOL_DOWN; do tcl-me-remo 
 Expected: the TV reacts to each as its own remote would. With adb, `getevent -lt` shows
 `KEY_HOMEPAGE`, `KEY_DOWN`, `KEY_SELECT`, `KEY_BACK` and so on.
 
-If nothing reacts but `status` says `ready`: this is the subscription problem of T6 showing
+If nothing reacts but `status --json` says `"ready": true`: this is the subscription problem of T6 showing
 up early, or the attributes' encryption requirement being refused. Check
 `dumpsys input` on the TV for the device, and try
 `tcl-me-remo config bluetooth.gatt_security plain` followed by `sudo systemctl restart tcl-me-remo`
@@ -175,11 +200,14 @@ reconnect.
 **T5a. How the link ends, and whether the TV comes back.** The service ends the link itself
 just before the machine sleeps, so that the TV is told "remote user terminated" (0x13) and
 not "power off" (0x15), which the kernel would send. Neither that this happens nor that it
-makes a difference has been seen on hardware. Record a trace across the suspend, in a
-terminal that survives it (ssh, or Desktop Mode), and read it afterwards:
+makes a difference has been seen on hardware. Record a trace across the suspend and read it
+afterwards. Run the recorder as a unit of its own: one started in an ssh session dies with
+the session, and an ssh session over Wi-Fi rarely survives a suspend.
 
 ```sh
-sudo btmon -w /tmp/t5.btsnoop        # start, suspend and wake as above, wait 30 s, Ctrl+C
+sudo systemd-run --unit=t5-trace -p StandardOutput=null btmon -w /tmp/t5.btsnoop
+#   suspend and wake as above, wait 30 s, then:
+sudo systemctl stop t5-trace
 btmon -r /tmp/t5.btsnoop | grep -E -A6 "MGMT Command: Disconnect|HCI Command: Disconnect|Disconnect Complete|LE.*Connection Complete"
 ```
 
@@ -196,21 +224,36 @@ In the trace, before the suspend:
 - The key-up of `SLEEP` (an `ATT: Handle Value Notification` with an all-zero value) goes
   out before the Disconnect, and the TV turns off.
 
-After the wake, without touching anything: does `tcl-me-remo status` show `connected` again
-within about ten seconds (`Keep calling the TV` on), and does the trace show the TV's `LE
-Connection Complete`? This is the question the reason code is about. Record it together with
-the TV's Android version.
-
-For comparison, once: `sudo systemctl stop tcl-me-remo` with the TV connected, suspend, wake,
-`sudo systemctl start tcl-me-remo`. Now the kernel ends the link (0x15 in the trace). Does
-the TV connect after this wake as well? If it reconnects after 0x13 and not after 0x15 (or
-the other way round, or always, or never), that is worth a line in `hardware-results/` on
-its own.
+After the wake, without touching anything: is the link back within about ten seconds (`Keep
+calling the TV` on), and does the trace show the TV's `LE Connection Complete`? In
+`tcl-me-remo status --json`, `"connected": true` is the answer; the plain `status` line then
+reads `connected` after a wake that sent a key, and `connected, waiting for the TV to
+subscribe` after one that did not, which is the link being up and unused, not a fault. This
+is the question the reason code is about. Record it together with the TV's Android version.
 
 Also try a wake on which nothing is sent to the TV (`tcl-me-remo config events.resume_tv_on
 false`, and `events.resume_switch_input false`): the log should show `the machine is awake
 again: calling the TV in the background`, and the link should be back without any action
-having run. Set the options back afterwards.
+having run. Do it once with the TV on and once with the TV in standby, and for the second
+record whether the TV **turned on**: it is called on such a wake although nothing is sent,
+and a TV that wakes from that alone needs `bluetooth.reconnect_on_drop` off. Set the options
+back afterwards.
+
+**The comparison with 0x15. Do this last in a session, and only once:** it costs the TV's
+subscription. `sudo systemctl stop tcl-me-remo` with the TV connected takes the HID service
+away from BlueZ, and after `start` BlueZ no longer knows that the TV subscribed. An Android
+11 to 13 TV then gets no keys until it is paired again (or `bluetooth.raw_notify` allows
+direct delivery, see T6), so nothing that depends on keys should follow this step.
+
+With the trace running: `sudo systemctl stop tcl-me-remo`, suspend, wake, `sudo systemctl
+start tcl-me-remo`. The expectation is that the link stays up without the service and that
+the kernel ends it at suspend with 0x15. Neither is certain: the TV may close the link
+itself when the HID service disappears. So read the trace before drawing any conclusion.
+Only if it shows the TV's link still up at suspend entry and a Disconnect with reason 0x15
+for its handle does this run say anything about 0x15; otherwise record what ended the link
+instead, and leave the question open. If the run counts: does the TV connect after this
+wake as well? Reconnecting after 0x13 and not after 0x15 (or the other way round, or always,
+or never) is worth a line in `hardware-results/` on its own.
 
 ## T6. After a reboot (the subscription problem)
 
@@ -224,19 +267,19 @@ First without rebooting (ask first: this disconnects every Bluetooth controller 
 ```sh
 sudo systemctl restart bluetooth
 sleep 5
-tcl-me-remo connect ; tcl-me-remo status ; tcl-me-remo key HOME
+tcl-me-remo connect ; tcl-me-remo status --json | grep -E '"(ready|subscribed|delivery)"' ; tcl-me-remo key HOME
 ```
 
-Record: `delivery` (`bluez` means the TV re-subscribed, `raw` means direct delivery), whether
-the log shows a reconnect ("bounce") and whether HOME reached the TV. Take a
-`sudo btmon -w /tmp/t6.btsnoop` trace of this test; it shows the Service Changed indication,
-any CCC writes by the TV, and the injected notification.
+Record: `delivery` (`bluez` means the TV re-subscribed, `raw` means direct delivery; it is
+empty when `connect` failed), whether the log shows a reconnect ("bounce") and whether HOME
+reached the TV. Take a `sudo btmon -w /tmp/t6.btsnoop` trace of this test; it shows the
+Service Changed indication, any CCC writes by the TV, and the injected notification.
 
 What happens next depends on the kernel. `tcl-me-remo doctor` has a `direct delivery` line
 that names the kernel and says what the setting comes to; `uname -r` is the same version.
 
-**If the TV subscribes again** (`delivery: bluez`): Android 14 or newer, nothing more to
-test here. Record it.
+**If the TV subscribes again** (`"delivery": "bluez"`): Android 14 or newer, nothing more
+to test here. Record it.
 
 **If it does not, on Linux 6.17 or newer** (direct delivery is used by default):
 
@@ -256,9 +299,18 @@ way to control the machine at hand):
 
 ```sh
 tcl-me-remo config bluetooth.raw_notify on
-tcl-me-remo connect ; tcl-me-remo status ; tcl-me-remo key HOME
+tcl-me-remo connect ; tcl-me-remo status --json | grep -E '"(ready|subscribed|delivery)"' ; tcl-me-remo key HOME
+sudo dmesg | grep "sent 0 < count"
 ```
 
+- **First find out which kind of kernel this is.** The version number does not say: the
+  part of the 6.17 fix that matters was also put into older stable kernels (6.12.45,
+  6.6.104 and 6.1.150 among them), and a vendor kernel may or may not carry it. If `dmesg`
+  shows `sent 0 < count` lines after the key, the kernel has the fix: nothing was
+  miscounted, the service's repair has nothing to repair, and controllers that keep working
+  prove nothing about it. Record the result of the steps below as "kernel with the fix
+  (clamped), repair not exercised", never as a confirmation of the repair. Only without
+  those lines do the steps below test the repair.
 - As above: the injected notifications in the trace, and the TV reacting.
 - Send about ten keys, then close the link (`tcl-me-remo disconnect`) with the trace still
   running. Right after the TV's `Disconnect Complete` the trace must show `< HCI Command: LE
@@ -284,7 +336,7 @@ tcl-me-remo connect ; tcl-me-remo status ; tcl-me-remo key HOME
 Then the real thing: put the TV in standby, reboot the machine, and see whether the TV comes
 on. `tcl-me-remo logs -n 60` afterwards shows the boot action.
 
-If keys do not arrive with `delivery: raw`, this is the most valuable bug report this project
+If keys do not arrive with `"delivery": "raw"`, this is the most valuable bug report this project
 can get: keep the btmon trace, the logs and the TV's Android version.
 
 ## T7. Shutdown and reboot
@@ -327,7 +379,7 @@ say so; the Wi-Fi assist (T10) is then the way to switch inputs.
 
 ## T9. Controllers alongside the TV link
 
-With the TV connected (`tcl-me-remo status` shows `ready`): connect a Bluetooth controller,
+With the TV connected (`tcl-me-remo status` shows `connected`): connect a Bluetooth controller,
 play for a minute, turn the controller off and on again. Try one classic controller and one
 Bluetooth LE controller if available.
 

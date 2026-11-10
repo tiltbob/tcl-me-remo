@@ -224,11 +224,30 @@ class Service:
             self.phase = Phase.GOING_DOWN
             self._down_epoch += 1
             self._offset_seen = self._sleep_offset()
+        epoch = self._down_epoch
         try:
             return await self._down_action(name, budget if budget is not None else DEFAULT_DOWN_BUDGET)
         finally:
             if not simulate:
-                self.phase = Phase.DOWN
+                self._down_handled(epoch)
+
+    def _down_handled(self, epoch: int) -> None:
+        """The down action of down event number ``epoch`` has ended: note where that leaves us.
+
+        Normally the machine is now down.  But the action can outlive the event: logind stops
+        waiting after its delay, and a machine that slept with the action unfinished wakes up
+        with it still running; a shutdown can be called off half-way.  The up event (or the
+        cancellation) has then been handled already, and it is the newer truth.  Marking the
+        machine "down" over it would make the next real suspend look like a duplicate, and
+        the action's last step has just parked the link that the up event un-parked.
+        """
+        if self._down_epoch != epoch:
+            return  # a newer down event is being handled; it will say how things stand
+        if self.phase == Phase.GOING_DOWN:
+            self.phase = Phase.DOWN
+        elif self.phase == Phase.RUNNING:
+            log.info("the machine came back up while the down action was still running")
+            self._resume_link()
 
     async def _down_action(self, name: str, budget: float) -> dict[str, Any]:
         cfg = self.cfg
@@ -253,9 +272,12 @@ class Service:
                 # Leave no half-open link behind: after a suspend the radio state is gone and
                 # a stale "connected" would swallow the wake key.  And end it ourselves, at
                 # once: a link the kernel ends as part of suspend or power-off is ended with
-                # reason "power off" (0x15), after which several Android versions do not call
-                # a remote back, while the reason a remote itself gives (0x13) is the one
-                # they all handle.  Shielded so that running out of budget does not skip it.
+                # reason "power off" (0x15), while a remote itself gives 0x13.  From Android's
+                # source, the HID host of Android 13 and 14 re-arms its connection to a remote
+                # after 0x13 and not after 0x15 (another layer there may reconnect anyway),
+                # Android 11 and 12 after neither, Android 16 after any.  Whether it matters
+                # on a real TV is not known; 0x13 is never the worse of the two.
+                # Shielded so that running out of budget does not skip it.
                 await asyncio.shield(self._disconnect_quietly())
 
         return await self._run_action("tv_off", name, action, mode="preempt", budget=budget)

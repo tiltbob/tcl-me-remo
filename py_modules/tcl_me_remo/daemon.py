@@ -21,7 +21,7 @@ import signal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import __version__, config, logsetup, paths, system
+from . import __version__, config, installer, logsetup, paths, system
 from .interfaces import Remote, WifiAssist
 from .ipc import IpcServer
 from .lifecycle import Logind
@@ -70,12 +70,16 @@ class Daemon:
         uptime: Callable[[], float] = system_uptime,
         shutdown_kind: Callable[[], Awaitable[str | None]] = system.shutdown_kind,
         watchdog_interval: float = WATCHDOG_INTERVAL,
+        run_command: system.Runner = system.run_command,
+        orphan_check_delay: float = installer.ORPHAN_CHECK_DELAY,
     ):
         self._make_remote = make_remote
         self._make_wifi = make_wifi
         self._uptime = uptime
         self._shutdown_kind = shutdown_kind
         self._watchdog_interval = watchdog_interval
+        self._run_command = run_command
+        self._orphan_check_delay = orphan_check_delay
         self._stop = asyncio.Event()
         self._bus_lost = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -147,6 +151,7 @@ class Daemon:
             elif first_start:
                 log.info("first start is long after power-on: not treating it as a boot")
             self._spawn(self._watchdog())
+            self._spawn(self._orphan_check())
 
             system.sd_notify("READY=1")
             self.ready.set()
@@ -242,6 +247,22 @@ class Daemon:
             if self.service.slept_since_last_event():
                 log.info("clock jump detected: the machine was suspended")
                 self._spawn(self.service.handle_event("resume"))
+
+    async def _orphan_check(self) -> None:
+        """Some minutes after start-up: was the Decky plugin removed while nobody checked?
+
+        The plugin's uninstall hook leaves a note and sets a timer for the check, and a
+        reboot discards the timer.  If the note is (still) there, the installer is started
+        outside this service to decide; see ``installer.uninstall_if_orphaned``.
+        """
+        await asyncio.sleep(self._orphan_check_delay)
+        argv = installer.orphan_check_command(paths.state_dir())
+        if argv is None:
+            return
+        log.info("the Decky plugin left a note that it was removed; checking whether it is gone for good")
+        code, _ = await self._run_command(argv, 15.0)
+        if code != 0:
+            log.warning("could not start that check (systemd-run failed); it is made again after the next start")
 
 
 def main() -> int:

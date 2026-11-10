@@ -469,6 +469,77 @@ async def test_a_shutdown_that_is_called_off_resumes_the_link(tmp_path):
     assert h.remote.resumes == 1 and h.service.phase == Phase.RUNNING
 
 
+class OrderedRemote(FakeRemote):
+    """Records the order of the two calls that park and un-park the link."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.order = []
+
+    async def disconnect(self, *, fast=False):
+        self.order.append("disconnect")
+        await super().disconnect(fast=fast)
+
+    def resume_link(self):
+        self.order.append("resume_link")
+        super().resume_link()
+
+
+@pytest.mark.parametrize("patch", [None, {"events": {"resume_tv_on": False, "resume_switch_input": False}}])
+async def test_a_wake_that_overtakes_the_down_action_is_the_last_word(tmp_path, patch):
+    """logind stops waiting after its delay, so a machine can sleep and wake with the down
+    action unfinished.  When that action then ends, the machine is up: it must not be marked
+    "down" (the next suspend would look like a duplicate and leave the TV on), and the link
+    its last step has just parked must not stay parked."""
+    h = Harness(tmp_path, remote=OrderedRemote(), patch=patch)
+    h.remote.state.connected = h.remote.state.ready = True
+    h.remote.key_delay = 0.1
+    down = asyncio.create_task(h.service.handle_event("suspend"))
+    await asyncio.sleep(0.02)
+    assert h.service.phase == Phase.GOING_DOWN
+    h.clock.sleep_for(600)
+    up = await h.service.handle_event("resume")
+    assert (await down)["ok"] and up["ok"]
+    assert h.service.phase == Phase.RUNNING and h.service.status()["phase"] == "running"
+    # Un-parked when the wake was handled, parked by the down action's last step, un-parked again.
+    assert h.remote.order == ["resume_link", "disconnect", "resume_link"]
+
+    # The next suspend is a real one.
+    h.remote.state.connected = h.remote.state.ready = True
+    h.remote.keys.clear()
+    record = await h.service.handle_event("suspend")
+    assert not record["skipped"] and h.remote.key_names() == ["SLEEP"]
+    assert h.service.phase == Phase.DOWN and h.remote.order[-1] == "disconnect"
+
+
+async def test_a_shutdown_called_off_while_its_action_still_runs_leaves_the_link_resumed(tmp_path):
+    h = Harness(tmp_path, remote=OrderedRemote())
+    h.remote.state.connected = h.remote.state.ready = True
+    h.remote.key_delay = 0.1
+    down = asyncio.create_task(h.service.handle_event("shutdown"))
+    await asyncio.sleep(0.02)
+    h.service.cancel_shutdown()
+    assert (await down)["ok"]
+    assert h.service.phase == Phase.RUNNING
+    assert h.remote.order == ["resume_link", "disconnect", "resume_link"]
+    assert not (await h.service.handle_event("shutdown"))["skipped"]
+
+
+async def test_an_overtaken_down_action_does_not_speak_for_the_newer_down_event(tmp_path):
+    """A sleep nobody announced the end of, then the next suspend while the first action is
+    still running: the machine *is* going down, and nothing is to be resumed."""
+    h = Harness(tmp_path, remote=OrderedRemote())
+    h.remote.state.connected = h.remote.state.ready = True
+    h.remote.key_delay = 0.1
+    first = asyncio.create_task(h.service.handle_event("suspend"))
+    await asyncio.sleep(0.02)
+    h.clock.sleep_for(600)
+    second = await h.service.handle_event("suspend")
+    assert not second["skipped"]
+    await first
+    assert h.service.phase == Phase.DOWN and "resume_link" not in h.remote.order
+
+
 async def test_suspend_preempts_a_running_wake_sequence(tmp_path):
     h = Harness(tmp_path)
     h.service._sleep = asyncio.sleep  # real time: the 2 s delay_after_wake keeps tv_on busy

@@ -165,3 +165,41 @@ def test_service_unavailable_exit_code(tmp_path, monkeypatch):
     out, err = io.StringIO(), io.StringIO()
     assert cli.run(["status"], out=out, err=err) == 3
     assert "Is the service running?" in err.getvalue()
+
+
+def test_uninstall_runs_the_installed_installer(monkeypatch):
+    from tcl_me_remo import installer
+
+    spawned, exit_code = [], 0
+
+    def spawn(argv):
+        spawned.append(argv)
+        return exit_code
+
+    monkeypatch.setattr(installer, "_spawn", spawn)
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    # as a normal user: through sudo, with a word about the password SteamOS does not have
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 1000)
+    out, err = io.StringIO(), io.StringIO()
+    assert cli.run(["uninstall", "--purge"], out=out, err=err) == 0
+    assert spawned[-1][:2] == ["sudo", "--"] and spawned[-1][-2:] == ["uninstall", "--purge"]
+    assert spawned[-1][2:] == installer.self_command("uninstall", "--purge")  # this copy's own installer
+    assert "passwd" in out.getvalue() and "Decky" in out.getvalue()
+
+    # as root: directly; settings are kept unless asked otherwise; a failure is passed on
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 0)
+    exit_code = 1
+    assert cli.run(["uninstall"], out=io.StringIO(), err=io.StringIO()) == 1
+    assert spawned[-1] == installer.self_command("uninstall")
+
+    # sudo gave up (no password set, or a wrong one): say what to do about it
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 1000)
+    err = io.StringIO()
+    assert cli.run(["uninstall"], out=io.StringIO(), err=err) == 1 and "passwd" in err.getvalue()
+
+    # no sudo: say so instead of failing obscurely
+    monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+    err = io.StringIO()
+    assert cli.run(["uninstall"], out=io.StringIO(), err=err) == 1 and "run this as root" in err.getvalue()
+    assert len(spawned) == 3
