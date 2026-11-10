@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -79,6 +80,17 @@ SLEEP_JUMP_SECONDS = 1.0
 # does not take it back when the wait ends, so the wait only bounds how long we look on.
 DISCONNECT_SECONDS = 0.5
 HISTORY_LENGTH = 20
+# The longest budget a down event may be given.  A request with more is refused; the
+# daemon's own (derived from logind's setting, which can be anything) is cut to it.
+MAX_EVENT_BUDGET = 120.0
+# Upper lengths of what an action record keeps.  Records are held in memory (the history) and
+# sent whole with every status reply, which has to stay well under ipc.MAX_LINE whatever
+# text a request or a TV managed to get into a message.
+MAX_DETAIL_CHARS = 600
+MAX_STEP_CHARS = 400
+MAX_STEPS_KEPT = 40
+# The most a "logs" reply carries, in bytes of JSON; older lines are left out beyond that.
+MAX_LOGS_BYTES = 768 * 1024
 
 Trace = list
 
@@ -138,6 +150,7 @@ class Service:
         sleep_offset_fn: Callable[[], float] = sleep_offset,
         config_problems: list[str] | None = None,
         power_state_path: Path | str | None = None,
+        lasting_config_problems: list[str] | None = None,
     ):
         self.cfg = cfg
         self.remote = remote
@@ -149,6 +162,9 @@ class Service:
         self._sleep = sleep
         self._sleep_offset = sleep_offset_fn
         self.config_problems: list[str] = list(config_problems or [])
+        # Those of them that a later save does not settle (the settings file was unusable and
+        # has been moved aside): they stay in the status until the service restarts.
+        self._lasting_problems: list[str] = list(lasting_config_problems or [])
         # Which way the last power key we sent switched the TV: "on", "off", or "" when that
         # is not known.  Kept in a file (when a path is given) because it has to survive a
         # reboot; see _toggle_held_back.
@@ -182,7 +198,16 @@ class Service:
 
         ``simulate`` runs the same decisions and actions without touching the bookkeeping
         that de-duplicates real events; the UI uses it for "test what happens on wake".
+
+        ``budget`` must be a positive, finite number of seconds, whoever the caller is: it
+        becomes a timer's deadline, and one that is not a number (NaN) leaves the event
+        loop's timers out of order for everything else.  More than MAX_EVENT_BUDGET is cut
+        to that.
         """
+        if budget is not None:
+            if not _is_positive_number(budget):
+                raise RpcError("bad_request", "'budget' must be a positive number of seconds")
+            budget = float(min(budget, MAX_EVENT_BUDGET))
         if name in UP_EVENTS:
             return await self._handle_up(name, simulate)
         if name in DOWN_EVENTS:
@@ -753,30 +778,32 @@ class Service:
         async def runner() -> dict[str, Any]:
             trace: Trace = []
             started_wall, started = time.time(), time.monotonic()
-            ok, skipped, detail = False, False, ""
+            ok, skipped, detail, error_code = False, False, "", ""
             try:
                 detail = await fn(trace)
                 ok = True
             except TimeoutError:
-                detail = "timed out"
+                detail, error_code = "timed out", "timeout"
             except asyncio.CancelledError:
                 # Only a newer action (or service shutdown) cancels this task.  Swallowing the
                 # cancellation is deliberate: the outcome must still be recorded and returned.
-                detail = "interrupted by a newer request"
+                detail, error_code = "interrupted by a newer request", "interrupted"
             except _Skip as exc:
                 ok, skipped, detail = True, True, str(exc)
             except RpcError as exc:
-                detail = exc.message
+                detail, error_code = exc.message, exc.code
             except Exception as exc:  # noqa: BLE001 - never let an action crash the service
                 log.exception("%s (%s) crashed", name, trigger)
-                detail = f"internal error: {type(exc).__name__}: {exc}"
+                detail, error_code = f"internal error: {type(exc).__name__}: {exc}", "internal"
+            detail = _clip(detail, MAX_DETAIL_CHARS)
             record = {
                 "name": name,
                 "trigger": trigger,
                 "ok": ok,
                 "skipped": skipped,
                 "detail": detail,
-                "steps": list(trace),
+                "error_code": error_code,
+                "steps": _clip_steps(trace),
                 "time": started_wall,
                 "seconds": round(time.monotonic() - started, 2),
             }
@@ -833,6 +860,7 @@ class Service:
                 "ok": False,
                 "skipped": False,
                 "detail": "interrupted by a newer request",
+                "error_code": "interrupted",
                 "steps": [],
                 "time": time.time(),
                 "seconds": 0.0,
@@ -851,6 +879,7 @@ class Service:
             "ok": True,
             "skipped": True,
             "detail": reason,
+            "error_code": "",
             "steps": [],
             "time": time.time(),
             "seconds": 0.0,
@@ -863,6 +892,7 @@ class Service:
 
     @staticmethod
     def _note(trace: Trace, message: str) -> None:
+        message = _clip(message, MAX_STEP_CHARS)
         trace.append(message)
         log.info("%s", message)
 
@@ -903,6 +933,9 @@ class Service:
         return await self._run_action("switch_input", "manual", action, mode="reject")
 
     async def run_macro(self, text: str) -> dict[str, Any]:
+        if len(text) > macro.MAX_TEXT:
+            # Before anything looks at it: the same limit as the input.macro setting.
+            raise RpcError("bad_macro", f"the macro is {len(text)} characters long; the limit is {macro.MAX_TEXT}")
         rendered = macro.render(text, self.cfg.input.hdmi_port)
 
         async def action(trace: Trace) -> str:
@@ -977,7 +1010,10 @@ class Service:
                 self._save_config(new_cfg)
             except OSError as exc:
                 raise RpcError("save_failed", f"settings are in effect but could not be saved: {exc}") from None
-            self.config_problems = []
+            # What was wrong with single values is settled by the file just written.  Not so
+            # that the old file was unusable and has been moved aside: the user still has to
+            # hear where their settings went.
+            self.config_problems = list(self._lasting_problems)
 
     async def on_paired(self, address: str, name: str) -> None:
         """Callback for the Bluetooth remote: pairing mode produced a bonded TV."""
@@ -1001,14 +1037,16 @@ class Service:
         gate = display.evaluate(cfg.display, state)
         running = self._action is not None and not self._action.done()
         text = effective_macro(cfg)
+        press, gap = cfg.bluetooth.key_press_ms / 1000.0, cfg.bluetooth.key_gap_ms / 1000.0
+        macro_error, macro_seconds = "", 0.0
         try:
             steps = macro.parse(text)
-            macro_error = ""
-            macro_seconds = macro.estimate_seconds(
-                steps, key_press=cfg.bluetooth.key_press_ms / 1000.0, key_gap=cfg.bluetooth.key_gap_ms / 1000.0
-            )
+            macro_seconds = macro.estimate_seconds(steps, key_press=press, key_gap=gap)
+            # What playing it would refuse, said here and not only when it is due: a macro
+            # that takes too long with the configured key timings.
+            macro.check_runnable(steps, key_press=press, key_gap=gap)
         except macro.MacroError as exc:
-            macro_error, macro_seconds = str(exc), 0.0
+            macro_error = str(exc)
         wifi_status = self.wifi.status() if self.wifi is not None else {}
         return {
             "version": __version__,
@@ -1046,7 +1084,7 @@ class Service:
         """Dispatch one control-channel request (see ipc.py for the wire format)."""
         handler = getattr(self, f"_rpc_{method}", None) if _METHOD_RE.match(method) else None
         if handler is None:
-            raise RpcError("unknown_method", f"unknown method {method!r}")
+            raise RpcError("unknown_method", f"unknown method {macro.quote(method)}")
         return await handler(params)
 
     async def _rpc_status(self, params: dict[str, Any]) -> Any:
@@ -1083,7 +1121,12 @@ class Service:
         hold = params.get("hold")
         if hold is not None and (isinstance(hold, bool) or not isinstance(hold, (int, float))):
             raise RpcError("bad_request", "'hold' must be a number of seconds")
-        return await self.send_key(_str(params, "key"), float(hold) if hold is not None else None)
+        if hold is not None and not (_is_positive_number(hold) and hold <= macro.MAX_HOLD):
+            raise RpcError("bad_request", f"hold must be between 0 and {macro.MAX_HOLD:g} seconds")
+        key = _str(params, "key")
+        if len(key) > macro.QUOTE_CHARS:
+            raise RpcError("bad_key", f"unknown key {macro.quote(key)}")  # no key is that long
+        return await self.send_key(key, float(hold) if hold is not None else None)
 
     async def _rpc_run_macro(self, params: dict[str, Any]) -> Any:
         return await self.run_macro(_str(params, "macro"))
@@ -1094,20 +1137,30 @@ class Service:
         port = params.get("port", cfg.input.hdmi_port)
         if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 4:
             raise RpcError("bad_request", "'port' must be an HDMI port number from 1 to 4")
+        text = _str(params, "macro", allow_empty=True)
+        if len(text) > macro.MAX_TEXT:
+            # Before parsing: this runs in the event loop that also has to answer logind.
+            return {"ok": False, "error": f"the macro is {len(text)} characters long; the limit is {macro.MAX_TEXT}"}
+        press, gap = cfg.bluetooth.key_press_ms / 1000.0, cfg.bluetooth.key_gap_ms / 1000.0
         try:
-            cleaned = macro.validate(_str(params, "macro", allow_empty=True))
+            cleaned = macro.validate(text)
             steps = macro.parse(macro.render(cleaned, port))
+            # The limit on the running time too, with the key timings that are set: it is
+            # what playing the macro would be refused for.
+            macro.check_runnable(steps, key_press=press, key_gap=gap)
         except macro.MacroError as exc:
             return {"ok": False, "error": str(exc)}
-        seconds = macro.estimate_seconds(
-            steps, key_press=cfg.bluetooth.key_press_ms / 1000.0, key_gap=cfg.bluetooth.key_gap_ms / 1000.0
-        )
+        seconds = macro.estimate_seconds(steps, key_press=press, key_gap=gap)
         return {"ok": True, "normalized": cleaned, "rendered": macro.format_steps(steps), "seconds": round(seconds, 1)}
 
     async def _rpc_event(self, params: dict[str, Any]) -> Any:
         budget = params.get("budget")
-        if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0):
-            raise RpcError("bad_request", "'budget' must be a positive number of seconds")
+        # NaN compares false with everything and 1e999 is an infinity: test for what is
+        # wanted, not for what is not.  (handle_event checks again, for its other callers.)
+        if budget is not None and not (_is_positive_number(budget) and budget <= MAX_EVENT_BUDGET):
+            raise RpcError(
+                "bad_request", f"'budget' must be a number of seconds, more than 0 and at most {MAX_EVENT_BUDGET:g}"
+            )
         name = _str(params, "name")
         if name not in EVENTS:
             raise RpcError("bad_request", f"unknown event {name!r} (expected one of: {', '.join(EVENTS)})")
@@ -1166,7 +1219,10 @@ class Service:
     async def _rpc_wifi_pair_finish(self, params: dict[str, Any]) -> Any:
         wifi = self._need_wifi()
         host = str(wifi.status().get("pairing_host", ""))
-        await wifi.finish_pairing(_str(params, "code"))
+        code = _str(params, "code")
+        if len(code) > 32:
+            raise RpcError("bad_request", "'code' is the short code the TV shows")
+        await wifi.finish_pairing(code)
         patch: dict[str, Any] = {"wifi": {"enabled": True}}
         if host:
             patch["wifi"]["host"] = host
@@ -1187,7 +1243,11 @@ class Service:
         host = params.get("host", self.cfg.wifi.host)
         if not isinstance(host, str) or not host.strip():
             raise RpcError("wifi_not_configured", "no TV address is set for the Wi-Fi assist")
-        result = await wifi.probe(host.strip(), timeout=6.0)
+        try:
+            host = config_mod.apply_patch(self.cfg, {"wifi": {"host": host}}).wifi.host
+        except ConfigError as exc:
+            raise RpcError("bad_request", str(exc)) from None
+        result = await wifi.probe(host, timeout=6.0)
         return {"reachable": True, "on": result.get("on"), "name": str(result.get("name", ""))}
 
     async def _rpc_wifi_unpair(self, params: dict[str, Any]) -> Any:
@@ -1200,7 +1260,16 @@ class Service:
         lines = params.get("lines", 100)
         if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= 1000:
             raise RpcError("bad_request", "'lines' must be between 1 and 1000")
-        return {"lines": self._recent_logs(lines) if self._recent_logs is not None else []}
+        found = self._recent_logs(lines) if self._recent_logs is not None else []
+        # The newest lines that fit into a reply (a line of 500 characters can take 3000
+        # bytes as JSON if none of them is ASCII).
+        kept, size = len(found), 0
+        while kept > 0:
+            size += len(json.dumps(found[kept - 1])) + 1
+            if size > MAX_LOGS_BYTES:
+                break
+            kept -= 1
+        return {"lines": found[kept:]}
 
 
 class _Skip(Exception):
@@ -1235,6 +1304,28 @@ def _write_last_power(path: Path, direction: str) -> None:
         except OSError:
             pass
         raise
+
+
+def _is_positive_number(value: Any) -> bool:
+    """A real number above zero: not a bool, not NaN, not an infinity (JSON's 1e999 is one)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return value > 0
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _clip_steps(trace: list) -> list[str]:
+    """The steps of an action for its record: all of them, unless there are absurdly many."""
+    steps = [str(step) for step in trace]
+    if len(steps) > MAX_STEPS_KEPT:
+        left_out = len(steps) - (MAX_STEPS_KEPT - 1)
+        steps = [*steps[: MAX_STEPS_KEPT - 1], f"... and {left_out} more steps"]
+    return steps
 
 
 def _str(params: dict[str, Any], name: str, *, allow_empty: bool = False) -> str:

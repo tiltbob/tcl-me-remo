@@ -235,8 +235,8 @@ export const RemoveServiceModal: FC<{ closeModal?: () => void }> = ({ closeModal
         installs the service again the next time it loads; to remove it for good, uninstall the plugin in Decky.
       </p>
       <ToggleField
-        label="Also delete settings"
-        description="Deletes the settings and what was learned about the TV. On the TV, remove this remote under Remotes & Accessories as well."
+        label="Also delete settings and the pairing"
+        description="Deletes the settings and what was learned about the TV, and removes the Bluetooth pairing with the TV from this machine: the TV has to be paired again afterwards. On the TV, remove this remote under Remotes & Accessories as well."
         checked={purge}
         onChange={setPurge}
       />

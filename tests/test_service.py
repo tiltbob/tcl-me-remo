@@ -967,14 +967,35 @@ async def test_wifi_input_switch_app_link(tmp_path):
     assert not record["ok"] and "no app link" in record["detail"]
 
 
-async def test_wifi_failure_falls_back_to_macro(tmp_path):
+async def test_wifi_failure_falls_back_to_macro_when_that_is_turned_on(tmp_path):
     wifi = FakeWifi(paired=False)
-    patch = {"input": {"method": "wifi"}, "wifi": {"enabled": True, "host": "tv.lan"}}
+    patch = {
+        "input": {"method": "wifi", "wifi_fallback_to_macro": True},
+        "wifi": {"enabled": True, "host": "tv.lan"},
+    }
     h = Harness(tmp_path, wifi=wifi, patch=patch)
     record = await h.service.switch_input()
     assert record["ok"] and "Bluetooth macro" in record["detail"]
     assert any("falling back" in step for step in record["steps"])
     assert h.remote.key_names() == ["HOME", "DOWN", "OK"]
+
+
+async def test_choosing_wifi_does_not_arm_the_macro(tmp_path):
+    """The macro presses keys blindly: it must not start to run because Wi-Fi was chosen.
+
+    With the settings as they come, and only what the set-up instructions say changed, a
+    Wi-Fi request that fails is a failure, on a wake as well as by hand.
+    """
+    assert C.default_config().input.wifi_fallback_to_macro is False
+    wifi = FakeWifi(paired=False)
+    patch = {"input": {"method": "wifi"}, "wifi": {"enabled": True, "host": "tv.lan"}}
+    h = Harness(tmp_path, wifi=wifi, patch=patch)
+    record = await h.service.switch_input()
+    assert not record["ok"] and record["error_code"] == "wifi_not_paired"
+    h.clock.sleep_for(60)
+    record = await h.service.handle_event("resume")
+    assert not record["ok"] and "input switched" not in record["detail"]
+    assert h.remote.key_names() == ["WAKE", "WAKE"]  # the power key (twice here), and no navigation keys
 
 
 async def test_wifi_failure_without_fallback_fails(tmp_path):
@@ -1468,3 +1489,303 @@ async def test_save_failure_is_reported_but_setting_takes_effect(tmp_path):
         h.service.set_config({"input": {"hdmi_port": 2}})
     assert err.value.code == "save_failed"
     assert h.service.cfg.input.hdmi_port == 2
+
+
+# --------------------------------------------------------------------------- what a request may say
+#
+# Whoever may open the control socket may send anything.  None of it may unsettle the event
+# loop, grow what the service keeps, or come back as "internal".
+
+LONG_MACRO = "OK~10*30 OK~10*30 OK~10*30"  # every token valid; over fifteen minutes in all
+
+
+@pytest.mark.parametrize(
+    "budget",
+    [float("nan"), float("inf"), float("-inf"), json.loads("1e999"), 10**400, 0, -1, 120.5, True, "3", [3]],
+    ids=["nan", "inf", "-inf", "1e999", "huge-int", "zero", "negative", "over-the-maximum", "bool", "text", "list"],
+)
+async def test_an_event_budget_is_a_finite_number_in_its_range(tmp_path, budget):
+    h = Harness(tmp_path)
+    with pytest.raises(RpcError) as err:
+        await h.service.rpc("event", {"name": "suspend", "simulate": True, "budget": budget})
+    assert err.value.code == "bad_request" and "budget" in err.value.message
+    assert h.remote.keys == [] and h.remote.ensure_calls == []  # refused before anything was started
+    # No timer was set with a deadline that is no number: one of those leaves the loop's
+    # timers out of order, for everything else that waits in it.
+    scheduled = getattr(asyncio.get_running_loop(), "_scheduled", [])
+    assert all(handle.when() == handle.when() for handle in scheduled)
+
+
+async def test_handle_event_checks_the_budget_for_every_caller(tmp_path):
+    h = Harness(tmp_path)
+    for bad in (float("nan"), float("inf"), 0, -2.0, "soon", True):
+        with pytest.raises(RpcError) as err:
+            await h.service.handle_event("suspend", budget=bad, simulate=True)
+        assert err.value.code == "bad_request"
+        with pytest.raises(RpcError):
+            await h.service.handle_event("boot", budget=bad)  # also where the budget is not used
+    assert h.remote.keys == [] and h.service.phase == Phase.RUNNING
+
+    # A budget that is merely long (the daemon derives its own from logind's setting, which
+    # can be anything) is cut, not refused: the suspend still has to be handled.
+    seen = []
+    real = h.service._handle_down
+
+    async def spy(name, budget, simulate):
+        seen.append(budget)
+        return await real(name, budget, simulate)
+
+    h.service._handle_down = spy
+    for long in (10**400, 5000.0, 2):
+        assert (await h.service.handle_event("suspend", budget=long, simulate=True))["ok"]
+    assert seen == [service_module.MAX_EVENT_BUDGET, service_module.MAX_EVENT_BUDGET, 2.0]
+    assert await h.service.rpc("event", {"name": "suspend", "simulate": True, "budget": 120})
+
+
+async def test_no_number_in_a_request_ends_as_an_internal_error(tmp_path):
+    h = Harness(tmp_path, wifi=FakeWifi())
+    for method, params in (
+        ("send_key", {"key": "OK", "hold": 10**400}),
+        ("send_key", {"key": "OK", "hold": float("nan")}),
+        ("send_key", {"key": "OK", "hold": float("inf")}),
+        ("send_key", {"key": "OK", "hold": 0}),
+        ("pair_start", {"timeout": float("nan")}),
+        ("pair_start", {"timeout": 10**400}),
+        ("logs", {"lines": 10**400}),
+        ("logs", {"lines": float("nan")}),
+        ("check_macro", {"macro": "OK", "port": float("nan")}),
+        ("check_macro", {"macro": "OK", "port": 10**400}),
+        ("wifi_pair_finish", {"code": "9" * 5000}),
+        ("wifi_test", {"host": "bad host; rm -rf"}),
+        ("wifi_test", {"host": "h" * 5000}),
+    ):
+        with pytest.raises(RpcError) as err:
+            await h.service.rpc(method, params)
+        assert err.value.code == "bad_request", (method, params, err.value.code)
+        assert len(err.value.message) < 300
+    for patch in ({"input": {"hdmi_port": float("nan")}}, {"display": {"wait_seconds": 10**400}}):
+        with pytest.raises(RpcError) as err:
+            await h.service.rpc("set_config", {"patch": patch})
+        assert err.value.code == "invalid_config"
+    assert h.remote.keys == [] and h.remote.pairing_calls == []
+
+
+async def test_text_from_a_request_is_not_kept_at_length(tmp_path):
+    """One request with a long bogus key used to make every later status reply unreadable."""
+    h = Harness(tmp_path)
+    rpc = h.service.rpc
+    for text in ("X" * 900, "OK " + "Y" * 1000, "9" * 1000, "OK*" + "7" * 900):
+        record = await rpc("run_macro", {"macro": text})
+        assert not record["ok"] and record["error_code"] == "bad_macro"
+        assert len(record["detail"]) < 200, record["detail"]
+    # Over the limit of the setting, the text is not looked at at all.
+    for text in ("X" * 900_000, "OK*0 " * 200_000, "{port}" * 170_000):
+        with pytest.raises(RpcError) as err:
+            await rpc("run_macro", {"macro": text})
+        assert err.value.code == "bad_macro" and "limit" in err.value.message and len(err.value.message) < 200
+        reply = await rpc("check_macro", {"macro": text})
+        assert reply["ok"] is False and "limit" in reply["error"] and len(reply["error"]) < 200
+    with pytest.raises(RpcError) as err:
+        await rpc("send_key", {"key": "K" * 900_000})
+    assert err.value.code == "bad_key" and len(err.value.message) < 200
+    with pytest.raises(RpcError) as err:
+        await rpc("nope" * 100_000, {})
+    assert len(err.value.message) < 200
+    assert h.remote.keys == []
+    assert len(json.dumps(h.service.status())) < 20_000
+    assert service_module.MAX_DETAIL_CHARS < 1000 and C.describe()["input"]["macro"]["maxlen"] == 1024
+
+
+async def test_an_action_record_has_an_upper_size_whatever_goes_into_it(tmp_path):
+    from tcl_me_remo import ipc
+
+    h = Harness(tmp_path)
+    h.remote._state.ready = h.remote._state.connected = False
+    h.remote.fail_code = "e" * 50_000  # a transport's message can carry text from outside (a TV's name)
+    for _ in range(service_module.HISTORY_LENGTH + 5):
+        record = await h.service.tv_on()
+        assert not record["ok"]
+        assert len(record["detail"]) <= service_module.MAX_DETAIL_CHARS
+        assert all(len(step) <= service_module.MAX_STEP_CHARS for step in record["steps"])
+    trace = []
+    for n in range(500):
+        h.service._note(trace, f"step {n} " + "s" * 5000)
+    steps = service_module._clip_steps(trace)
+    assert len(steps) == service_module.MAX_STEPS_KEPT and steps[-1] == "... and 461 more steps"
+    assert steps[0].startswith("step 0 ") and len(steps[0]) == service_module.MAX_STEP_CHARS
+    # The fullest history there can be still fits into one message several times over.
+    worst = service_module.HISTORY_LENGTH + 1
+    worst *= service_module.MAX_DETAIL_CHARS + service_module.MAX_STEPS_KEPT * (service_module.MAX_STEP_CHARS + 4) + 200
+    assert worst < ipc.MAX_LINE // 2
+    assert len(json.dumps(h.service.status())) < ipc.MAX_LINE // 4
+
+
+async def test_the_log_ring_and_the_logs_reply_are_bounded(tmp_path):
+    import logging
+
+    from tcl_me_remo import ipc, logsetup
+
+    ring = logsetup.RingHandler()
+    long_text = ("k" * 900_000,)
+    ring.emit(logging.LogRecord("x", logging.WARNING, __file__, 1, "macro (manual): FAILED: %s", long_text, None))
+    ring.emit(logging.LogRecord("x", logging.INFO, __file__, 1, "short", (), None))
+    long_line, short_line = ring.tail(2)
+    assert len(long_line) == logsetup.RING_LINE_CHARS and long_line.endswith("...") and "FAILED: kkk" in long_line
+    assert short_line.endswith("INFO    short")
+
+    # Lines without a single ASCII character take six bytes a character as JSON.
+    h = Harness(tmp_path)
+    lines = [f"{n:04d} " + "é" * (logsetup.RING_LINE_CHARS - 5) for n in range(logsetup.RING_SIZE)]
+    h.service._recent_logs = lambda count: lines[-count:]
+    reply = await h.service.rpc("logs", {"lines": 1000})
+    assert len(json.dumps({"id": 1, "ok": True, "result": reply})) < ipc.MAX_LINE
+    assert 100 < len(reply["lines"]) < 1000 and reply["lines"][-1] == lines[-1]  # the newest are kept
+    assert reply["lines"] == lines[-len(reply["lines"]) :]
+    assert (await h.service.rpc("logs", {"lines": 3}))["lines"] == lines[-3:]
+
+
+# --------------------------------------------------------------------------- the macro's running time
+
+
+async def test_check_macro_and_status_apply_the_running_time_limit(tmp_path):
+    h = Harness(tmp_path)
+    rpc = h.service.rpc
+    reply = await rpc("check_macro", {"macro": LONG_MACRO})
+    assert reply["ok"] is False and "would take" in reply["error"] and "120s" in reply["error"]
+    # ... with the key timings that are set: 64 keys are fine as things are, not with a long gap
+    many = " ".join(["OK"] * 64)
+    assert (await rpc("check_macro", {"macro": many}))["ok"] is True
+    with pytest.raises(RpcError) as err:
+        await rpc("set_config", {"patch": {"input": {"macro": LONG_MACRO}}})
+    assert err.value.code == "invalid_config" and "input.macro" in err.value.message
+    await rpc("set_config", {"patch": {"input": {"macro": many}}})
+    with pytest.raises(RpcError) as err:
+        await rpc("set_config", {"patch": {"bluetooth": {"key_gap_ms": 5000}}})
+    assert err.value.code == "invalid_config" and "bluetooth.key_gap_ms" in err.value.message
+    assert h.service.cfg.bluetooth.key_gap_ms == 350 and h.service.status()["input"]["macro_error"] == ""
+
+
+async def test_an_over_long_macro_from_an_older_file_shows_in_the_status_and_blocks_nothing_else(tmp_path):
+    h = Harness(tmp_path)
+    stored = h.service.cfg.to_dict()
+    stored["input"].update(macro=LONG_MACRO, preset="custom")
+    h.service.cfg, problems = C.from_dict(stored, strict=False)  # as load() takes it: value by value
+    assert problems == []
+
+    shown = h.service.status()["input"]
+    assert shown["macro_error"].startswith("macro would take") and shown["macro_seconds"] > 900
+    assert (await h.service.rpc("check_macro", {"macro": LONG_MACRO}))["error"] == shown["macro_error"]
+    record = await h.service.switch_input()
+    assert not record["ok"] and record["detail"] == shown["macro_error"]  # what the status said would happen
+    # Any other setting can still be changed, and so can the macro.
+    await h.service.rpc("set_config", {"patch": {"events": {"reboot_tv_off": True}, "enabled": True}})
+    assert h.service.cfg.events.reboot_tv_off is True
+    await h.service.rpc("set_config", {"patch": {"input": {"macro": "HOME OK"}}})
+    assert h.service.status()["input"]["macro_error"] == ""
+
+
+# --------------------------------------------------------------------------- action records
+
+
+async def test_action_records_carry_an_error_code(tmp_path):
+    h = Harness(tmp_path, wifi=FakeWifi(paired=False), patch={"input": {"method": "none"}})
+    assert (await h.service.tv_off())["error_code"] == ""  # it worked
+    h.service.set_config({"enabled": False})
+    assert (await h.service.handle_event("boot"))["error_code"] == ""  # skipped is not failed
+    h.service.set_config({"enabled": True})
+
+    assert (await h.service.switch_input())["error_code"] == "not_configured"
+    assert (await h.service.run_macro("BOGUS"))["error_code"] == "bad_macro"
+    assert (await h.service.switch_input("wifi"))["error_code"] == "wifi_not_configured"
+    h.service.set_config({"wifi": {"enabled": True, "host": "tv.lan"}})
+    assert (await h.service.switch_input("wifi"))["error_code"] == "wifi_not_paired"
+
+    h.remote._state.ready = h.remote._state.connected = False
+    h.remote.fail_code = "bluetooth_off"
+    assert (await h.service.run_macro("OK"))["error_code"] == "bluetooth_off"  # a macro says which
+    record = await h.service.tv_on()
+    assert record["error_code"] == "tv_unreachable" and "bluetooth_off" in record["detail"]  # power: no way through
+    assert (await h.service.handle_event("suspend", simulate=True))["error_code"] == "tv_unreachable"
+    for record in h.service.status()["history"]:
+        assert isinstance(record["error_code"], str) and bool(record["error_code"]) == (not record["ok"])
+    assert h.service.status()["last_action"]["error_code"] == "tv_unreachable"
+
+
+async def test_an_action_that_was_pre_empted_says_so_in_its_code(tmp_path):
+    h = Harness(tmp_path, patch={"input": {"method": "none"}})
+    h.remote._state.ready = h.remote._state.connected = True
+    h.remote.key_gate = asyncio.Event()
+    turning_on = asyncio.create_task(h.service.tv_on())
+    await asyncio.wait_for(h.remote.key_waiting.wait(), 10)
+    going_down = asyncio.create_task(h.service.handle_event("suspend", simulate=True))
+    record = await asyncio.wait_for(turning_on, 10)
+    assert not record["ok"] and record["error_code"] == "interrupted"
+    h.remote.key_gate.set()
+    assert (await asyncio.wait_for(going_down, 10))["error_code"] == ""
+
+
+# --------------------------------------------------------------------------- settings
+
+
+async def test_a_problem_with_the_settings_file_itself_outlives_the_next_save(tmp_path):
+    kept = "config.json is not valid JSON; using defaults. The file was kept as config.json.broken"
+    service = Service(
+        C.default_config(),
+        remote=FakeRemote(),
+        save_config=lambda cfg: None,
+        sys_root=tmp_path,
+        config_problems=[kept, "input.hdmi_port: must be at most 4 (default used)"],
+        lasting_config_problems=[kept],
+    )
+    assert len(service.status()["config_problems"]) == 2
+    service.set_config({"events": {"reboot_tv_off": True}})
+    assert service.status()["config_problems"] == [kept]  # the single value is settled, the lost file is not
+    await service.on_paired("11:22:33:44:55:66", "TV")
+    await service.forget_tv()
+    assert service.status()["config_problems"] == [kept]
+
+
+async def test_a_tv_with_an_odd_name_is_still_stored(tmp_path):
+    """Refusing the name would refuse the address that comes with it, and the pairing would be lost."""
+    h = Harness(tmp_path, remote=FakeRemote(paired=False), wifi=FakeWifi(paired=False))
+    await h.service.on_paired("11:22:33:44:55:66", "TV\nERROR tcl_me_remo.daemon: forged\x00 \ud800" + "x" * 500)
+    assert h.service.cfg.bluetooth.tv_address == "11:22:33:44:55:66"
+    assert h.service.cfg.bluetooth.tv_name.startswith("TV ERROR tcl_me_remo.daemon: forged x")
+    assert len(h.service.cfg.bluetooth.tv_name) <= 64 and h.service.config_problems == []
+
+    await h.service.rpc("wifi_pair_start", {"host": "192.168.1.50"})
+    await h.service.rpc("wifi_pair_finish", {"code": "A1B2C3", "name": "Living\tRoom\x1b[2J TV\udc00"})
+    assert h.service.cfg.wifi.enabled and h.service.cfg.wifi.name == "Living Room [2J TV"
+
+    # The name this machine gives itself is another matter: that one is refused.
+    for name in ("Deck\x00Remote", "\ud800", "é" * 14):
+        with pytest.raises(RpcError) as err:
+            await h.service.rpc("set_config", {"patch": {"bluetooth": {"device_name": name}}})
+        assert err.value.code == "invalid_config"
+    assert h.remote.config.device_name == "SteamOS Remote" and "SteamOS Remote" in json.dumps(h.saved[-1].to_dict())
+
+
+# --------------------------------------------------------------------------- the display check
+
+
+async def test_a_sysfs_that_cannot_be_read_does_not_open_the_display_check(tmp_path):
+    """Out of file descriptors, say: a handheld on the sofa must not conclude it has no screen."""
+    h = Harness(tmp_path, connectors={"card0-eDP-1": "connected"})
+    assert (await h.service.handle_event("boot"))["skipped"]  # undocked: nothing happens
+    status = h.sys_root / "class" / "drm" / "card0-eDP-1" / "status"
+    status.unlink()
+    status.mkdir()  # reading it fails from now on
+
+    h.clock.sleep_for(60)
+    record = await h.service.handle_event("resume")
+    assert record["skipped"] and "could not be read" in record["detail"]
+    record = await h.service.handle_event("suspend", simulate=True)
+    assert record["skipped"] and "could not be read" in record["detail"]
+    assert h.remote.keys == []
+    shown = h.service.status()["display"]
+    assert shown["gate_ok"] is False and "card0-eDP-1" in shown["unreadable"]
+
+    # With the check turned off, and by hand, things work as they always did.
+    h.service.set_config({"display": {"require_external": "no"}})
+    assert (await h.service.handle_event("suspend", simulate=True))["ok"]
+    assert h.remote.key_names() == ["SLEEP"]

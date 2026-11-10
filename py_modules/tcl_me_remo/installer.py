@@ -218,6 +218,9 @@ RestartSec=3
 TimeoutStartSec=45
 TimeoutStopSec=20
 KillMode=mixed
+# Well clear of systemd's default of 1024: the service must still be able to open sysfs and
+# its settings file when something holds every control connection it allows, and more.
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target

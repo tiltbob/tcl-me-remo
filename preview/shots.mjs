@@ -673,6 +673,10 @@ async function main() {
     const page = await settings("bluetooth", "bluetooth");
     check("shows the live Bluetooth state", (await sees(page, "hci0 (11:22:33:44:55:66)")) && (await sees(page, "Ready for keys")) && (await sees(page, "TV subscribed")) && (await sees(page, "Delivery")));
     check("groups the rarely needed settings under Advanced", (await sees(page, "Advanced", 2000, true)) && (await sees(page, "Wake beacon (experimental)")));
+    check(
+      "the two settings that need a restart say so",
+      (await page.getByText("A change takes effect when the service restarts (Diagnostics).").count()) === 2 && (await sees(page, "more than one adapter. A change takes effect when the service restarts", 2000)),
+    );
     await shot(page, "bluetooth");
     await toggle(page, "Keep calling the TV").click();
     await sleep(300);
@@ -830,8 +834,12 @@ async function main() {
       (await page.getByRole("button", { name: "Hide steps", exact: true }).count()) === 1 && (await sees(page, "Bluetooth: playing macro: F3 1.5s LEFT*8 RIGHT*2 OK", 1000)),
     );
     await button(page, "Remove").click();
-    check("Remove asks first and offers to delete the settings", (await sees(page, "Remove the background service?")) && (await toggle(page, "Also delete settings").count()) === 1 && (await calls(page, "remove_service")).length === 0);
-    await toggle(page, "Also delete settings").click();
+    check("Remove asks first and offers to delete the settings", (await sees(page, "Remove the background service?")) && (await toggle(page, "Also delete settings and the pairing").count()) === 1 && (await calls(page, "remove_service")).length === 0);
+    check(
+      "deleting the settings is said to remove the Bluetooth pairing on this machine as well",
+      await sees(page, "removes the Bluetooth pairing with the TV from this machine", 1000),
+    );
+    await toggle(page, "Also delete settings and the pairing").click();
     await shot(page, "remove-dialog", false);
     await button(page, "Remove service and settings").click();
     check("confirming calls remove_service with the choice", await (async () => {

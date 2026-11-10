@@ -23,7 +23,7 @@ from typing import Any, Awaitable, Callable
 
 from . import __version__, config, installer, logsetup, paths, system
 from .interfaces import Remote, WifiAssist
-from .ipc import IpcServer
+from .ipc import IpcServer, socket_answers
 from .lifecycle import Logind
 from .service import DEFAULT_DOWN_BUDGET, Service
 
@@ -100,10 +100,32 @@ class Daemon:
         task.add_done_callback(self._tasks.discard)
 
     async def run(self) -> int:
+        if socket_answers(paths.socket_path()):
+            # Somebody ran "tcl-me-remo daemon" by hand while the service is up.  Stop before
+            # anything is touched: a second instance would take the control socket away from
+            # the first (and its file with it on the way out), and register a second remote.
+            logsetup.setup()
+            log.error("a tcl-me-remo service is already running (%s answers): not starting", paths.socket_path())
+            return 1
         cfg_path = paths.config_path()
-        cfg, problems = config.load(cfg_path)
+        load_failure: Exception | None = None
+        try:
+            cfg, problems, lasting = config.load_for_service(cfg_path)
+        except Exception as exc:  # noqa: BLE001 - it promises not to raise; the service comes up regardless
+            # Without this the service would exit, be restarted and exit again, with no
+            # control socket through which the setting could ever be put right.
+            load_failure = exc
+            cfg = config.default_config()
+            note = f"the settings could not be loaded ({type(exc).__name__}: {exc}); using defaults."
+            try:
+                note = f"{note} {config.set_aside(cfg_path)}"
+            except Exception:  # noqa: BLE001
+                pass
+            problems = lasting = [note[:600]]
         ring = logsetup.setup(cfg.log_level)
         log.info("tcl-me-remo %s starting", __version__)
+        if load_failure is not None:
+            log.error("loading the settings failed", exc_info=load_failure)
         for problem in problems:
             log.warning("config: %s", problem)
 
@@ -128,6 +150,7 @@ class Daemon:
                 on_config_changed=lambda new_cfg: logsetup.set_level(new_cfg.log_level),
                 recent_logs=ring.tail,
                 config_problems=problems,
+                lasting_config_problems=lasting,
                 power_state_path=paths.state_dir() / "power.json",
             )
             self.service = service

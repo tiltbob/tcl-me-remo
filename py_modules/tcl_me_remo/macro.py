@@ -106,7 +106,11 @@ def _number(text: str, what: str, token: str) -> float:
 
 
 def parse(text: str) -> list[Step]:
-    """Parse macro text into steps.  Raises :class:`MacroError` with a readable reason."""
+    """Parse macro text into steps.  Raises :class:`MacroError` with a readable reason.
+
+    Text longer than MAX_TEXT is refused unread, which also bounds the work done here: at
+    most MAX_TEXT / 2 tokens are ever looked at.
+    """
     if len(text) > MAX_TEXT:
         raise MacroError(f"the macro is {len(text)} characters long; the limit is {MAX_TEXT}")
     steps: list[Step] = []

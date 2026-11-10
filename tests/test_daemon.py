@@ -419,3 +419,104 @@ async def test_no_system_bus_is_a_clean_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("TCL_ME_REMO_CONFIG", str(tmp_path / "config.json"))
     monkeypatch.setenv("TCL_ME_REMO_RUNTIME_DIR", str(tmp_path / "run"))
     assert await Daemon().run() == 1
+
+
+# --------------------------------------------------------------------------- a damaged settings file
+
+
+async def test_a_settings_file_with_a_slip_in_it_is_kept_and_the_service_runs(rig):
+    """One comma too many used to cost every setting as soon as any setting was changed."""
+    rig.uptime = 5000.0
+    good = rig.config_path.read_text()
+    slip = good.replace('"enabled": true,', '"enabled": true,,', 1)
+    assert slip != good
+    rig.config_path.write_text(slip)
+    kept = rig.config_path.with_name("config.json.broken")
+
+    await rig.start()
+    status = await rig.call("status")
+    assert len(status["config_problems"]) == 1 and str(kept) in status["config_problems"][0]
+    assert "not valid JSON" in status["config_problems"][0]
+    assert kept.read_text() == slip and not rig.config_path.exists()  # out of the way before anything is saved
+
+    # The first setting that is changed goes to a new file.  The user's file is untouched,
+    # and the status keeps saying where it is.
+    await rig.call("set_config", {"patch": {"events": {"reboot_tv_off": True}}})
+    await rig.remote.on_paired("11:22:33:44:55:66", "Den TV")
+    assert json.loads(rig.config_path.read_text())["events"]["reboot_tv_off"] is True
+    assert kept.read_text() == slip
+    assert (await rig.call("status"))["config_problems"] == status["config_problems"]
+
+    # Until the service is started again: the settings file is in order by then.
+    assert await rig.stop() == 0
+    await rig.start()
+    assert (await rig.call("status"))["config_problems"] == []
+    assert kept.read_text() == slip
+
+
+@pytest.mark.parametrize(
+    "content, set_aside",
+    [
+        (b'{"input": {"hdmi_port": NaN}}', False),
+        (b'{"input": {"hdmi_port": 1e999}, "display": {"wait_seconds": 1' + b"0" * 400 + b"}}", False),
+        ('{"input": {"macro": "DOWN*²"}}'.encode(), False),
+        ('{"bluetooth": {"tv_name": "Caf\xe9"}}'.encode("latin-1"), True),
+        ('{"enabled": true}'.encode("utf-16"), True),
+        (b"[" * 100_000, True),
+    ],
+    ids=["nan", "infinity-and-a-huge-number", "a-digit-int-does-not-take", "latin-1", "utf-16", "nested-too-deeply"],
+)
+async def test_the_service_starts_whatever_the_settings_file_holds(rig, content, set_aside):
+    """Each of these used to end the process at start, again at every restart, with no
+    control socket through which the setting could have been put right."""
+    rig.uptime = 5000.0
+    rig.config_path.write_bytes(content)
+    await rig.start()
+    status = await rig.call("status")
+    assert status["config_problems"] and status["input"]["hdmi_port"] == 1
+    assert rig.config_path.with_name("config.json.broken").exists() is set_aside
+    await rig.call("set_config", {"patch": {"input": {"hdmi_port": 2}}})  # and it can be put right
+    assert json.loads(rig.config_path.read_text())["input"]["hdmi_port"] == 2
+    assert await rig.stop() == 0
+
+
+async def test_a_loader_that_raises_does_not_stop_the_service(rig, monkeypatch):
+    def broken(path):
+        raise RuntimeError("a check that tripped over a value")
+
+    monkeypatch.setattr(C, "load_for_service", broken)
+    original = rig.config_path.read_text()
+    rig.uptime = 5000.0
+    await rig.start()
+    problems = (await rig.call("status"))["config_problems"]
+    assert len(problems) == 1 and "could not be loaded" in problems[0] and "RuntimeError" in problems[0]
+    # Running on defaults, so the file is moved out of the way of the next save, and said to be.
+    kept = rig.config_path.with_name("config.json.broken")
+    assert kept.read_text() == original and str(kept) in problems[0]
+    await rig.call("set_config", {"patch": {"input": {"hdmi_port": 2}}})
+    assert (await rig.call("status"))["config_problems"] == problems
+    assert await rig.stop() == 0
+
+
+# --------------------------------------------------------------------------- one service at a time
+
+
+async def test_a_second_daemon_does_not_start_while_the_first_one_answers(rig):
+    """``sudo tcl-me-remo daemon`` by hand, with the service running."""
+    rig.uptime = 5000.0
+    await rig.start()
+    touched = []
+
+    async def make_remote(bus, _cfg):
+        touched.append("bluetooth")
+        return FakeRemote()
+
+    second = Daemon(make_remote=make_remote, make_wifi=lambda _cfg: None, uptime=lambda: 5000.0)
+    before = rig.config_path.read_text()
+    assert await asyncio.wait_for(second.run(), 20) == 1
+    assert touched == []  # it stopped before it registered a second remote with BlueZ
+    assert rig.config_path.read_text() == before
+    # The first one is still reachable, during and after.
+    assert rig.socket_path.exists() and (await rig.call("status"))["phase"] == "running"
+    assert await rig.stop() == 0
+    assert not rig.socket_path.exists()

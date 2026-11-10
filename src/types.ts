@@ -167,6 +167,11 @@ export interface DisplayStatus {
   gate_ok: boolean;
   gate_reason: string;
   has_internal: boolean;
+  /**
+   * Why the display connectors could not be read ("" when they were, and on a machine that
+   * has none). The gate stays closed meanwhile and `gate_reason` says the same.
+   */
+  unreadable?: string;
   connectors: Connector[];
 }
 
@@ -185,6 +190,8 @@ export interface ActionRecord {
   ok: boolean;
   skipped: boolean;
   detail: string;
+  /** Why it failed, as a code of the control protocol ("tv_unreachable", ...); "" when `ok`. */
+  error_code?: string;
   steps: string[];
   time: number;
   seconds: number;
@@ -242,6 +249,12 @@ export interface ServiceInfo {
   installed_version: string;
   bundled_version: string;
   needs_update: boolean;
+  /**
+   * True when the installed files are newer than the service that is running: an install
+   * replaced them and the restart did not happen (it was cut short). `problems` says so in
+   * words, and installing again (Repair) finishes the update.
+   */
+  restart_pending?: boolean;
   /** Where the service's code is installed (empty when it is not). */
   install_dir?: string;
   /**
