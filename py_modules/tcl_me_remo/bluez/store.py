@@ -5,9 +5,15 @@ It holds what cannot be learnt again cheaply after a reboot:
 * whether the paired TV wrote its notification subscription again the last time bluetoothd
   had lost it (Android 14+ does, Android 11-13 does not) - this decides how long the next
   boot waits before falling back to direct delivery;
-* addresses of TVs the user asked to forget while BlueZ could not be reached, so that the
-  stale bond is removed later instead of silently blocking a new pairing
-  (``JustWorksRepairing = never`` rejects pairing with a device BlueZ still knows).
+* addresses of TVs whose bond BlueZ still holds although we no longer want it (the user
+  asked to forget the TV while BlueZ could not be reached, or a pairing window ended after
+  the TV had bonded but before it was adopted), so that the bond is removed later instead of
+  silently blocking the next pairing (``JustWorksRepairing = never`` rejects pairing with a
+  device BlueZ still knows);
+* addresses of TVs that bonded in a pairing window which is still open ("pending"): should
+  the service die before the window completes, the next start treats them as stale;
+* whether packets were injected through the raw HCI socket whose effect on the kernel's
+  counters has not been repaired yet (rawhci.py), together with the boot it happened in.
 
 Reads tolerate a missing or damaged file; writes are atomic and never raise.
 """
@@ -32,6 +38,8 @@ class StateStore:
         self._tv = ""
         self._resubscribes: bool | None = None
         self._stale: list[str] = []
+        self._pending: list[str] = []
+        self._raw_debt = ""   # boot id the unsettled injected packets belong to, "" if none
         self._load()
 
     # ------------------------------------------------------------------ file
@@ -53,9 +61,12 @@ class StateStore:
         self._tv = tv.upper() if isinstance(tv, str) else ""
         hint = data.get("resubscribes")
         self._resubscribes = hint if isinstance(hint, bool) else None
-        stale = data.get("stale")
-        if isinstance(stale, list):
-            self._stale = [item.upper() for item in stale if isinstance(item, str)]
+        for name in ("stale", "pending"):
+            items = data.get(name)
+            if isinstance(items, list):
+                setattr(self, f"_{name}", [item.upper() for item in items if isinstance(item, str)])
+        debt = data.get("raw_debt")
+        self._raw_debt = debt if isinstance(debt, str) else ""
 
     def _save(self) -> None:
         if self._path is None:
@@ -65,6 +76,8 @@ class StateStore:
             "tv": self._tv,
             "resubscribes": self._resubscribes,
             "stale": self._stale,
+            "pending": self._pending,
+            "raw_debt": self._raw_debt,
         }
         tmp = ""
         try:
@@ -84,6 +97,11 @@ class StateStore:
                     pass
 
     # ------------------------------------------------------------------ re-subscription hint
+
+    @property
+    def tv(self) -> str:
+        """Address of the TV the hint belongs to: the TV this service last paired with or used."""
+        return self._tv
 
     def resubscribes(self, tv_address: str) -> bool | None:
         """True / False as observed last time for this TV, None if never observed."""
@@ -119,4 +137,49 @@ class StateStore:
         address = address.upper()
         if address in self._stale:
             self._stale.remove(address)
+            self._save()
+
+    # ------------------------------------------------------------------ bonds of an unfinished pairing
+
+    @property
+    def pending(self) -> list[str]:
+        return list(self._pending)
+
+    def add_pending(self, address: str) -> None:
+        address = address.upper()
+        if address and address not in self._pending:
+            self._pending.append(address)
+            self._save()
+
+    def discard_pending(self, address: str) -> None:
+        address = address.upper()
+        if address in self._pending:
+            self._pending.remove(address)
+            self._save()
+
+    def pending_to_stale(self) -> None:
+        """Whatever bonded in a window that never completed is a bond to remove."""
+        if not self._pending:
+            return
+        for address in self._pending:
+            if address not in self._stale:
+                self._stale.append(address)
+        self._pending = []
+        self._save()
+
+    # ------------------------------------------------------------------ raw delivery debt
+
+    def raw_debt(self, boot: str) -> bool:
+        """Whether injected packets from the boot ``boot`` are still to be settled."""
+        return bool(self._raw_debt) and self._raw_debt == (boot or "unknown")
+
+    def set_raw_debt(self, boot: str) -> None:
+        boot = boot or "unknown"
+        if self._raw_debt != boot:
+            self._raw_debt = boot
+            self._save()
+
+    def clear_raw_debt(self) -> None:
+        if self._raw_debt:
+            self._raw_debt = ""
             self._save()

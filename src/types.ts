@@ -244,6 +244,12 @@ export interface ServiceInfo {
   needs_update: boolean;
   /** Where the service's code is installed (empty when it is not). */
   install_dir?: string;
+  /**
+   * True while the plugin backend is installing, updating or repairing the service (it does
+   * so in the background when the plugin loads). The panel then shows "Installing" instead
+   * of raising a "not installed" alarm.
+   */
+  installing?: boolean;
   problems: string[];
 }
 

@@ -38,14 +38,29 @@ What it costs - read this before relying on it
       traffic to the TV pauses for the length of the key press.  Harmless, as long as the
       release always follows; ``RawLink.notify`` therefore never leaves a press unanswered
       without telling the caller.
-      When the link closes, ``hci_conn_del`` adds the wrapped counter to the adapter-wide
-      LE credit count (``hdev->le_cnt += conn->sent``), which *removes* one transmit credit
-      per injected packet for every LE device, game controllers included, until the count is
-      rebuilt.  ``RawLink.link_closed`` repairs that by sending "LE Read Buffer Size" (a read-only
-      HCI command, opcode 0x2002), whose completion handler resets the count
-      (``hci_cc_le_read_buffer_size``: ``hdev->le_cnt = hdev->le_pkts``).  Controllers that
-      share one buffer pool between classic and LE (they report 0 LE buffers) are not
-      repaired by this; there the missing credits come out of the classic pool.
+      When the link closes, ``hci_conn_del`` adds the wrapped counter to an adapter-wide
+      credit count, which *removes* one transmit credit per injected packet until the count
+      is rebuilt.  Which count depends on the controller (``if (hdev->le_pkts) hdev->le_cnt
+      += conn->sent; else hdev->acl_cnt += conn->sent;``):
+
+      - a controller with LE buffers of its own loses LE credits (every LE device, game
+        controllers included);
+      - a controller that shares one buffer pool between classic and LE (it reports 0 LE
+        buffers) loses credits of that shared pool, which also carries headsets and classic
+        controllers.
+
+      A count that lands exactly on zero with nothing in flight stalls all transmission of
+      that pool until the adapter is reset; one that would go below zero wraps and is clamped
+      back to full by the next completion event.  ``RawLink.settle`` repairs the count after
+      the link has closed: it sends "LE Read Buffer Size" (read-only, opcode 0x2002), whose
+      completion handler resets the LE count (``hci_cc_le_read_buffer_size``: ``hdev->le_cnt
+      = hdev->le_pkts``), reads the controller's answer, and if that says "0 LE buffers" also
+      sends "Read Buffer Size" (opcode 0x1005; ``hci_cc_read_buffer_size``: ``hdev->acl_cnt =
+      hdev->acl_pkts``).  The second command is sent only when needed because resetting a
+      count while the kernel has packets of its own in flight (music to a headset) briefly
+      over-credits it.  The debt outlives this process: remote.py records it on disk when the
+      first packet is injected and settles it at the next start if the service stopped while
+      the link was still up.
     * Linux >= 6.17 clamps both places.  Nothing leaks, but the kernel logs a warning
       ("hcon ... sent 0 < count 1") for every injected packet.
     * A kernel L2CAP frame that the controller is still receiving in fragments could be
@@ -68,6 +83,7 @@ code that touches the operating system, and tests replace it.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import errno
 import fcntl
@@ -88,8 +104,14 @@ HCI_CHANNEL_RAW = 0
 #: _IOR('H', 212, int) from include/net/bluetooth/hci_sock.h
 HCIGETCONNLIST = 0x800448D4
 
+#: Socket option level and name for the event filter of a raw HCI socket (lib/bluetooth.h, hci_sock.h).
+SOL_HCI = 0
+HCI_FILTER = 2
+
 HCI_COMMAND_PKT = 0x01
 HCI_ACLDATA_PKT = 0x02
+HCI_EVENT_PKT = 0x04
+EVT_CMD_COMPLETE = 0x0E
 #: hci_conn.type of an LE link (include/net/bluetooth/hci.h)
 LE_LINK = 0x80
 #: hci_conn.state values of a usable link (include/net/bluetooth/bluetooth.h)
@@ -102,7 +124,14 @@ ATT_OP_HANDLE_VALUE_NOTIFICATION = 0x1B
 MAX_VALUE_LENGTH = 20
 
 #: HCI command packet: LE Read Buffer Size (OGF 0x08, OCF 0x0002), no parameters.
+OPCODE_LE_READ_BUFFER_SIZE = 0x2002
 LE_READ_BUFFER_SIZE_COMMAND = bytes([HCI_COMMAND_PKT, 0x02, 0x20, 0x00])
+#: HCI command packet: Read Buffer Size (OGF 0x04, OCF 0x0005), no parameters.
+OPCODE_READ_BUFFER_SIZE = 0x1005
+READ_BUFFER_SIZE_COMMAND = bytes([HCI_COMMAND_PKT, 0x05, 0x10, 0x00])
+#: How long the controller's answer to LE Read Buffer Size is waited for, and how often it is looked for.
+REPLY_WAIT = 0.5
+REPLY_POLL = 0.02
 #: First kernel release that clamps the per-connection and adapter-wide packet counters.
 FIXED_KERNEL = (6, 17)
 
@@ -113,6 +142,12 @@ _LIST_HEADER = struct.Struct("=HH")
 _CONN_INFO = struct.Struct("=H6sBBHI")
 # struct sockaddr_hci { sa_family_t hci_family; unsigned short hci_dev; unsigned short hci_channel; }
 _SOCKADDR_HCI = struct.Struct("=HHH")
+# struct hci_ufilter { __u32 type_mask; __u32 event_mask[2]; __le16 opcode; } - 16 bytes with padding,
+# and the kernel refuses a shorter option value.
+_FILTER_MASKS = struct.Struct("=III")
+#: Largest HCI event: packet type, event code, length byte, 255 bytes of parameters.
+MAX_EVENT_SIZE = 258
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 
 class RawError(Exception):
@@ -207,6 +242,50 @@ def att_notification_packet(conn_handle: int, value_handle: int, value: bytes) -
     return struct.pack("<BHH", HCI_ACLDATA_PKT, conn_handle, len(l2cap)) + l2cap
 
 
+def command_complete_filter(opcode: int) -> bytes:
+    """Socket filter that lets through only the Command Complete event of ``opcode``.
+
+    ``is_filtered_packet`` in hci_sock.c: bit ``packet type`` of ``type_mask``, bit ``event
+    code`` of ``event_mask``, and - for Command Complete - an exact opcode match.
+    """
+    masks = _FILTER_MASKS.pack(1 << HCI_EVENT_PKT, 1 << EVT_CMD_COMPLETE, 0)
+    return masks + struct.pack("<H", opcode) + b"\x00\x00"
+
+
+def parse_command_complete(packet: bytes, opcode: int) -> bytes | None:
+    """Return parameters (status first) if ``packet`` is the Command Complete event of ``opcode``.
+
+    As read from a raw HCI socket: packet type, event code, parameter length, number of
+    commands the controller accepts, opcode (little endian), return parameters.
+    """
+    if len(packet) < 6 or packet[0] != HCI_EVENT_PKT or packet[1] != EVT_CMD_COMPLETE:
+        return None
+    if int.from_bytes(packet[4:6], "little") != opcode:
+        return None
+    return bytes(packet[6:])
+
+
+def le_buffer_count(params: bytes) -> int | None:
+    """Number of LE data buffers from the return parameters of LE Read Buffer Size.
+
+    ``struct hci_rp_le_read_buffer_size { status; le_mtu (2 bytes); le_max_pkt; }``.  None if
+    the command failed or the answer is too short.  Zero means the controller has one pool
+    for classic and LE data.
+    """
+    if len(params) < 4 or params[0] != 0:
+        return None
+    return params[3]
+
+
+def boot_id() -> str:
+    """Identifies the running kernel instance; its packet counters do not outlive it."""
+    try:
+        with open(BOOT_ID_PATH, encoding="ascii") as handle:
+            return handle.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def dev_id_from_adapter(adapter: str) -> int:
     """``"/org/bluez/hci0"`` or ``"hci0"`` -> 0."""
     match = re.search(r"hci(\d+)$", adapter)
@@ -216,7 +295,7 @@ def dev_id_from_adapter(adapter: str) -> int:
 
 
 def kernel_needs_credit_repair(release: str | None = None) -> bool:
-    """True for kernels that leak LE transmit credits after injected packets (see module docs)."""
+    """True for kernels that leak transmit credits after injected packets (see module docs)."""
     match = re.match(r"(\d+)\.(\d+)", release if release is not None else platform.release())
     if not match:
         return True  # unknown: the repair is harmless on a fixed kernel
@@ -235,14 +314,20 @@ class RawBackend(Protocol):
 
     def send(self, packet: bytes) -> None: ...
 
+    def watch(self, opcode: int) -> None:
+        """From now on keep the controller's Command Complete events for ``opcode``."""
+
+    def reply(self, opcode: int) -> bytes | None:
+        """Return parameters of a Command Complete for ``opcode`` that has arrived; never waits."""
+
     def close(self) -> None: ...
 
 
 class HciSocketBackend:
     """A raw HCI socket bound to one controller.
 
-    The socket's event filter is left at its default (everything filtered out), so nothing is
-    ever queued for us to read.
+    The socket's event filter is left at its default (everything filtered out) unless
+    :meth:`watch` asks for one command's answer, so nothing else is ever queued for us.
     """
 
     def __init__(self) -> None:
@@ -289,6 +374,22 @@ class HciSocketBackend:
         if sent != len(packet):
             raise OSError(errno.EIO, f"short write to the HCI socket ({sent} of {len(packet)} bytes)")
 
+    def watch(self, opcode: int) -> None:
+        self._need().setsockopt(SOL_HCI, HCI_FILTER, command_complete_filter(opcode))
+
+    def reply(self, opcode: int) -> bytes | None:
+        sock = self._need()
+        while True:
+            try:
+                packet = sock.recv(MAX_EVENT_SIZE, socket.MSG_DONTWAIT)
+            except (BlockingIOError, InterruptedError):
+                return None
+            if not packet:
+                return None
+            params = parse_command_complete(packet, opcode)
+            if params is not None:
+                return params
+
     def close(self) -> None:
         if self._sock is not None:
             try:
@@ -323,11 +424,28 @@ class RawLink:
         self._repair = kernel_needs_credit_repair() if repair_credits is None else repair_credits
         self._backend: RawBackend | None = None
         self.connection: HciConnection | None = None
-        self.injected = 0  # packets injected on the current TV link (kept across detach/attach)
+        #: Packets injected whose effect on the kernel's counters has not been settled yet.
+        #: Kept across detach/attach and across TV links until :meth:`settle` ran.
+        self.injected = 0
 
     @property
     def attached(self) -> bool:
         return self.connection is not None
+
+    @property
+    def repairs(self) -> bool:
+        """Whether this kernel needs its counters repaired after injected packets."""
+        return self._repair
+
+    @property
+    def owes(self) -> bool:
+        """Injected packets have left the kernel's credit count in need of a repair."""
+        return self._repair and self.injected > 0
+
+    def assume_debt(self) -> None:
+        """An earlier run of the service injected packets and could not settle (it was stopped
+        while the TV link was up)."""
+        self.injected = max(self.injected, 1)
 
     def attach(self, dev_id: int, tv_address: str) -> HciConnection:
         """Open the controller and find the TV's link.  Raises :class:`RawError`."""
@@ -361,38 +479,60 @@ class RawLink:
         """Stop using the connection (delivery moved to bluetoothd, or the link is going).
 
         Never raises.  The count of injected packets is kept: the kernel's bookkeeping can
-        only be repaired once the link is closed, see :meth:`link_closed`.
+        only be repaired once the link is closed, see :meth:`settle`.
         """
         backend, self._backend = self._backend, None
         self.connection = None
         if backend is not None:
             self._close(backend)
 
-    def link_closed(self, dev_id: int) -> None:
-        """The TV link is down: undo what the injected packets did to the kernel's counters.
+    async def settle(self, dev_id: int) -> None:
+        """Undo what the injected packets did to the kernel's counters.  Never raises.
 
-        Never raises.  Must only be called after the link has closed - the repair resets the
-        adapter's LE credit count, which is wrong while injected packets are still in flight,
-        and pointless before ``hci_conn_del`` has subtracted them.
+        Must only be called once the TV link has closed (bluetoothd reports that after the
+        kernel deleted the connection): the repair resets an adapter-wide credit count, which
+        is wrong while injected packets are still in flight and pointless before
+        ``hci_conn_del`` has subtracted them.  Takes up to :data:`REPLY_WAIT` because the
+        controller's answer decides whether a second command is needed (module docstring);
+        it never blocks the event loop.
         """
         self.detach()
-        injected, self.injected = self.injected, 0
-        if not injected or not self._repair:
+        owed, self.injected = self.injected, 0
+        if not owed or not self._repair:
             return
         backend = self._backend_factory()
         try:
             backend.open(dev_id)
+            backend.watch(OPCODE_LE_READ_BUFFER_SIZE)
             backend.send(LE_READ_BUFFER_SIZE_COMMAND)
-            log.debug("raw: asked the kernel to rebuild its LE credit count after %d injected packets", injected)
+            params, waited = None, 0.0
+            while params is None and waited < REPLY_WAIT:
+                await asyncio.sleep(REPLY_POLL)
+                waited += REPLY_POLL
+                params = backend.reply(OPCODE_LE_READ_BUFFER_SIZE)
+            buffers = le_buffer_count(params) if params is not None else None
+            if buffers is None:
+                log.warning(
+                    "raw: asked the kernel to rebuild its LE credit count after %d injected packets, but the "
+                    "controller's answer %s; if it shares its buffers between classic and LE, credits stay lost "
+                    "until Bluetooth is switched off and on",
+                    owed,
+                    "did not arrive" if params is None else "reported a failure",
+                )
+            elif buffers == 0:
+                # One pool for classic and LE: the credits were taken from the classic count.
+                backend.send(READ_BUFFER_SIZE_COMMAND)
+                log.debug("raw: rebuilt the kernel's shared credit count after %d injected packets", owed)
+            else:
+                log.debug("raw: rebuilt the kernel's LE credit count after %d injected packets", owed)
         except OSError as exc:
-            log.warning("raw: could not rebuild the kernel's LE credit count: %s", _explain(exc))
+            if exc.errno in (errno.ENODEV, errno.ENETDOWN):
+                # The controller is gone or off: its counters start from scratch when it is back.
+                log.debug("raw: nothing to rebuild, %s", _explain(exc))
+            else:
+                log.warning("raw: could not rebuild the kernel's credit count: %s", _explain(exc))
         finally:
             self._close(backend)
-
-    def reset(self) -> None:
-        """The controller itself went away; its counters start from scratch when it returns."""
-        self.detach()
-        self.injected = 0
 
     @staticmethod
     def _close(backend: RawBackend) -> None:

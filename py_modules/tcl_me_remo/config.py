@@ -165,7 +165,8 @@ class BluetoothConfig:
         default="auto",
         metadata=_meta(
             choices=("auto", "off", "always"),
-            help="Deliver keys straight to the radio when BlueZ has lost the TV's subscription (after a reboot).",
+            help="Deliver keys straight to the radio when BlueZ has lost the TV's subscription (after a reboot). "
+            "'off' means such a TV has to be paired again after each reboot.",
         ),
     )
     reconnect_on_drop: bool = field(
@@ -227,7 +228,8 @@ class WifiConfig:
         default="app_link",
         metadata=_meta(
             choices=("app_link", "keycode"),
-            help="app_link opens the TV-input link (works on TCL); keycode sends the HDMI key (ignored by TCL).",
+            help="app_link opens the TV-input link (reported to work on TCL sets); keycode sends the HDMI "
+            "key, which TCL sets are reported to ignore.",
         ),
     )
     link_preset: str = field(

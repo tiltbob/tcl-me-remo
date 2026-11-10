@@ -107,6 +107,36 @@ async def test_install_failure_is_reported_to_the_panel(backend, monkeypatch):
     assert state["problems"][0].startswith("install failed:")
 
 
+async def test_installing_is_reported_and_concurrent_requests_share_one_install(backend, monkeypatch):
+    started, release, runs = asyncio.Event(), asyncio.Event(), []
+
+    async def slow_installer(*args, timeout=120.0):
+        if args[0] == "install":
+            runs.append(args)
+            started.set()
+            await release.wait()
+            return {"log": ["installed"], "installed": True}
+        return {"installed": False, "active": False, "enabled": False, "problems": []}
+
+    monkeypatch.setattr(backend, "_installer", slow_installer)
+    plugin = backend.Plugin()
+    assert (await plugin.service_info())["installing"] is False
+    await plugin._main()
+    await started.wait()
+    assert (await plugin.service_info())["installing"] is True
+    # the user presses Repair while the start-up install is still running: no second install
+    pressed = asyncio.ensure_future(plugin.install_service())
+    await asyncio.sleep(0.05)
+    release.set()
+    reply = await pressed
+    assert reply == {"ok": True, "result": {"log": ["installed"], "installed": True}}
+    assert len(runs) == 1
+    assert (await plugin.service_info())["installing"] is False
+    # afterwards a new press runs a fresh install
+    assert (await plugin.install_service())["ok"] is True
+    assert len(runs) == 2
+
+
 async def test_uninstall_hook_only_schedules_a_check(backend, monkeypatch):
     commands = []
 

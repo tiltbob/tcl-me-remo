@@ -83,7 +83,7 @@ there are two ways, both off until you turn them on:
 
 - **Key macro over Bluetooth.** Android TVs have no remote key for "HDMI 2", so the machine
   presses the keys you would: open the source list, move to the entry, OK. Pick the HDMI
-  port, choose a preset, press *Test* and watch the TV. If the preset misses, adjust the
+  port, choose a preset, press *Try* and watch the TV. If the preset misses, adjust the
   macro; `F3 1.5s LEFT*8 RIGHT*2 OK` reads "F3, wait, eight times left, twice right, OK".
   See [macros](docs/macros.md).
 - **Wi-Fi assist.** Opt-in. The machine pairs with the TV over the network, the way the
@@ -164,7 +164,7 @@ Uninstall the plugin in Decky; a few minutes later the service removes itself. W
 python3 -m pytest -q --timeout 60     # the service; needs dbus-daemon, no Bluetooth
 ruff check .
 pnpm install && pnpm run build        # the Decky panel
-scripts/build-plugin.sh               # out/tcl-me-remo.zip
+python3 scripts/build_zip.py          # out/tcl-me-remo.zip
 ```
 
 The service is plain Python 3.11+ with one vendored dependency. Tests run it against fake

@@ -91,6 +91,12 @@ class BluezWatcher:
             await asyncio.gather(task, return_exceptions=True)
         for rule in _MATCH_RULES:
             await dbus.remove_match(self._bus, rule)
+        # Nothing is tracked from here on: a later start() must take a fresh snapshot instead of
+        # trusting a mirror that missed every change in between.
+        self.owner = None
+        self.objects = {}
+        self.synced = False
+        self._queued = None
 
     # ------------------------------------------------------------------ queries
 

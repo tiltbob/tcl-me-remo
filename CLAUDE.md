@@ -21,6 +21,8 @@ touching the CLI or the plugin.
   - `installer.py`, `doctor.py`, `cli.py`, `ipc.py` — install, diagnostics, CLI, control socket.
   - `_vendor/dbus_fast/` — vendored, pure Python. Refresh only with `scripts/vendor.sh`.
 - `main.py`, `src/`, `plugin.json`, `package.json` — the Decky plugin (backend bridge, React UI).
+- `preview/` — the same UI rendered in a browser against mocks and a fake backend; it
+  produces `docs/images/` and is the only way to see the panel without a Deck.
 - `tests/` — pytest; `fake_bluez.py` and `fake_logind.py` stand in for the system services on
   a private D-Bus daemon.
 - `hardware-results/` — what was observed on real hardware. Add to it, never rewrite history.
@@ -30,7 +32,9 @@ touching the CLI or the plugin.
 ```sh
 python3 -m pytest -q --timeout 60    # needs dbus-daemon; no Bluetooth hardware needed
 ruff check .
-pnpm install && pnpm run build       # the plugin frontend
+pnpm install && pnpm run typecheck && pnpm run build    # the plugin frontend
+pnpm run preview                     # renders every screen with mocked Decky modules, runs UI checks
+python3 scripts/build_zip.py         # out/tcl-me-remo.zip (the name must not change)
 ./install.sh                         # install this checkout as the running service (sudo)
 tcl-me-remo doctor                   # read-only health report
 ```

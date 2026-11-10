@@ -135,6 +135,7 @@ class Plugin:
         # Set here, not in _main: the panel can call in before _main has run.
         self._install_lock = asyncio.Lock()
         self._install_error = ""
+        self._installing = None  # the running install task, if any
         self._startup = None
 
     async def _main(self):
@@ -166,16 +167,25 @@ class Plugin:
             decky.logger.warning("could not schedule the clean-up check: %s", err.strip())
 
     async def _ensure_service(self):
-        async with self._install_lock:
-            result = await _installer("install", "--user-home", decky.DECKY_USER_HOME)
-        if "error" in result:
-            self._install_error = str(result["error"])
-            decky.logger.error("service install failed: %s", self._install_error)
-        else:
-            self._install_error = ""
-            for line in result.get("log", []):
-                decky.logger.info("service: %s", line)
-        return result
+        """Install, update or repair the service.  Callers arriving meanwhile share the result."""
+        if self._installing is None:
+            self._installing = asyncio.ensure_future(self._run_install())
+        return await asyncio.shield(self._installing)
+
+    async def _run_install(self):
+        try:
+            async with self._install_lock:
+                result = await _installer("install", "--user-home", decky.DECKY_USER_HOME)
+            if "error" in result:
+                self._install_error = str(result["error"])
+                decky.logger.error("service install failed: %s", self._install_error)
+            else:
+                self._install_error = ""
+                for line in result.get("log", []):
+                    decky.logger.info("service: %s", line)
+            return result
+        finally:
+            self._installing = None
 
     # ------------------------------------------------------------------ called by the panel
 
@@ -210,6 +220,9 @@ class Plugin:
             }
         if self._install_error:
             state.setdefault("problems", []).insert(0, f"install failed: {self._install_error}")
+        # True while the plugin is putting the service in place (first load, or Repair), so
+        # the panel can say "installing" instead of raising a "not installed" alarm.
+        state["installing"] = self._installing is not None
         return state
 
     async def install_service(self) -> dict:
