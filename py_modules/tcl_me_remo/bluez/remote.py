@@ -160,6 +160,13 @@ NOT_SUBSCRIBED_OLD_KERNEL = (
 #: was to be sent travels in a report whose subscription is missing.
 NOT_SUBSCRIBED_THIS_KEY = " (it renewed its subscription for some keys only, and this key is not among them)"
 
+#: What send_key answers when the key it holds was released underneath it (_release_held):
+#: an error code and the beginning of the sentence, "... while HOME was held".  Only the first
+#: is about the link; after the other two it is up as before.
+HOLD_LINK_CLOSED = ("not_connected", "the Bluetooth link was closed")
+HOLD_SUBSCRIPTION_ENDED = ("not_subscribed", "the TV ended a subscription to key reports")
+HOLD_DELIVERY_CHANGED = ("not_connected", "key delivery was changed in the settings")
+
 
 #: Longest TV name that is kept (``bluetooth.tv_name`` allows as much).
 MAX_TV_NAME = 64
@@ -303,6 +310,7 @@ class BleRemote:
         self._error = ""
         self._pairing_note = ""               # how the last pairing window ended / what is wrong with the open one
         self._held: int | None = None         # report id of the key that is down right now
+        self._hold_ended = HOLD_LINK_CLOSED   # why that key was released before its time was up
         self._last_activity = 0.0
         self._last_report_at = 0.0            # when the last input report was handed over
         self._advert_not_before = 0.0
@@ -476,7 +484,7 @@ class BleRemote:
                 self._restart_idle_watch()
             if self._ready and self._delivery == "raw" and self._direct_delivery() == "off":
                 # Direct delivery was just forbidden: keys can no longer reach the TV.
-                self._release_held()
+                self._release_held(HOLD_DELIVERY_CHANGED)
                 self._ready, self._delivery = False, ""
                 self._raw.detach()
             elif (
@@ -488,7 +496,7 @@ class BleRemote:
             ):
                 # Direct delivery was just allowed, and some reports have no other way to the
                 # TV: the next ensure_ready sets it up for them.
-                self._release_held()
+                self._release_held(HOLD_DELIVERY_CHANGED)
                 self._ready, self._delivery = False, ""
 
     async def ensure_ready(self, timeout: float, *, wake: bool = False) -> bool:
@@ -541,13 +549,15 @@ class BleRemote:
             if not self._ready:
                 raise TransportError("not_connected", "the TV is not connected over Bluetooth")
             self._deliver(report_id, payload)
-            self._held = report_id
+            self._held, self._hold_ended = report_id, HOLD_LINK_CLOSED
             try:
                 await asyncio.sleep(max(0.0, hold))
                 if self._held is None:
-                    # We gave the link up ourselves meanwhile (disconnect, forget, pairing) and
-                    # released the key on the way out, see _release_held.
-                    raise TransportError("not_connected", f"the Bluetooth link was closed while {key.spec} was held")
+                    # We gave the link up ourselves meanwhile (disconnect, forget, pairing), or
+                    # it stopped being ready for keys while it stayed up, and the key was
+                    # released on the way out, see _release_held.
+                    code, what = self._hold_ended
+                    raise TransportError(code, f"{what} while {key.spec} was held")
                 if not self._ready:
                     # The TV tears its input device down with the link, which releases the key.
                     self._held = None
@@ -571,14 +581,23 @@ class BleRemote:
                         self._spawn(self._drop_link_quietly())
             self._last_activity = time.monotonic()
 
-    def _release_held(self) -> None:
+    def _release_held(self, ended: tuple[str, str] = HOLD_LINK_CLOSED) -> None:
         """Release the key that is down, if any, before the link stops being usable.
 
         bluetoothd keeps a link up for two more seconds after Device1.Disconnect(); a key
-        left down for that long would auto-repeat on the TV.
+        left down for that long would auto-repeat on the TV.  The same goes for a link that
+        stays up and is merely not ready for keys any more: ``ended`` is what send_key then
+        answers (HOLD_...).
         """
         report_id, self._held = self._held, None
-        if report_id is None or not self._ready:
+        if report_id is None:
+            return
+        self._hold_ended = ended
+        if not self._ready:
+            return
+        if self._delivery != "raw" and self._app is not None and not self._app.reports[report_id].notifying:
+            # The TV has just ended the subscription of this very report: bluetoothd would
+            # drop the release (_deliver refuses it), and the TV no longer wants to hear of it.
             return
         try:
             self._deliver(report_id, hid.release_report(report_id))
@@ -1575,7 +1594,10 @@ class BleRemote:
                 # bluetoothd drops this report from now on (all of ours, once the last
                 # subscription is gone).  Not ready any more, so that the next ensure_ready
                 # looks again (direct delivery, or an honest error) instead of sending keys
-                # into the void.
+                # into the void.  A key that is down comes up first: its own report still
+                # gets through unless it is the one this is about, and send_key, which finds
+                # the link not ready when the time is up, would leave it down on the TV.
+                self._release_held(HOLD_SUBSCRIPTION_ENDED)
                 self._ready, self._delivery = False, ""
             self._wakeup.fire()
             return

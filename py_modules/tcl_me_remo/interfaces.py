@@ -116,6 +116,12 @@ class Remote(Protocol):
         a link that is ready although the TV subscribed to some of its three key reports only
         and direct delivery is not allowed, a key in one of the others raises
         ``not_subscribed`` and nothing is sent, while the link stays ready for the rest.
+
+        A link that stops being ready while the key is down ends the key early: the key is
+        released first wherever a release can still reach the TV, and when ``hold`` is over
+        the call raises ``not_connected`` (the link dropped or was closed, or key delivery
+        was changed in the settings) or ``not_subscribed`` (the TV ended a subscription; the
+        link is still up).
         """
 
     async def start_pairing(self, timeout: float) -> None:

@@ -227,8 +227,9 @@ in one of the others fails with the same error as for a TV that did not subscrib
 saying that this key is not among those the TV subscribed for. No Android version does this
 by design; by the source it can happen when the link drops between the TV's first and last
 write, after which the TV writes nothing more until the next reboot of this machine. The
-service then waits the full time once and only a moment on later links. None of this has
-been observed on a TV.
+service then waits the full time once and only a moment on later links. A TV that ends one
+of its subscriptions on a link that is in use is looked at afresh before the next key, and a
+key that is down at that moment is released first. None of this has been observed on a TV.
 
 For a TV that does not subscribe again (Android 11 to 13) the service has a **direct
 delivery** path (`bluetooth.raw_notify`):
