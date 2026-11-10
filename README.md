@@ -147,6 +147,7 @@ tcl-me-remo uninstall [--purge]    remove the service (asks sudo)
 | `display.edid_match` | empty | Act only while a display with this name is connected (for example `TCL`) |
 | `input.method` | `none` | `macro`, `wifi` or `none` |
 | `input.hdmi_port` | 1 | The HDMI port the machine is on |
+| `input.wifi_fallback_to_macro` | off | With `input.method` `wifi`: play the key macro when the Wi-Fi request fails |
 | `bluetooth.reconnect_on_drop` | on | Keep calling the TV while it is not connected |
 | `bluetooth.raw_notify` | `auto` | Direct key delivery for TVs that do not re-subscribe after a reboot: `auto` (Linux 6.17 and later only), `on`, `off` |
 | `power.on_key`, `power.off_key` | `WAKE`, `SLEEP` | The keys used for power |

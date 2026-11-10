@@ -133,7 +133,8 @@ the machine stayed up and counts the next suspend or shutdown as a new one.
 A handheld that wakes on the sofa must not turn the TV on. The **display check** looks at the
 kernel's display connectors: with a built-in panel (eDP, DSI, LVDS), TV actions run only
 while an external display is connected, optionally only one whose EDID name matches. A
-machine without a built-in panel is assumed to be on the TV.
+machine without a built-in panel is assumed to be on the TV. If the connectors exist but
+cannot be read, the check stays closed and says so, rather than guessing.
 
 ## The link
 
@@ -240,8 +241,8 @@ delivery. While the service keeps calling the TV (`bluetooth.reconnect_on_drop`)
 one-off reconnect happens in the background as soon as the TV has connected and stayed
 silent (or stopped after some of its subscriptions), not when the first key is due: before a
 suspend there would be no time for it.
-`tcl-me-remo status --json` shows `"delivery": "raw"` when this path is in use, and
-`tcl-me-remo doctor` says "direct delivery" on its TV link line. If the TV subscribes later
+`tcl-me-remo status` shows `delivery: raw` when this path is in use (`"delivery": "raw"`
+in `status --json`), and `tcl-me-remo doctor` says "direct delivery" on its TV link line. If the TV subscribes later
 after all, delivery switches back at once, report by report.
 
 Direct delivery has a side effect on Linux kernels before 6.17. (To be exact: on mainline
@@ -349,7 +350,7 @@ It only works while the TV's network is up: on, or in standby with Screenless se
 | `/opt/tcl-me-remo/` | the code (root-owned) and `bin/tcl-me-remo` |
 | `/etc/systemd/system/tcl-me-remo.service` | the service |
 | `/etc/systemd/system/tcl-me-remo-sleep.service` | the suspend/resume hook |
-| `/var/lib/tcl-me-remo/config.json` | settings |
+| `/var/lib/tcl-me-remo/config.json` | settings. A file that cannot be read at all is moved to `config.json.broken` at start-up and the service runs on defaults; `tcl-me-remo status` says so until the next restart |
 | `/var/lib/tcl-me-remo/` | state: Wi-Fi pairing certificate, what was learned about the TV, the installer's notes (links it made, "the plugin was removed") |
 | `/run/tcl-me-remo/control.sock` | control socket (`root:wheel`, `0660`) |
 | `/var/lib/bluetooth/` | the Bluetooth bond itself (BlueZ's, not ours) |

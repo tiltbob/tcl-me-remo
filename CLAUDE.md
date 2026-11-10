@@ -48,7 +48,8 @@ tcl-me-remo doctor                   # read-only health report
   them for a bonded remote and Android before 14 never re-reads them. Changing a byte breaks
   every existing pairing without any error. New keys must fit the declared usage ranges.
 - **Do not restart the service or re-register the GATT application without need.** Either one
-  makes BlueZ forget the TV's subscription. Settings changes are applied live.
+  makes BlueZ forget the TV's subscription. Settings changes are applied live (the two exceptions,
+  `bluetooth.adapter` and `bluetooth.gatt_security`, say so in their help text).
 - **Standard library only**, plus the vendored D-Bus library. SteamOS has no pip and a
   read-only root. The plugin backend runs in Decky's own Python, so `ipc.py`, `paths.py`
   and `installer.py` must not import anything heavier.

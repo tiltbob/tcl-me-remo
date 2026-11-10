@@ -29,9 +29,9 @@ when the session ends; it is how the next session, on any machine, learns what i
 ## Tools
 
 ```sh
-tcl-me-remo status            # one line on the link: no TV / calling / connected
+tcl-me-remo status            # one line on the link, e.g. "connected, ready (delivery: bluez)"
 tcl-me-remo status --json | grep -E '"(connected|ready|subscribed|delivery|error)"'
-                              # the same in full; "delivery" is "bluez" or "raw" while ready
+                              # the same as separate fields
 tcl-me-remo logs -n 100       # what the service did, step by step
 journalctl -u tcl-me-remo -b  # the same, for the whole boot
 sudo btmon -w /tmp/t3.btsnoop # radio-level trace of one attempt (Ctrl+C to stop)
@@ -44,18 +44,26 @@ With adb enabled on the TV (`adb connect <tv-ip>`):
 adb shell getprop ro.build.version.release        # Android version
 adb shell dumpsys power | grep mWakefulness       # Awake / Asleep / Dozing
 adb shell getevent -lt                            # key events as they arrive
-adb shell dumpsys input | grep -A12 "SteamOS"     # which key layout the TV applied to us
+adb shell dumpsys input | grep -B2 -A12 "SteamOS" # which key layout the TV applied to us
+                                                  # (nothing? the TV may list us under the
+                                                  #  machine's own Bluetooth name: look for that)
 adb shell dumpsys tv_input | grep -i inputId      # input ids for the Wi-Fi assist
 ```
 
 adb is the only way for an unattended session to see what the TV did. Without it, ask the
 person.
 
-Reading the plain `status` line: `connected` means ready for keys. `connected, waiting for
-the TV to subscribe` means the link is up and no key has been asked for yet; that is the
-normal resting state after a boot or a wake and says nothing about the TV's subscription
-(the `subscribed` field of `status --json` does). How keys travel (`delivery`) is not in
-the plain output at all; `tcl-me-remo doctor` shows it on its `TV link` line.
+Reading the plain `status` line:
+
+- `connected, ready (delivery: bluez)` or `(delivery: raw)`: keys can be sent, and this is
+  how they travel. `raw` is direct delivery (T6).
+- `connected (no key sent on this link yet)`: the link is up and the TV has subscribed, but
+  nothing was sent on it. This is the normal resting state after a boot or a wake.
+- `connected, waiting for the TV to subscribe`: the link is up and the TV has not renewed
+  its subscription (yet).
+- `calling the TV...`: not connected; the machine is advertising for the TV to connect.
+
+`tcl-me-remo doctor` shows the same on its `TV link` line.
 
 ## T1. Pairing
 

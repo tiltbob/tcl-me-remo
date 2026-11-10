@@ -23,7 +23,8 @@ tcl-me-remo macro "F3 1.5s LEFT*8 RIGHT*{port} OK"
 ```
 
 Between keys the machine pauses for `bluetooth.key_gap_ms` (350 ms by default) so the TV's
-menus can keep up. A macro may have at most 64 steps and run for two minutes.
+menus can keep up. A macro may be at most 1024 characters long, have at most 64 steps and
+run for two minutes; a macro over a limit is refused when it is saved, not when it is due.
 
 ## Switching inputs with a macro
 
