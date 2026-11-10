@@ -39,6 +39,7 @@ TIMEOUTS = {
     "tv_off": 45.0,
     "send_key": 30.0,
     "wifi_discover": 20.0,
+    "wifi_test": 20.0,
     "wifi_pair_start": 30.0,
     "wifi_pair_finish": 30.0,
 }

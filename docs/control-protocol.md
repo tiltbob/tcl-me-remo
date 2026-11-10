@@ -30,10 +30,10 @@ echo '{"id":1,"method":"status"}' | sudo socat - UNIX-CONNECT:/run/tcl-me-remo/c
 | `set_config` | `{patch}` nested object of changes, e.g. `{"input": {"hdmi_port": 2}}` | `{config}` |
 | `tv_on` | `{switch_input?: bool}` (default `true`) | [Action record](#action-record) |
 | `tv_off` | | Action record |
-| `switch_input` | | Action record |
+| `switch_input` | `{via?}` `macro` or `wifi`: try exactly that method, whatever `input.method` is, with no fallback | Action record |
 | `send_key` | `{key, hold?}` key name or raw usage; `hold` in seconds | `{key}` |
 | `run_macro` | `{macro}` macro text; `{port}` placeholders allowed | Action record |
-| `check_macro` | `{macro}` | `{ok, normalized, rendered, seconds}` or `{ok: false, error}` |
+| `check_macro` | `{macro, port?}` port defaults to the configured HDMI port | `{ok, normalized, rendered, seconds}` or `{ok: false, error}` |
 | `event` | `{name, simulate?, budget?, wait?}` name is `boot`, `resume`, `suspend`, `shutdown` or `reboot` | Action record, or `{queued, name}` with `wait: false` |
 | `pair_start` | `{timeout?}` 10..600 seconds, default 120 | Bluetooth state |
 | `pair_cancel` | | Bluetooth state |

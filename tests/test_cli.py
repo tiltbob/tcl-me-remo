@@ -54,6 +54,10 @@ async def test_on_off_input_key_macro(running):
 
     code, out, _ = await running("input")
     assert code == 0 and "input switched" in out
+    code, out, _ = await running("input", "--via", "macro")
+    assert code == 0 and "input switched (Bluetooth macro)" in out
+    code, out, _ = await running("input", "--via", "wifi")
+    assert code == 1 and "failed:" in out  # the Wi-Fi assist is not set up in this test
 
     running.remote.keys.clear()
     code, out, _ = await running("key", "home")

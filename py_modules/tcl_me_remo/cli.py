@@ -43,7 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("on", help="turn the TV on and switch to this machine's input")
     p.add_argument("--no-input", action="store_true", help="only turn the TV on")
     sub.add_parser("off", help="turn the TV off")
-    sub.add_parser("input", help="switch the TV to this machine's input")
+    p = sub.add_parser("input", help="switch the TV to this machine's input")
+    p.add_argument("--via", choices=["macro", "wifi"], help="try this method, whatever input.method is set to")
 
     p = sub.add_parser("key", help="send one remote key, e.g. HOME, DOWN, OK, C:0223")
     p.add_argument("key")
@@ -309,7 +310,8 @@ def run(
         if args.command == "off":
             return _print_record(call("tv_off", timeout=40.0), out)
         if args.command == "input":
-            return _print_record(call("switch_input", timeout=180.0), out)
+            params = {"via": args.via} if args.via else {}
+            return _print_record(call("switch_input", params, timeout=180.0), out)
         if args.command == "key":
             params: dict[str, Any] = {"key": args.key}
             if args.hold is not None:

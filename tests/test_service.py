@@ -483,6 +483,30 @@ async def test_wifi_failure_without_fallback_fails(tmp_path):
     assert wifi.attempts == 1  # a non-"unreachable" error is not retried
 
 
+async def test_a_method_can_be_tried_before_it_is_turned_on(tmp_path):
+    wifi = FakeWifi()
+    patch = {"input": {"method": "none"}, "wifi": {"enabled": True, "host": "tv.lan"}}
+    h = Harness(tmp_path, wifi=wifi, patch=patch)
+    assert not (await h.service.switch_input())["ok"]  # switching is off...
+    record = await h.service.switch_input("macro")  # ...but each method can be tried
+    assert record["ok"] and record["detail"] == "input switched (Bluetooth macro)"
+    assert h.remote.key_names() == ["HOME", "DOWN", "OK"]
+    record = await h.service.rpc("switch_input", {"via": "wifi"})
+    assert record["ok"] and record["detail"] == "input switched (Wi-Fi)"
+    assert wifi.keys == [("tv.lan", 243)]
+
+    # an explicit method never falls back to the other one: the user asked to see *this* one
+    wifi.fail_code = "wifi_error"
+    h.remote.keys.clear()
+    record = await h.service.switch_input("wifi")
+    assert not record["ok"] and h.remote.keys == []
+
+    for bad in ("telepathy", 5):
+        with pytest.raises(RpcError) as err:
+            await h.service.rpc("switch_input", {"via": bad})
+        assert err.value.code == "bad_request"
+
+
 async def test_macro_method_without_macro_explains(tmp_path):
     h = Harness(tmp_path, patch={"input": {"macro": ""}})
     record = await h.service.switch_input()
@@ -619,6 +643,9 @@ async def test_rpc_surface(tmp_path):
 
     assert (await rpc("check_macro", {"macro": "home down*{port}"}))["rendered"] == "HOME DOWN*4"
     assert (await rpc("check_macro", {"macro": "bogus"}))["ok"] is False
+    assert (await rpc("check_macro", {"macro": "down*{port}", "port": 2}))["rendered"] == "DOWN*2"
+    with pytest.raises(RpcError):
+        await rpc("check_macro", {"macro": "OK", "port": 7})
     assert (await rpc("check_macro", {"macro": ""}))["ok"] is True
 
     assert (await rpc("send_key", {"key": "HOME"})) == {"key": "HOME"}

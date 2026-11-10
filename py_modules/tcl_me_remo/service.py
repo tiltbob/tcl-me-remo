@@ -543,8 +543,22 @@ class Service:
     async def tv_off(self) -> dict[str, Any]:
         return await self._run_action("tv_off", "manual", self._do_tv_off, mode="reject", budget=MANUAL_OFF_BUDGET)
 
-    async def switch_input(self) -> dict[str, Any]:
+    async def switch_input(self, via: str | None = None) -> dict[str, Any]:
+        """Switch the TV's input now.
+
+        ``via`` ("macro" or "wifi") tries exactly that method, whatever ``input.method`` says
+        and without falling back, so a method can be tested before it is turned on.
+        """
+        if via not in (None, "macro", "wifi"):
+            raise RpcError("bad_request", "'via' must be 'macro' or 'wifi'")
+
         async def action(trace: Trace) -> str:
+            if via == "wifi":
+                await self._wifi_switch_input(trace)
+                return "input switched (Wi-Fi)"
+            if via == "macro":
+                await self._macro_switch_input(trace)
+                return "input switched (Bluetooth macro)"
             return f"input switched ({await self._do_switch_input(trace)})"
 
         return await self._run_action("switch_input", "manual", action, mode="reject")
@@ -693,7 +707,10 @@ class Service:
         return await self.tv_off()
 
     async def _rpc_switch_input(self, params: dict[str, Any]) -> Any:
-        return await self.switch_input()
+        via = params.get("via")
+        if via is not None and not isinstance(via, str):
+            raise RpcError("bad_request", "'via' must be 'macro' or 'wifi'")
+        return await self.switch_input(via)
 
     async def _rpc_send_key(self, params: dict[str, Any]) -> Any:
         hold = params.get("hold")
@@ -707,9 +724,12 @@ class Service:
     async def _rpc_check_macro(self, params: dict[str, Any]) -> Any:
         """Validate macro text without running it (live feedback while the user types)."""
         cfg = self.cfg
+        port = params.get("port", cfg.input.hdmi_port)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 4:
+            raise RpcError("bad_request", "'port' must be an HDMI port number from 1 to 4")
         try:
             cleaned = macro.validate(_str(params, "macro", allow_empty=True))
-            steps = macro.parse(macro.render(cleaned, cfg.input.hdmi_port))
+            steps = macro.parse(macro.render(cleaned, port))
         except macro.MacroError as exc:
             return {"ok": False, "error": str(exc)}
         seconds = macro.estimate_seconds(
