@@ -419,7 +419,8 @@ class BleRemote:
 
     async def start_pairing(self, timeout: float) -> None:
         self._abort += 1  # a running ensure_ready gives way
-        self._parked = False
+        # No background calling while the old bond is removed and the window is set up.
+        was_parked, self._parked = self._parked, True
         self._wakeup.fire()
         await self._cancel_task("_reconnect_task")
         async with self._op_lock:
@@ -427,8 +428,12 @@ class BleRemote:
             try:
                 await self._open_pairing(timeout)
             except TransportError:
+                self._parked = was_parked
+                self._call_in_background()
                 raise
             except (DBusError, TimeoutError, OSError) as exc:
+                self._parked = was_parked
+                self._call_in_background()
                 raise self._fail("bluetooth_error", f"could not open pairing mode: {_describe(exc)}") from None
 
     async def cancel_pairing(self) -> None:
@@ -443,6 +448,7 @@ class BleRemote:
 
     async def forget(self) -> None:
         self._abort += 1
+        self._parked = True
         self._wakeup.fire()
         await self.cancel_pairing()
         await self._cancel_task("_reconnect_task")
@@ -1236,6 +1242,7 @@ class BleRemote:
 
         self._cfg = dataclasses.replace(self._cfg, tv_address=address, tv_name=name)
         self._paired_this_registration = True
+        self._parked = False
         self._store.set_resubscribes(address, None)
         self._store.discard_stale(address)
         self._error = ""

@@ -27,6 +27,7 @@ their Bluetooth controller before suspending and wake when it is heard.  Experim
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Callable
@@ -125,6 +126,9 @@ class Advertiser:
         self._basic = BasicAdvertisement(self._released)
         self._exported = False
         self._use_basic = False
+        # start() and stop() are called from several tasks (a waiting ensure_ready, the
+        # background caller, the pairing loop); bluetoothd must see them one at a time.
+        self._lock = asyncio.Lock()
         self.adapter_path = ""
         self.active_path = ""          # object registered with bluetoothd, "" if none
         self.settings: AdvertSettings | None = None
@@ -193,10 +197,14 @@ class Advertiser:
 
         Raises ``DBusError`` / ``TimeoutError`` if bluetoothd refuses.
         """
+        async with self._lock:
+            await self._start(adapter_path, settings)
+
+    async def _start(self, adapter_path: str, settings: AdvertSettings) -> None:
         if self.active and self.adapter_path == adapter_path and self.settings == settings:
             return
         if self.active:
-            await self.stop()
+            await self._stop()
         self.export()
         self._timed.settings = self._basic.settings = settings
         self.adapter_path = adapter_path
@@ -239,6 +247,10 @@ class Advertiser:
 
     async def stop(self) -> None:
         """Take the advertisement off air.  Never raises."""
+        async with self._lock:
+            await self._stop()
+
+    async def _stop(self) -> None:
         if not self.active:
             return
         path, self.active_path, self.settings = self.active_path, "", None
@@ -291,7 +303,8 @@ class Beacon:
 
     async def start(self, adapter_path: str, company: int, data: bytes) -> None:
         """Broadcast ``data`` as manufacturer data of ``company``.  Raises if bluetoothd refuses."""
-        if self.active and (adapter_path, company, data) == (self._adapter_path, self._object.company, self._object.data):
+        current = (self._adapter_path, self._object.company, self._object.data)
+        if self.active and current == (adapter_path, company, bytes(data)):
             return
         await self.stop()
         self.export()
