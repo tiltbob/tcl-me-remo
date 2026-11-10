@@ -833,6 +833,7 @@ async function main() {
       "an opened entry stays open when a new action is recorded",
       (await page.getByRole("button", { name: "Hide steps", exact: true }).count()) === 1 && (await sees(page, "Bluetooth: playing macro: F3 1.5s LEFT*8 RIGHT*2 OK", 1000)),
     );
+    check("no settings problem is shown when there is none", (await page.getByText("Settings problems").count()) === 0);
     await button(page, "Remove").click();
     check("Remove asks first and offers to delete the settings", (await sees(page, "Remove the background service?")) && (await toggle(page, "Also delete settings and the pairing").count()) === 1 && (await calls(page, "remove_service")).length === 0);
     check(
@@ -852,6 +853,33 @@ async function main() {
     await button(page, "Install service").click();
     check("and the service can be installed again from there", await sees(page, "Yes, version", 8000));
     await page.context().close();
+  }
+
+  console.log("Settings: Diagnostics, a problem with the settings file");
+  {
+    const setting = { events: { reboot_tv_off: true } };
+    const save = (page) => page.evaluate((patch) => window.__preview.fake.rpc("set_config", { patch }), setting);
+
+    const value = await settings("diagnostics, a bad value", "diagnostics", { configProblem: "value" });
+    check("a value that could not be used is shown", (await sees(value, "Settings problems")) && (await sees(value, "input.hdmi_port: must be at most 4")));
+    check("with the way to settle it", await sees(value, "Changing any setting writes a clean settings file."));
+    await save(value);
+    check("and it is settled by the next save", await gone(value, "Settings problems"));
+    await value.context().close();
+
+    const kept = await settings("diagnostics, the file was moved aside", "diagnostics", { configProblem: "kept" });
+    check("a settings file that was moved aside is shown with where it is", (await sees(kept, "Settings problems")) && (await sees(kept, "/var/lib/tcl-me-remo/config.json.broken")));
+    check(
+      "the page says that the service runs on defaults and how to get the settings back",
+      (await sees(kept, "The service is running on default settings")) && (await sees(kept, "mend that file and move it back in Desktop Mode, then restart")),
+    );
+    check("and does not claim that changing a setting clears it", (await kept.getByText("Changing any setting writes a clean settings file.").count()) === 0);
+    await shot(kept, "diagnostics-settings-kept", false);
+    const statusBefore = await statusCalls(kept);
+    await save(kept);
+    await until(async () => (await statusCalls(kept)) >= statusBefore + 2);
+    check("which is true: the entry is still there after a setting was saved", (await sees(kept, "config.json.broken", 1000)) && (await sees(kept, "The service is running on default settings", 1000)));
+    await kept.context().close();
   }
 
   await browser.close();

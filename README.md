@@ -173,6 +173,11 @@ hooks, and says what is wrong in plain words.
   restores things.
 - **The machine does not show up on the TV when pairing.** Pairing mode closes after two
   minutes; open it again. Remove any earlier pairing between the TV and this machine first.
+- **Settings are back to their defaults and the TV shows as unpaired.** `tcl-me-remo status`
+  then has a `config:` line: the settings file could not be read (a slip while editing it
+  by hand, usually) and was kept as `/var/lib/tcl-me-remo/config.json.broken`. Mend it,
+  move it back to `config.json` and restart the service
+  (`sudo systemctl restart tcl-me-remo`).
 - **A Bluetooth LE controller no longer reconnects.** Set
   `bluetooth.idle_disconnect_seconds` to `30`. The link to the TV is then closed whenever
   no key was sent for that long and made again when needed, so turning the TV off at

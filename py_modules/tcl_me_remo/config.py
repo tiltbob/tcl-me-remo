@@ -49,7 +49,10 @@ class ConfigError(ValueError):
     """A configuration value is invalid.  ``path`` is dotted, e.g. ``input.hdmi_port``."""
 
     def __init__(self, path: str, message: str):
-        super().__init__(f"{path}: {message}" if path else message)
+        # The path of a setting that does not exist is whatever the caller sent: named cut
+        # short, like any value (no real path comes near the length).
+        shown = path if len(path) <= _QUOTE_CHARS else path[: _QUOTE_CHARS - 3] + "..."
+        super().__init__(f"{shown}: {message}" if path else message)
         self.path = path
         self.message = message
 
@@ -245,7 +248,9 @@ class BluetoothConfig:
         default=True,
         metadata=_meta(
             help="Keep calling the TV whenever it is not connected, so the link is up when it is needed. "
-            "Turn off if the TV wakes up by itself."
+            "Turn off if the TV wakes up by itself; turning the TV off then gets a second attempt when the "
+            "first could not reach it, so a TV that does not answer can hold a suspend for about 10 s and a "
+            "shutdown for about 12 s."
         ),
     )
     wake_beacon: str = field(
@@ -270,7 +275,9 @@ class BluetoothConfig:
             min=0,
             max=3600,
             help="Drop the link after this long without a key (0 = keep it). Helps adapters that cannot "
-            "reconnect Bluetooth LE controllers while the TV is connected.",
+            "reconnect Bluetooth LE controllers while the TV is connected. When set, turning the TV off gets "
+            "a second attempt when the first could not reach it, so a TV that does not answer can hold a "
+            "suspend for about 10 s and a shutdown for about 12 s.",
         ),
     )
     gatt_security: str = field(
@@ -716,7 +723,32 @@ def set_aside(path: Path) -> str:
         os.replace(path, kept)
     except OSError as exc:
         return f"It could not be moved out of the way ({exc}): the next change of a setting overwrites it."
-    return f"The file was kept as {kept}; settings are saved to a new {path.name} from now on."
+    return (
+        f"The file was kept as {kept}; settings are saved to a new {path.name} from now on. "
+        f"To get the old settings back, mend that file, move it back to {path.name} and restart the service."
+    )
+
+
+def left_aside(path: Path) -> str:
+    """The reminder for a start with no settings file and a kept one beside it ("" otherwise).
+
+    That is how the service starts the next time after :func:`set_aside` if no setting was
+    changed in between (after a reboot, say): on defaults, with the paired TV gone, and the
+    notice of the first start gone too.  A later start no longer says it once the kept file
+    has been moved back or deleted, or settings have been saved (which makes a new file).
+    """
+    path = Path(path)
+    kept = path.with_name(path.name + BROKEN_SUFFIX)
+    try:
+        if path.exists() or path.is_symlink() or not kept.is_file():
+            return ""
+    except OSError:
+        return ""
+    return (
+        f"The service started on default settings: there was no {path.name}, because an earlier one could not "
+        f"be read and was kept as {kept}. To get those settings back, mend that file, move it back to "
+        f"{path.name} and restart the service; if they are not wanted, delete it."
+    )
 
 
 def load_for_service(path: Path) -> tuple[Config, list[str], list[str]]:
@@ -725,7 +757,8 @@ def load_for_service(path: Path) -> tuple[Config, list[str], list[str]]:
     A file of which nothing could be read (not JSON, not text, not an object) leaves the
     service running on defaults, and the first setting changed after that would be saved
     over it: a slip of the hand in an editor would cost every setting.  Such a file is
-    therefore moved aside first (:func:`set_aside`).
+    therefore moved aside first (:func:`set_aside`), and a later start that finds only the
+    kept file says so again (:func:`left_aside`).
 
     Returns the config, all problems, and those among them that must stay visible until the
     service restarts (the others are over once the settings have been saved again).
@@ -737,8 +770,10 @@ def load_for_service(path: Path) -> tuple[Config, list[str], list[str]]:
         cfg, unusable = default_config(), True
         problems = [f"{path} could not be loaded ({type(exc).__name__}: {exc}); using defaults"]
     if not unusable:
-        return cfg, [_cut(problem) for problem in problems], []
-    note = _cut(f"{_cut(problems[0], 250)}. {set_aside(path)}", 600)
+        problems = [_cut(problem) for problem in problems]
+        reminder = _cut(left_aside(path), 600)
+        return (cfg, [reminder, *problems], [reminder]) if reminder else (cfg, problems, [])
+    note = _cut(f"{_cut(problems[0], 250)}. {set_aside(path)}", 800)
     return cfg, [note], [note]
 
 

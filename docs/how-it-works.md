@@ -56,7 +56,11 @@ written raw (`S:81`), and the other usages Android turns into `KEYCODE_POWER` (`
   left the TV on, on a second wake without a "TV off" in between, and until the service has
   turned the TV off for the first time. Which way the last power key went is kept in
   `/var/lib/tcl-me-remo/power.json`, so it is still known after a reboot. A power key
-  pressed from the on-screen remote or in a macro counts too.
+  pressed from the on-screen remote or in a macro counts too, and so does one sent over the
+  Wi-Fi assist. An automatic power key that was cut short while it was down (the time ran
+  out, or the machine was sent to sleep in the middle of "TV on") counts as sent, because
+  the TV has had the press and the release. One held by hand that was cut short leaves the
+  direction unknown: how long it was down decides what the TV made of it.
 - **Turning it off automatically** always sends the off key. With a toggle, a TV that is
   already off is turned on by it.
 - "TV on" and "TV off" by hand always send the key.
@@ -112,7 +116,8 @@ half second and is not part of the attempt's time. So the machine is held for at
 3.5 s + 0.5 s = 4 s of logind's 5 s, plus the moment it takes to cancel an action that was
 running when the suspend came. Nothing that was in progress is waited for: an action is
 cancelled, and a key that is being held from the on-screen remote or with `key --hold` is
-released (its sender gets a `busy` error).
+released (its sender gets a `busy` error). Only a machine that is going down does that: a
+"TV off" asked for by hand waits its turn behind a held key, which lasts 10 s at most.
 
 Every route reports the same event, and the service acts on the first report. A second
 report normally changes nothing, with one exception. If the first attempt could not get the
@@ -126,9 +131,26 @@ the default settings the link is kept up, so a link that is down means the TV is
 answering (already off, unplugged, out of range); there is no second attempt, and the 4 s
 above are the limit.
 
+The same settings decide what a longer route does when it is the first to report, which
+happens when logind's route does not act (no logind, or one that cannot tell a reboot from
+a power-off and leaves the shutdown to the stop signal). Its attempt is then the only one,
+and it waits for the TV for as long as its 6 s or 8 s allow instead of the
+`bluetooth.off_connect_timeout` that fits logind's window. A route with logind's usual
+3.5 s is not affected, whatever the settings. (If logind has been configured to wait longer
+than its default 5 s, its route has more than 3.5 s and is treated the same way.)
+
+An attempt whose time ends while the power key is down counts as the key having gone out:
+the press is with the TV and the key is released at that moment, so the TV has had a whole
+key press. It is recorded as a success, remembered as the "off" it most probably was (see
+[Discrete power](#discrete-power)), and never followed by a second attempt, which with a
+toggle would turn the TV back on.
+
 A down event is taken to be followed by the machine going down. If the service is still
-running two minutes after it handled one, and the clocks show no sleep, it concludes that
-the machine stayed up and counts the next suspend or shutdown as a new one.
+running two minutes after it handled one, and the clocks show no sleep, it asks systemd
+whether the system is shutting down. If it is (a shutdown that is merely slow), nothing
+changes and the question is put again two minutes later. If it is not, the service
+concludes that the machine stayed up and counts the next suspend or shutdown as a new one;
+should the resume of that suspend still be reported after all, it is handled as a wake.
 
 A handheld that wakes on the sofa must not turn the TV on. The **display check** looks at the
 kernel's display connectors: with a built-in panel (eDP, DSI, LVDS), TV actions run only
@@ -166,8 +188,12 @@ that woke on the sofa; whether a TCL set does that has not been observed. If you
 With `bluetooth.idle_disconnect_seconds` set, one rule covers every link: a link that has
 carried no key for that long is closed and parked, whether it was used before or only came
 up because the TV was called (after a boot, a wake, a drop, or pairing). The link is then up
-for that long after each boot and wake and whenever something is sent, and down otherwise;
-a suspend that finds it down has to get the TV back within its three seconds.
+for that long after each boot and wake and whenever something is sent, and down otherwise.
+A suspend that finds it down has three seconds to get the TV back and, because the link is
+down by this setting's choice, a second attempt of six if those were not enough (see
+[Lifecycle events](#lifecycle-events)): a TV that does not answer then holds a suspend for
+about 10 s and a shutdown for about 12 s. The same goes for `bluetooth.reconnect_on_drop`
+turned off.
 
 ### Before the machine sleeps
 
@@ -351,8 +377,9 @@ It only works while the TV's network is up: on, or in standby with Screenless se
 | `/opt/tcl-me-remo/` | the code (root-owned) and `bin/tcl-me-remo` |
 | `/etc/systemd/system/tcl-me-remo.service` | the service |
 | `/etc/systemd/system/tcl-me-remo-sleep.service` | the suspend/resume hook |
-| `/var/lib/tcl-me-remo/config.json` | settings. A file that cannot be read at all is moved to `config.json.broken` at start-up and the service runs on defaults; `tcl-me-remo status` says so until the next restart |
-| `/var/lib/tcl-me-remo/` | state: Wi-Fi pairing certificate, what was learned about the TV, the installer's notes (links it made, "the plugin was removed") |
+| `/var/lib/tcl-me-remo/config.json` | settings. A file that cannot be read at all is moved to `config.json.broken` at start-up and the service runs on defaults; `tcl-me-remo status`, the doctor and the panel's Diagnostics page say so, also after later starts, until the file is mended and moved back, deleted, or settings have been saved |
+| `/var/lib/tcl-me-remo/power.json` | which way the last power key switched the TV (`on`, `off`, or empty for "not known"); only read when the on key is a toggle, see [Discrete power](#discrete-power). Deleting it is harmless: the next automatic "TV on" with a toggle is then skipped once |
+| `/var/lib/tcl-me-remo/` | other state: Wi-Fi pairing certificate, what was learned about the TV, the installer's notes (links it made, "the plugin was removed") |
 | `/run/tcl-me-remo/control.sock` | control socket (`root:wheel`, `0660`) |
 | `/var/lib/bluetooth/` | the Bluetooth bond itself (BlueZ's, not ours) |
 

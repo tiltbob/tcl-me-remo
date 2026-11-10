@@ -262,6 +262,56 @@ def test_a_file_that_cannot_be_moved_aside_is_said_to_be_in_danger(tmp_path, mon
     assert "could not be moved" in problems[0] and "Read-only" in problems[0]
 
 
+def test_a_later_start_still_says_where_the_settings_went(tmp_path):
+    """The notice lived for one run of the service.  After a reboot with no setting changed
+    the service ran on defaults again, the TV unpaired, and nothing said why."""
+    path, kept = tmp_path / "config.json", tmp_path / "config.json.broken"
+    wanted = C.apply_patch(C.default_config(), {"input": {"method": "macro", "hdmi_port": 3}})
+    C.save(wanted, path)
+    slip = path.read_text().replace('"hdmi_port": 3,', '"hdmi_port": 3,,')
+    path.write_text(slip)
+    first = C.load_for_service(path)
+    assert first[2] and not path.exists()
+
+    for _ in range(2):  # the next start, and the one after that
+        cfg, problems, lasting = C.load_for_service(path)
+        assert cfg == C.default_config() and len(problems) == 1 and lasting == problems
+        assert str(kept) in problems[0] and "default" in problems[0] and "move it back" in problems[0]
+        assert kept.read_text() == slip and not path.exists()  # looking changes nothing
+    assert C.left_aside(path) == problems[0]
+    assert C.load(path) == (C.default_config(), [])  # the plain loader reads one file and no more
+
+    # It is over when the person has done what it says ...
+    path.write_text(slip.replace(",,", ","))
+    kept.unlink()
+    assert C.load_for_service(path) == (wanted, [], [])
+    # ... or has thrown the kept file away,
+    path.unlink()
+    assert C.load_for_service(path) == (C.default_config(), [], [])
+    # ... or has made new settings since: then there is a settings file, and it is in order.
+    kept.write_text(slip)
+    C.save(C.default_config(), path)
+    assert C.load_for_service(path) == (C.default_config(), [], [])
+    # A directory of that name is not a file this program kept.
+    path.unlink()
+    kept.unlink()
+    kept.mkdir()
+    assert C.load_for_service(path) == (C.default_config(), [], [])
+
+
+def test_the_name_of_a_setting_that_does_not_exist_is_not_repeated_at_length():
+    for patch in ({"k" * 300_000: 1}, {"input": {"\u00e9" * 300_000: 1}}, {"x" * 300_000: {"y": 1}}):
+        with pytest.raises(C.ConfigError) as err:
+            C.apply_patch(C.default_config(), patch)
+        assert "unknown setting" in str(err.value) and len(str(err.value)) < 200
+    with pytest.raises(C.ConfigError) as err:
+        C.set_path(C.default_config(), "input." + "z" * 5000, 1)
+    assert str(err.value).startswith("input.zzz") and len(str(err.value)) < 200
+    # Real names are given whole.
+    with pytest.raises(C.ConfigError, match=r"^bluetooth\.idle_disconnect_seconds: must be"):
+        C.set_path(C.default_config(), "bluetooth.idle_disconnect_seconds", -5)
+
+
 # --------------------------------------------------------------------------- values from outside
 
 

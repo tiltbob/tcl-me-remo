@@ -31,6 +31,7 @@ class Rig:
         self.wifi = None
         self.uptime = 30.0
         self.kind = None
+        self.kind_asked = 0  # how often the service asked whether the system is going down
         self.daemon = None
         self.task = None
         self.options = {}  # further Daemon(...) arguments
@@ -50,6 +51,7 @@ class Rig:
             return self.remote
 
         async def shutdown_kind():
+            self.kind_asked += 1
             return self.kind
 
         self.daemon = Daemon(
@@ -386,6 +388,69 @@ async def test_a_down_event_the_machine_did_not_follow_is_forgotten_after_a_whil
     await eventually(lambda: rig.remote.key_names() == ["SLEEP", "SLEEP"])
 
 
+@pytest.mark.parametrize("off_key", ["SLEEP", "POWER"])
+async def test_a_shutdown_that_is_merely_slow_is_not_taken_for_one_that_did_not_happen(rig, monkeypatch, off_key):
+    """Still running two minutes after logind announced the power-off: a stop job ahead of
+    ours hangs.  The rule above used to call the down event off; the stop signal then sent
+    the off key a second time, and an off key that is a toggle turned the TV back on while
+    the machine powered off."""
+    monkeypatch.setattr(service_module, "STALE_DOWN_SECONDS", 0.5)
+    cfg, _ = C.load(rig.config_path)
+    C.save(C.apply_patch(cfg, {"power": {"off_key": off_key}}), rig.config_path)
+    rig.uptime = 5000.0
+    await rig.start()
+    service = rig.daemon.service
+    rig.remote.state.connected = rig.remote.state.ready = True
+    rig.kind = "shutdown"  # what systemd answers from the moment the shutdown has begun
+    rig.logind.prepare_for_shutdown(True, "power-off")
+    await eventually(lambda: rig.remote.key_names() == [off_key] and service.phase == Phase.DOWN, timeout=10)
+    resumes = rig.remote.resumes
+
+    # The watchdog comes to the point where it would give the down event up, asks, and
+    # leaves it alone.  And again one such period later.
+    await eventually(lambda: rig.kind_asked >= 2, timeout=10)
+    assert service.phase == Phase.DOWN and rig.remote.resumes == resumes
+    assert rig.remote.key_names() == [off_key]
+
+    assert await rig.stop() == 0  # the stop signal: the second report of the same shutdown
+    assert rig.remote.key_names() == [off_key]
+
+
+async def test_systemd_is_not_asked_about_a_down_event_that_is_not_old(rig):
+    rig.uptime = 5000.0
+    await rig.start()
+    rig.remote.state.connected = rig.remote.state.ready = True
+    rig.logind.prepare_for_sleep(True)
+    await eventually(lambda: rig.remote.key_names() == ["SLEEP"], timeout=10)
+    await eventually(lambda: rig.daemon.service.phase == Phase.DOWN, timeout=10)
+    await asyncio.sleep(0.5)  # ten rounds of the watchdog
+    assert rig.kind_asked == 0 and rig.daemon.service.phase == Phase.DOWN
+
+
+@pytest.mark.parametrize("by_design", [True, False])
+async def test_the_stop_signal_as_the_only_route_uses_its_time_when_the_link_is_down_by_design(rig, by_design):
+    """A logind that cannot tell a reboot from a power-off leaves the shutdown to the stop
+    signal.  That is then the only attempt, and with the link down because the settings have
+    it down it waits for the TV for as long as its 8 s allow, not for ``off_connect_timeout``."""
+    cfg, _ = C.load(rig.config_path)
+    patch = {"bluetooth": {"off_connect_timeout": 0.3, "reconnect_on_drop": not by_design}}
+    C.save(C.apply_patch(cfg, patch), rig.config_path)
+    rig.remote = FakeRemote(connect_after=1.0)  # the TV answers, but not within off_connect_timeout
+    rig.uptime = 5000.0
+    await rig.start()
+    rig.logind.prepare_for_shutdown(True)  # no metadata: the kind is not known yet
+    await eventually(lambda: rig.logind.held("shutdown") == 0, timeout=10)
+    assert rig.remote.keys == [] and rig.remote.ensure_calls == []
+
+    rig.kind = "shutdown"
+    assert await rig.stop() == 0
+    if by_design:
+        assert rig.remote.key_names() == ["SLEEP"]
+        assert rig.remote.ensure_calls == [pytest.approx(daemon_module.STOP_BUDGET - 0.08 - 0.4 - 0.1)]
+    else:
+        assert rig.remote.keys == [] and rig.remote.ensure_calls == [0.3]
+
+
 async def test_a_removed_plugin_is_looked_into_some_time_after_start(rig):
     # Decky's uninstall hook leaves a note and a timer; a reboot discards the timer.  The
     # service then has its installer decide (outside the service, which that may remove).
@@ -452,6 +517,38 @@ async def test_a_settings_file_with_a_slip_in_it_is_kept_and_the_service_runs(ri
     await rig.start()
     assert (await rig.call("status"))["config_problems"] == []
     assert kept.read_text() == slip
+
+
+async def test_a_restart_with_nothing_changed_still_says_where_the_settings_went(rig):
+    """The service starts at boot, so the notice used to live for one boot: after the next
+    one it ran on defaults, with the TV unpaired, and status, doctor and the panel were silent."""
+    rig.uptime = 5000.0
+    slip = rig.config_path.read_text().replace('"enabled": true,', '"enabled": true,,', 1)
+    rig.config_path.write_text(slip)
+    kept = rig.config_path.with_name("config.json.broken")
+
+    await rig.start()
+    first = (await rig.call("status"))["config_problems"]
+    assert len(first) == 1 and "not valid JSON" in first[0]
+    assert await rig.stop() == 0
+
+    for _ in range(2):  # a reboot, and another one
+        await rig.start()
+        problems = (await rig.call("status"))["config_problems"]
+        assert len(problems) == 1 and str(kept) in problems[0] and "default settings" in problems[0]
+        assert kept.read_text() == slip and not rig.config_path.exists()
+        assert await rig.stop() == 0
+
+    # It stays for the run in which the settings are made anew ...
+    await rig.start()
+    await rig.call("set_config", {"patch": {"events": {"reboot_tv_off": True}}})
+    assert (await rig.call("status"))["config_problems"] == problems
+    assert await rig.stop() == 0
+    # ... and then there is a settings file again, and nothing to say.
+    await rig.start()
+    assert (await rig.call("status"))["config_problems"] == []
+    assert kept.read_text() == slip
+    assert await rig.stop() == 0
 
 
 @pytest.mark.parametrize(

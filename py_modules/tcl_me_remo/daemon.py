@@ -121,7 +121,7 @@ class Daemon:
                 note = f"{note} {config.set_aside(cfg_path)}"
             except Exception:  # noqa: BLE001
                 pass
-            problems = lasting = [note[:600]]
+            problems = lasting = [note[:800]]
         ring = logsetup.setup(cfg.log_level)
         log.info("tcl-me-remo %s starting", __version__)
         if load_failure is not None:
@@ -285,9 +285,22 @@ class Daemon:
             if self.service.slept_since_last_event():
                 log.info("clock jump detected: the machine was suspended")
                 self._spawn(self.service.handle_event("resume"))
-            else:
-                # A suspend or shutdown that was handled long ago, and here we still are.
-                self.service.check_still_up()
+            elif self.service.down_event_is_stale():
+                # A suspend or shutdown that was handled long ago, and here we still are.  The
+                # machine either stayed up, or it is on its way down and slow about it (a stop
+                # job ahead of ours that hangs).  Calling the down event off in the second
+                # case would send the off key again when the stop signal comes, and an off
+                # key that is a toggle turns the TV back on.  So ask what is asked at stop
+                # time, and only now: not on every tick.
+                try:
+                    going_down = await self._shutdown_kind() is not None
+                except Exception:  # noqa: BLE001 - as in _going_down: no answer is "not shutting down"
+                    log.debug("could not determine whether the system is going down", exc_info=True)
+                    going_down = False
+                if going_down:
+                    self.service.down_event_stands()
+                else:
+                    self.service.check_still_up()
 
     async def _orphan_check(self) -> None:
         """Some minutes after start-up: was the Decky plugin removed while nobody checked?

@@ -207,7 +207,20 @@ export const DiagnosticsPage: FC = () => {
               description={<span style={{ color: colors.text, overflowWrap: "anywhere" }}>{problem}</span>}
             />
           ))}
-          <Note>Changing any setting writes a clean settings file.</Note>
+          {/* Two kinds of entry. Single values that could not be used are settled by the next
+              save. A file of which nothing could be read was moved aside (the entry names
+              it, "config.json.broken"): that entry stays until the service restarts, and
+              saving a setting does not bring the old ones back. */}
+          {status.config_problems.some((problem) => !problem.includes(".broken")) && (
+            <Note>Changing any setting writes a clean settings file.</Note>
+          )}
+          {status.config_problems.some((problem) => problem.includes(".broken")) && (
+            <Note label="The service is running on default settings">
+              Changing a setting does not clear this, and does not bring the old settings back: they are in the
+              file named above. To get them back, mend that file and move it back in Desktop Mode, then restart
+              the service. Or set things up again here; the notice then ends when the service next restarts.
+            </Note>
+          )}
         </Section>
       )}
 

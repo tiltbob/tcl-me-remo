@@ -3,6 +3,7 @@ import errno
 import json
 import logging
 import os
+import select
 import socket
 import stat
 from pathlib import Path
@@ -26,6 +27,10 @@ async def handler(method, params):
         return "rested"
     if method == "huge":
         return "x" * (ipc.MAX_LINE + 10)
+    if method == "big":
+        return "x" * 900_000  # fits into one message, and into no socket buffer
+    if method == "rant":
+        raise ipc.RpcError("bad_key", "unknown key " + "k" * (3 * ipc.MAX_LINE))
     raise ipc.RpcError("unknown_method", f"no such method {method}")
 
 
@@ -418,3 +423,238 @@ async def test_the_group_that_could_not_be_set_is_reported(tmp_path, caplog):
         await srv.start()
     await srv.stop()
     assert any("no-such-group-xyz" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- found by the second check
+
+
+def _strict(line):
+    """Parse a reply the way a reader does that takes JSON and nothing else."""
+
+    def refuse(name):
+        raise AssertionError(f"{name} in a reply: {line[:80]!r}")
+
+    return json.loads(line, parse_constant=refuse)
+
+
+async def test_a_number_too_large_is_refused_wherever_it_stands(server):
+    """1e999 is an infinity by another name.  As an id it used to be echoed as ``Infinity``,
+    which is no JSON; in a parameter no handler looks at it was let through."""
+    lines = (
+        b'{"id": 1e999, "method": "echo"}\n',
+        b'{"id": -1e999, "method": "echo"}\n',
+        b'{"id": [1, [1e999]], "method": "echo"}\n',
+        b'{"id": 1, "method": "echo", "params": {"unused": 1e999}}\n',
+        b'{"id": 1, "method": "echo", "params": {"deep": [{"x": -1E+999}]}}\n',
+    )
+    reader, writer = await _raw(server, b"")
+    for line in lines:
+        writer.write(line)
+        await writer.drain()
+        answer = await asyncio.wait_for(reader.readline(), 10)
+        reply = _strict(answer)
+        assert reply["ok"] is False and reply["error"]["code"] == "bad_request", answer
+        assert "finite" in reply["error"]["message"]
+    # Large and small numbers that are numbers pass, and come back as they were sent.
+    writer.write(b'{"id": 1.5e300, "method": "echo", "params": {"a": 1e-320, "b": 12345678901234567890}}\n')
+    await writer.drain()
+    assert _strict(await reader.readline()) == {
+        "id": 1.5e300,
+        "ok": True,
+        "result": {"a": 1e-320, "b": 12345678901234567890},
+    }
+    writer.close()
+    await writer.wait_closed()
+
+
+async def test_no_reply_is_longer_than_a_message_may_be(server):
+    """Error replies were not held to the limit that successful ones were: a long message
+    from a handler, or a long id, came back at length (three bytes for every one sent)."""
+    reader, writer = await _raw(server, b"", limit=8 * ipc.MAX_LINE)
+    # The message of an error is cut; its code is what a program reads, and it is kept.
+    writer.write(b'{"id": 7, "method": "rant"}\n')
+    await writer.drain()
+    answer = await asyncio.wait_for(reader.readline(), 10)
+    reply = _strict(answer)
+    assert len(answer) < 3 * ipc.MAX_ERROR_CHARS and reply["id"] == 7
+    assert reply["error"]["code"] == "bad_key" and reply["error"]["message"].endswith("...")
+    # An id is echoed, so it has a size: with a successful request, a failing one and an unknown one.
+    long_id = json.dumps("\u00e9" * 300_000).encode()
+    for method in (b"echo", b"boom", b"rant"):
+        writer.write(b'{"id": ' + long_id + b', "method": "' + method + b'"}\n')
+        await writer.drain()
+        answer = await asyncio.wait_for(reader.readline(), 10)
+        reply = _strict(answer)
+        assert len(answer) < 1000 and reply["id"] is None and reply["error"]["code"] == "bad_request", answer[:200]
+    # ... which no id that anybody uses comes near
+    for fine in (b"12345678901234567890", b'"' + b"a" * 200 + b'"', b'{"client": "panel", "n": [1, 2]}', b"null"):
+        writer.write(b'{"id": ' + fine + b', "method": "echo"}\n')
+        await writer.drain()
+        reply = _strict(await asyncio.wait_for(reader.readline(), 10))
+        assert reply == {"id": json.loads(fine), "ok": True, "result": {}}
+    writer.close()
+    await writer.wait_closed()
+
+
+async def _is_served(srv, tries=600):
+    """Ask until the server has a place free (at most ``tries`` times, 0.05 s apart)."""
+    for _ in range(tries):
+        try:
+            return await ipc.call(srv.path, "echo", {"v": 1}) == {"v": 1}
+        except ipc.RpcError as exc:
+            assert exc.code == "busy", (exc.code, exc.message)
+            await asyncio.sleep(0.05)
+    return False
+
+
+async def test_a_client_that_does_not_read_its_replies_loses_its_place(tmp_path):
+    """The idle limit was on the wait for a request only.  A client that sent requests and
+    never read the answers sat in the write for ever, on one of the few places."""
+    srv = ipc.IpcServer(tmp_path / "control.sock", handler, group=None, max_clients=2, idle_timeout=2.0)
+    await srv.start()
+    deaf = []
+    try:
+        for _ in range(2):
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(str(srv.path))
+            sock.sendall(b'{"id": 1, "method": "big"}\n' * 3)  # more than the socket holds unread
+            deaf.append(sock)
+        # Both places are taken ...
+        with pytest.raises(ipc.RpcError) as err:
+            await ipc.call(srv.path, "echo")
+        assert err.value.code == "busy"
+        # ... and given up without the clients doing anything.  (Without the limit on the
+        # write this waits the full 30 seconds and fails.)
+        assert await _is_served(srv), "a client that reads nothing kept its place"
+        # A reply that is slow to be fetched is no reason by itself: a client that reads
+        # late, inside the limit, gets all of it.
+        reader, writer = await _raw(srv, b'{"id": 2, "method": "big"}\n', limit=2 * ipc.MAX_LINE)
+        await asyncio.sleep(0.5)
+        assert len(json.loads(await asyncio.wait_for(reader.readline(), 30))["result"]) == 900_000
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        for sock in deaf:
+            sock.close()
+        await asyncio.wait_for(srv.stop(), 30)
+
+
+def _hung_up(sock):
+    poller = select.poll()
+    poller.register(sock, select.POLLIN)
+    return any(event & (select.POLLHUP | select.POLLERR) for _, event in poller.poll(0))
+
+
+async def test_a_connection_is_closed_even_if_what_was_written_is_never_fetched(tmp_path, monkeypatch):
+    """Closing a connection first delivers what is still to be written, for as long as the
+    client likes.  Such a connection was no longer counted, so any number of them could be
+    left open: the limit on clients did not hold for them."""
+
+    class RoomyServer(ipc.IpcServer):
+        # With asyncio's usual limits a reply this size makes the write wait (the case of
+        # the test above).  Here it does not, as with a smaller reply behind a full socket:
+        # the reply is still in the server's hands when the connection is to be closed.
+        async def _on_client(self, reader, writer):
+            writer.transport.set_write_buffer_limits(high=4 * ipc.MAX_LINE)
+            await super()._on_client(reader, writer)
+
+    monkeypatch.setattr(ipc, "CLOSE_SECONDS", 1.0)
+    srv = RoomyServer(tmp_path / "control.sock", handler, group=None, max_clients=1, idle_timeout=2.0)
+    await srv.start()
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(srv.path))
+        sock.sendall(b'{"id": 1, "method": "big"}\n')
+        sock.shutdown(socket.SHUT_WR)  # "that was all": the server closes its side, we never read
+        for _ in range(600):  # 30 s; without the limit on closing it never happens
+            if _hung_up(sock):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail("the server kept a connection open whose client had stopped reading")
+        assert await _is_served(srv)
+    finally:
+        sock.close()
+        await asyncio.wait_for(srv.stop(), 30)
+
+
+async def test_a_client_that_is_turned_away_still_gets_to_send_its_request(tmp_path):
+    """The server said "busy" and closed at once.  A client's request then met a closed
+    socket, and a client that stops at a failed write (asyncio's, so the Decky bridge) never
+    read the answer: it reported that the service could not be reached.  Seen only with the
+    service in a process of its own, about once in a hundred calls."""
+    srv = ipc.IpcServer(tmp_path / "control.sock", handler, group=None, max_clients=1, refusal_linger=60.0)
+    await srv.start()
+    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    late = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        held.connect(str(srv.path))
+        await _raw_wait_for_clients(srv, 1)
+
+        # A client that is slow to send: long after the server has answered, its request
+        # still goes out without an error, and the answer and the end follow.
+        late.connect(str(srv.path))
+        late.settimeout(30)
+        await asyncio.sleep(0.5)
+        late.sendall(b'{"id": 1, "method": "echo"}\n')  # BrokenPipeError when the server did not wait
+        answer = await asyncio.to_thread(late.makefile("rb").read)
+        reply = json.loads(answer)
+        assert reply["error"]["code"] == "busy" and answer.count(b"\n") == 1
+
+        # The wait is for one client's request, not a way to hold connections open: while
+        # one is being waited for, the next is told and closed at once ...
+        reader1, writer1 = await asyncio.open_unix_connection(str(srv.path))
+        assert json.loads(await asyncio.wait_for(reader1.readline(), 10))["error"]["code"] == "busy"
+        reader2, writer2 = await asyncio.open_unix_connection(str(srv.path))
+        assert json.loads(await asyncio.wait_for(reader2.readline(), 10))["error"]["code"] == "busy"
+        assert await asyncio.wait_for(reader2.read(), 10) == b""  # (60 s if it waited for this one too)
+        writer2.close()
+        # ... and a server that stops does not wait for it either.
+        await asyncio.wait_for(srv.stop(), 10)
+        assert await asyncio.wait_for(reader1.read(), 10) == b""
+        writer1.close()
+    finally:
+        held.close()
+        late.close()
+        await asyncio.wait_for(srv.stop(), 30)
+
+
+async def _raw_wait_for_clients(srv, count):
+    for _ in range(600):
+        if len(srv._clients) >= count:
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail("the server did not take the connection")
+
+
+async def test_a_client_that_was_turned_away_and_sends_nothing_is_closed(tmp_path):
+    srv = ipc.IpcServer(tmp_path / "control.sock", handler, group=None, max_clients=1, refusal_linger=1.0)
+    await srv.start()
+    held = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        held.connect(str(srv.path))
+        await _raw_wait_for_clients(srv, 1)
+        reader, writer = await asyncio.open_unix_connection(str(srv.path))
+        assert json.loads(await asyncio.wait_for(reader.readline(), 10))["error"]["code"] == "busy"
+        assert await asyncio.wait_for(reader.read(), 30) == b""
+        writer.close()
+    finally:
+        held.close()
+        await srv.stop()
+
+
+def test_a_send_that_fails_in_an_unusual_way_is_an_rpc_error(tmp_path, monkeypatch):
+    """``call_sync`` promises that every failure is an RpcError.  A send that failed with
+    anything but a broken pipe ended in an UnboundLocalError."""
+
+    class Choked(socket.socket):
+        def connect(self, address):
+            pass
+
+        def sendall(self, data, *flags):
+            raise OSError(errno.ENOBUFS, "No buffer space available")
+
+    monkeypatch.setattr(ipc.socket, "socket", Choked)
+    with pytest.raises(ipc.RpcError) as err:
+        ipc.call_sync(tmp_path / "control.sock", "status")
+    assert err.value.code == "unavailable" and "No buffer space" in err.value.message

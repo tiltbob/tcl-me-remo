@@ -220,6 +220,15 @@ and whether `TV off` came through `Bluetooth` or failed. Repeat with the TV link
 the TV off and on with its own remote first): the service then has about 3 seconds to
 reconnect.
 
+With the default settings that is all the time there is. If `bluetooth.reconnect_on_drop`
+is off (T4 may have had you turn it off) or `bluetooth.idle_disconnect_seconds` is set, the
+link is down because the settings have it down, and a first attempt that did not get the TV
+back is followed by a second one from the sleep hook, with 6 seconds of its own. The log
+then shows two `tv_off (suspend)` records, the second with the step `second attempt: the
+first one could not reach the TV in its time`, and the suspend may be held for up to about
+10 seconds. Record which settings were in effect, both records, and the time from the
+*first* `tv_off` line to the kernel's suspend entry.
+
 **T5a. How the link ends, and whether the TV comes back.** The service ends the link itself
 just before the machine sleeps, so that the TV is told "remote user terminated" (0x13) and
 not "power off" (0x15), which the kernel would send. Neither that this happens nor that it
@@ -297,6 +306,26 @@ Record: `delivery` (`bluez` means the TV re-subscribed, `raw` means direct deliv
 empty when `connect` failed), whether the log shows a reconnect ("bounce") and whether HOME
 reached the TV. Take a `sudo btmon -w /tmp/t6.btsnoop` trace of this test; it shows the
 Service Changed indication, any CCC writes by the TV, and the injected notification.
+
+Read the trace for the TV's **subscription writes** in particular (`btmon -r
+/tmp/t6.btsnoop | less`). A TV subscribes to each of the three key reports with an `ATT:
+Write Request` to the handle right after the report's value handle, which is where BlueZ
+puts the subscription descriptor (going by its source): `0x010b` for the keyboard report
+(value handle `0x010a`), `0x010f` for the consumer keys (`0x010e`) and `0x0113` for system
+control, the report `WAKE` travels in (`0x0112`). The value written is `01 00`. For the
+first link after the restart, and again for the link after a "bounce" if there was one,
+record:
+
+- how many of the three writes there are (three, some, none),
+- in which order they come,
+- how long after the link came up each one arrives (the time stamps of the `LE Connection
+  Complete` or `LE Enhanced Connection Complete` event and of each write),
+- and anything between them: a disconnect, an error response, a write with `00 00`.
+
+The service counts the TV as ready when all three are there, and waits for the rest for a
+while when only some are. What a real TV does here (all at once, one per connection event,
+only after its own service discovery, some never) has not been observed, and the waiting
+times in the code are guesses until it has.
 
 What happens next depends on the kernel. `tcl-me-remo doctor` has a `direct delivery` line
 that names the kernel and says what the setting comes to; `uname -r` is the same version.

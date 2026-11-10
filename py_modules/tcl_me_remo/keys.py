@@ -161,7 +161,9 @@ _POWER_TOGGLES = frozenset(
     {(PAGE_SYSTEM, 0x81), (PAGE_CONSUMER, 0x0030), (PAGE_KEYBOARD, 0x66), (PAGE_CONSUMER, 0x019E)}
 )
 _POWER_ON = frozenset({(PAGE_SYSTEM, 0x83)})
-_POWER_OFF = frozenset({(PAGE_CONSUMER, 0x0032)})
+# Consumer "Sleep" (0x32, the key named SLEEP) and "Sleep Mode" (0x34) both become Linux
+# KEY_SLEEP, which is Android's KEYCODE_SLEEP.
+_POWER_OFF = frozenset({(PAGE_CONSUMER, 0x0032), (PAGE_CONSUMER, 0x0034)})
 # System Sleep: KEYCODE_SLEEP up to Android 15, LOCK from Android 16.
 _POWER_UNCLEAR = frozenset({(PAGE_SYSTEM, 0x82)})
 

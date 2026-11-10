@@ -67,7 +67,8 @@ WIFI_AFTER_BLE_SECONDS = 1.5
 # the clocks show no sleep, the machine is taken to be up.  Between the event and the moment
 # the kernel freezes us (or systemd stops us) there are at most other inhibitors (5 s), the
 # sleep hook (10 s) and the kernel's own freeze time-out (20 s); two minutes is well clear
-# of that.
+# of that.  A shutdown has no such limit (a stop job ahead of ours can hang for longer), so
+# the daemon asks systemd whether the system is stopping before it lets the rule act.
 STALE_DOWN_SECONDS = 120.0
 # Pause after the last key of a down action: the kernel drops every Bluetooth link as part
 # of suspend, so the key-up report must be on the air before the suspend lock is released.
@@ -79,6 +80,10 @@ SLEEP_JUMP_SECONDS = 1.0
 # control uses); the transport makes that request within the first fraction of this time and
 # does not take it back when the wait ends, so the wait only bounds how long we look on.
 DISCONNECT_SECONDS = 0.5
+# How long a down event waits for a key held by hand to end once it has told it to.  The
+# shipped transport gives way at once; this is so that one that does not cannot use up the
+# time the power key has.
+CUT_KEY_SECONDS = 0.2
 HISTORY_LENGTH = 20
 # The longest budget a down event may be given.  A request with more is refused; the
 # daemon's own (derived from logind's setting, which can be anything) is cut to it.
@@ -113,6 +118,8 @@ class _OffAttempt:
     sent: int = 0                         # power keys that went out, on either transport
     via: str = ""                         # the transport of the first of them
     unreached: bool = False               # it ended because the TV could not be reached or readied in time
+    cut: bool = False                     # it was ended with the key down (counted in ``sent``: see _power_ble)
+    unsure: bool = False                  # ... or waiting behind a key held by hand: whether it went out is not known
 
 
 def sleep_offset() -> float:
@@ -176,6 +183,9 @@ class Service:
         self._boot_handled = False
         self._down_epoch = 0  # counts real down events; lets a queued up event notice one
         self._down_since = 0.0  # time.monotonic() when the phase last became DOWN
+        # The last down event was given up as stale (check_still_up): if the resume of that
+        # very suspend turns up after all, it is a real one.
+        self._late_resume_due = False
         # The down action of this cycle failed to reach the TV: a second route may try again.
         self._retry_possible = False
         self._action: asyncio.Task[dict[str, Any]] | None = None
@@ -212,7 +222,7 @@ class Service:
             return await self._handle_up(name, simulate)
         if name in DOWN_EVENTS:
             return await self._handle_down(name, budget, simulate)
-        raise RpcError("bad_request", f"unknown event {name!r} (expected one of: {', '.join(EVENTS)})")
+        raise RpcError("bad_request", f"unknown event {macro.quote(str(name))} (expected one of: {', '.join(EVENTS)})")
 
     def slept_since_last_event(self) -> bool:
         """True if the machine has been suspended since the service last accounted for it."""
@@ -226,14 +236,29 @@ class Service:
         if went_down:
             self._resume_link()  # the down action closed the link for a shutdown that is not coming
 
-    def check_still_up(self, now: float | None = None) -> bool:
-        """Called every now and then (the daemon's watchdog): has a down event gone stale?
+    def down_event_is_stale(self, now: float | None = None) -> bool:
+        """Was a down event handled STALE_DOWN_SECONDS ago, with the service still running?
 
-        See STALE_DOWN_SECONDS.  Returns True if the phase was put back to "running".
+        Only the clocks are looked at.  Whether the machine is merely slow on its way down
+        is for the caller to find out (the daemon asks systemd) before it has
+        ``check_still_up`` act on the answer.
         """
         if self.phase != Phase.DOWN or self.slept_since_last_event():
             return False  # a sleep the clocks show is a resume, and is handled as one
-        if (time.monotonic() if now is None else now) - self._down_since < STALE_DOWN_SECONDS:
+        return (time.monotonic() if now is None else now) - self._down_since >= STALE_DOWN_SECONDS
+
+    def down_event_stands(self) -> None:
+        """The machine is still on its way down, only slowly: look again STALE_DOWN_SECONDS from now."""
+        if self.phase == Phase.DOWN:
+            self._down_since = time.monotonic()
+
+    def check_still_up(self, now: float | None = None) -> bool:
+        """A down event that has gone stale stops counting: the machine is taken to be up.
+
+        See STALE_DOWN_SECONDS and ``down_event_is_stale``.  Returns True if the phase was
+        put back to "running".
+        """
+        if not self.down_event_is_stale(now):
             return False
         log.info(
             "still running %gs after a suspend or shutdown was handled, and the machine has not slept: "
@@ -242,6 +267,10 @@ class Service:
         )
         self.phase = Phase.RUNNING
         self._retry_possible = False
+        # A suspend can take longer than this to fail.  Its resume, if one is still reported,
+        # finds the phase "running" and would be taken for a duplicate: the TV we turned off
+        # would stay off.
+        self._late_resume_due = True
         self._resume_link()  # the down action closed the link
         return True
 
@@ -271,8 +300,11 @@ class Service:
                 # have slept and woken for this suspend yet, so it is the late second
                 # notification of the previous wake, overtaken by the next suspend.  Taking it
                 # for a new wake would send "TV on" right behind the "TV off".
-                if self.phase != Phase.DOWN and not self.slept_since_last_event():
+                # One exception: a suspend whose down event was given up as stale.  Its
+                # resume, late as it is, is the first word of that wake (_late_resume_due).
+                if self.phase != Phase.DOWN and not self.slept_since_last_event() and not self._late_resume_due:
                     return self._skipped("tv_on", name, "duplicate resume event ignored")
+                self._late_resume_due = False
             self.phase = Phase.RUNNING
             self._retry_possible = False
             self._offset_seen = self._sleep_offset()
@@ -353,6 +385,7 @@ class Service:
         else:
             self._down_epoch += 1
             self._offset_seen = self._sleep_offset()
+            self._late_resume_due = False  # a new cycle: the resume that was still owed is not coming
         self._retry_possible = False  # one second attempt per cycle
         self.phase = Phase.GOING_DOWN
         epoch = self._down_epoch
@@ -373,9 +406,12 @@ class Service:
         is not answering (off already, unplugged, out of range), and trying longer would only
         make every suspend with such a TV slower.
         """
+        return self.phase == Phase.DOWN and self._retry_possible and self._link_down_by_design()
+
+    def _link_down_by_design(self) -> bool:
+        """Do the settings have the link down at times when the TV would answer a call?"""
         bluetooth = self.cfg.bluetooth
-        link_down_by_design = not bluetooth.reconnect_on_drop or bluetooth.idle_disconnect_seconds > 0
-        return self.phase == Phase.DOWN and self._retry_possible and link_down_by_design
+        return not bluetooth.reconnect_on_drop or bluetooth.idle_disconnect_seconds > 0
 
     def _down_handled(self, epoch: int) -> None:
         """The down action of down event number ``epoch`` has ended: note where that leaves us.
@@ -405,6 +441,13 @@ class Service:
         attempt of a cycle (see _second_attempt_due), which waits for the TV for as long as
         its budget allows: the first attempt's last step stopped calling the TV, so this one
         starts the call from scratch.
+
+        So does a first attempt that has more than the usual time while the link is down by
+        the settings' choice.  That is a longer route reporting first: the sleep hook or the
+        stop signal when logind's route did not act (logind not available, or one that
+        cannot tell a reboot from a power-off).  It is the only attempt this cycle may get,
+        and waiting ``off_connect_timeout`` of six or eight seconds would waste the rest.
+        With the usual budget nothing changes, whatever the settings: see the condition.
         """
         cfg = self.cfg
         wanted = bool(getattr(cfg.events, f"{name}_tv_off"))
@@ -419,7 +462,7 @@ class Service:
             reason = ""
 
         attempt = _OffAttempt(cut_held_key=True)
-        if retry:
+        if retry or (budget > DEFAULT_DOWN_BUDGET and self._link_down_by_design()):
             press = cfg.bluetooth.key_press_ms / 1000.0
             attempt.connect_timeout = max(cfg.bluetooth.off_connect_timeout, budget - press - FLUSH_SECONDS - 0.1)
 
@@ -452,15 +495,27 @@ class Service:
 
         What counts is whether the key went out.  If the time ends after it (in the gap
         before a repeat, or in the pause that lets the key-up onto the air), the TV has been
-        told and the attempt is a success; the trace says that the time ran out.
+        told and the attempt is a success; the trace says that the time ran out.  The same
+        goes for a time that ends while the key is down: the transport releases it, the TV
+        has had a whole key press, and _power_ble has counted it.
+
+        Only an attempt that got nothing out because the TV could not be reached is marked
+        ``unreached``, which is what allows a second route to try again.
         """
         attempt.deadline = time.monotonic() + budget
         try:
             return await asyncio.wait_for(self._do_tv_off(trace, attempt), budget)
         except TimeoutError:
             if attempt.sent:
-                self._note(trace, f"out of time ({budget:g}s) right after the key went out")
+                when = "with the key down; it was released at once" if attempt.cut else "right after the key went out"
+                self._note(trace, f"out of time ({budget:g}s) {when}")
                 return f"TV off ({attempt.via})"
+            if attempt.unsure:
+                raise RpcError(
+                    "tv_unreachable",
+                    f"ran out of time ({budget:g}s) with the power key waiting behind a key held by hand "
+                    "that did not let go",
+                ) from None
             attempt.unreached = True
             raise RpcError("tv_unreachable", f"ran out of time ({budget:g}s)") from None
 
@@ -470,14 +525,21 @@ class Service:
         The transport sends one key at a time, so a key held for seconds would keep the power
         key of a down event waiting until the machine is asleep.  The transport releases a
         key whose press is cancelled; the caller gets an error reply (see send_key).
+
+        The key's task is given CUT_KEY_SECONDS to end, and the power key goes out whether
+        or not it has: a wait without a bound of its own would not end with the attempt's
+        time either (a cancelled ``gather`` waits for its child; ``asyncio.wait`` does not).
         """
         task = self._key_task
         if task is None or task.done():
             return
         self._key_cut = task
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        self._note(trace, "a key that was being held by hand was cut short")
+        ended, _ = await asyncio.wait({task}, timeout=CUT_KEY_SECONDS)
+        if ended:
+            self._note(trace, "a key that was being held by hand was cut short")
+        else:
+            self._note(trace, f"a key that was being held by hand did not end within {CUT_KEY_SECONDS:g}s of being cut")
 
     async def _disconnect_quietly(self) -> None:
         try:
@@ -571,10 +633,13 @@ class Service:
         if not await self._ble_ready(trace, connect_timeout, wake=on):
             if attempt is not None:
                 attempt.unreached = True
-            raise RpcError("tv_unreachable", f"the TV did not connect within {connect_timeout:g}s")
+            raise RpcError(
+                "tv_unreachable", self._why_not_ready(f"the TV did not connect within {connect_timeout:g}s")
+            )
         press = cfg.bluetooth.key_press_ms / 1000.0
         deadline = attempt.deadline if attempt is not None else None
-        sent, no_time = 0, False
+        direction = "on" if on else "off"
+        sent, no_time, cut = 0, False, False
         try:
             for index in range(repeat):
                 if index:
@@ -587,16 +652,45 @@ class Service:
                         no_time = True
                         break
                     await self._sleep(cfg.power.repeat_gap)
-                await self.remote.send_key(key, press)
+                try:
+                    await self.remote.send_key(key, press)
+                except asyncio.CancelledError:
+                    # Ended with the key down: the attempt's time ran out, or a newer action
+                    # took over.  The press is with the TV, and the transport releases a key
+                    # whose press is cancelled, so the TV has had a whole key press, a little
+                    # shorter than asked for.  It counts as sent.  Calling it "TV not
+                    # reached" would have a second route send it again, and a toggle sent
+                    # twice turns the TV off and back on; and since the TV was most probably
+                    # switched, that is what is remembered: forgetting the direction would
+                    # leave a TV we turned off dark at the next wake (a toggle as on key is
+                    # sent only after an "off"), in order to be right in the rarer case.
+                    #
+                    # Not so while a key held by hand is still with the transport, which
+                    # sends one key at a time: ours may never have begun.  Then nothing is
+                    # known, nothing is remembered, and no second attempt is made either.
+                    held = self._key_task
+                    if held is not None and not held.done():
+                        self._remember_power("")
+                        if attempt is not None:
+                            attempt.unsure = True
+                    else:
+                        sent, cut = sent + 1, True
+                        self._remember_power(direction)
+                        if attempt is not None:
+                            attempt.sent += 1
+                            attempt.via = attempt.via or "Bluetooth"
+                            attempt.cut = True
+                    raise
                 sent += 1
-                self._remember_power("on" if on else "off")
+                self._remember_power(direction)
                 if attempt is not None:
                     attempt.sent += 1
                     attempt.via = attempt.via or "Bluetooth"
         finally:
             if sent:
                 count = "" if repeat == 1 else f" x{sent}" if sent == repeat else f" x{sent} of {repeat}"
-                self._note(trace, f"Bluetooth: sent {key}{count}" + (" (no time for more)" if no_time else ""))
+                note = " (no time for more)" if no_time else " (cut short, and released)" if cut else ""
+                self._note(trace, f"Bluetooth: sent {key}{count}{note}")
 
     async def _power_wifi(self, trace: Trace, *, on: bool, timeout: float, attempt: _OffAttempt | None = None) -> None:
         assert self.wifi is not None
@@ -671,6 +765,19 @@ class Service:
             self._note(trace, f"Bluetooth: TV connected after {time.monotonic() - started:.1f}s")
         return ready
 
+    def _why_not_ready(self, not_connected: str) -> str:
+        """What to say when the wait for the TV ended without it being ready for keys.
+
+        ``not_connected`` is the caller's sentence for a TV that did not connect.  A TV that
+        did connect, and was not ready in time all the same (it had not written all of its
+        subscriptions yet, say), is a different matter with a different way out, and the
+        transport has said which in ``state.error``.
+        """
+        state = self.remote.state
+        if not state.connected:
+            return not_connected
+        return state.error or "the TV connected but was not ready for keys in time"
+
     async def _do_switch_input(self, trace: Trace) -> str:
         cfg = self.cfg
         if cfg.input.method == "none":
@@ -704,9 +811,8 @@ class Service:
         if not steps:
             raise RpcError("bad_macro", "the macro is empty")
         if not await self._ble_ready(trace, cfg.bluetooth.connect_timeout):
-            raise RpcError(
-                "tv_unreachable", f"Bluetooth: the TV did not connect within {cfg.bluetooth.connect_timeout:g}s"
-            )
+            reason = self._why_not_ready(f"the TV did not connect within {cfg.bluetooth.connect_timeout:g}s")
+            raise RpcError("tv_unreachable", f"Bluetooth: {reason}")
         self._note(trace, f"Bluetooth: playing macro: {macro.format_steps(steps)}")
         await macro.run(steps, self._send_key_noting, key_press=press, key_gap=gap, sleep=self._sleep)
 
@@ -963,7 +1069,7 @@ class Service:
         async def press() -> None:
             if not self.remote.state.ready:
                 if not await self.remote.ensure_ready(min(cfg.bluetooth.connect_timeout, 10.0)):
-                    raise RpcError("tv_unreachable", "the TV is not connected over Bluetooth")
+                    raise RpcError("tv_unreachable", self._why_not_ready("the TV is not connected over Bluetooth"))
             await self._send_key_noting(key.spec, hold if hold is not None else cfg.bluetooth.key_press_ms / 1000.0)
 
         async with self._key_lock:
@@ -1163,7 +1269,7 @@ class Service:
             )
         name = _str(params, "name")
         if name not in EVENTS:
-            raise RpcError("bad_request", f"unknown event {name!r} (expected one of: {', '.join(EVENTS)})")
+            raise RpcError("bad_request", f"unknown event {macro.quote(name)} (expected one of: {', '.join(EVENTS)})")
         simulate, wait = _bool(params, "simulate", False), _bool(params, "wait", True)
         coro = self.handle_event(name, budget=float(budget) if budget is not None else None, simulate=simulate)
         if wait:

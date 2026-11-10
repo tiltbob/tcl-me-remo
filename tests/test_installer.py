@@ -948,6 +948,63 @@ def test_orphan_check_command_for_the_service(env):
     assert out.returncode == 0 and "bundled_version" in json.loads(out.stdout)
 
 
+def test_the_time_budgets_fit_into_the_time_outs_of_the_units(tmp_path):
+    """These numbers live in five files: the unit texts and HOOK_BUDGET (installer.py), the
+    command's own wait (cli.py), the attempt and the tidy-up after it (service.py), the stop
+    budget (daemon.py) and the questions to systemd (system.py).  Here they are held against
+    each other, each read from where it is used."""
+    import asyncio
+    import io
+    import re
+
+    from tcl_me_remo import cli, daemon, system
+    from tcl_me_remo import service as service_module
+
+    target = tmp_path / "opt" / "tcl-me-remo"
+    units = installer.render_units(_layout(tmp_path), target)
+
+    def seconds(unit, setting):
+        (value,) = re.findall(rf"^{setting}=(\d+(?:\.\d+)?)$", units[unit], re.M)
+        return float(value)
+
+    spare = 0.5  # for a reply to travel, a process to start and end
+
+    # The sleep hook: "tcl-me-remo event suspend --budget N", which systemd gives TimeoutStartSec.
+    (command,) = re.findall(r"^ExecStart=-?(.+)$", units[SLEEP_HOOK], re.M)
+    argv = command.split()
+    argv = argv[argv.index(f"{target}/bin/tcl-me-remo") + 1 :]
+    calls = []
+
+    def call(method, params=None, *, timeout=30.0):
+        calls.append((method, params, timeout))
+        return {"ok": True, "skipped": True, "detail": "duplicate suspend event ignored", "steps": []}
+
+    assert cli.run(argv, call=call, out=io.StringIO(), err=io.StringIO()) == 0
+    ((method, params, command_waits),) = calls
+    assert method == "event" and params["name"] == "suspend" and params.get("wait", True) is True
+    assert params["budget"] == installer.HOOK_BUDGET
+    # The service answers once the attempt and the tidy-up after it are over; the command
+    # waits longer than that, and systemd longer than the command.
+    service_answers = params["budget"] + service_module.DISCONNECT_SECONDS
+    assert service_answers + spare <= command_waits <= seconds(SLEEP_HOOK, "TimeoutStartSec") - spare
+    # A route with time of its own has more than the first one, or it has nothing to add.
+    assert params["budget"] > service_module.DEFAULT_DOWN_BUDGET
+
+    # The stop signal: ask systemd why, "TV off", tidy up, and then the rest of the way out
+    # (sockets, the Bluetooth objects), all of it inside the main unit's TimeoutStopSec.
+    asked = []
+
+    async def run(argv, timeout):
+        asked.append(timeout)
+        return 0, "stopping\n" if "is-system-running" in argv else ""
+
+    assert asyncio.run(system.shutdown_kind(run)) == "shutdown" and len(asked) == 2
+    rest_of_the_way_out = 5.0
+    stop_path = sum(asked) + daemon.STOP_BUDGET + service_module.DISCONNECT_SECONDS
+    assert stop_path + rest_of_the_way_out <= seconds(SERVICE, "TimeoutStopSec")
+    assert daemon.STOP_BUDGET > service_module.DEFAULT_DOWN_BUDGET
+
+
 def test_plugin_name_matches_the_manifest():
     assert json.loads((REPO / "plugin.json").read_text())["name"] == installer.PLUGIN_NAME
 

@@ -547,7 +547,7 @@ async def test_no_second_attempt_after_a_key_went_out_or_the_display_check_said_
     h3 = Harness(tmp_path, remote=FakeRemote(connect_after=None), patch=LINK_DOWN_BY_DESIGN)
     assert not (await h3.service.handle_event("suspend", budget=3.5, simulate=True))["ok"]
     h3.remote.connect_after = 0.0
-    assert (await h3.service.handle_event("suspend", budget=6.0))["ok"]  # the first real one
+    assert (await h3.service.handle_event("suspend", budget=3.5))["ok"]  # the first real one
     assert h3.remote.ensure_calls == [0.3, 0.3]
 
 
@@ -574,10 +574,112 @@ async def test_a_duplicate_that_arrives_during_the_first_attempt_waits_and_then_
     assert h.service.phase == Phase.GOING_DOWN
     second = asyncio.create_task(h.service.handle_event("suspend", budget=6.0))
     await asyncio.sleep(0.2)
-    assert not first.done() and not second.done() and h.remote.ensure_calls == [0.3]  # it waits its turn
+    # It waits its turn.  (The first one has 30 s and the link is down by design, so it would
+    # wait for the TV for nearly all of them: see the tests of a longer route reporting first.)
+    assert not first.done() and not second.done()
+    assert h.remote.ensure_calls == [pytest.approx(30.0 - 0.08 - 0.4 - 0.1)]
     h.remote.give_up.set()
     assert not (await first)["ok"]
     assert (await second)["ok"] and h.remote.key_names() == ["SLEEP"] and h.remote.disconnects == 2
+
+
+async def test_a_simulated_down_event_that_fails_leaves_nothing_to_try_again(tmp_path):
+    h = Harness(tmp_path, patch=LINK_DOWN_BY_DESIGN)
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.handle_event("suspend", budget=3.5))["ok"]  # the real one: SLEEP went out
+    h.remote.connect_after = None
+    assert not (await h.service.handle_event("suspend", budget=3.5, simulate=True))["ok"]  # "Test sleep", TV gone
+    h.remote.connect_after = 0.0
+    second = await h.service.handle_event("suspend", budget=6.0)  # the hook's report of the real one
+    assert second["skipped"] and "duplicate" in second["detail"] and h.remote.key_names() == ["SLEEP"]
+
+
+async def test_a_budget_that_ends_with_the_power_key_down_counts_as_the_key_and_is_not_tried_again(tmp_path):
+    """The transport sends the press at once and releases a key whose press is cancelled, so
+    a time that ends with the key down has given the TV a whole key press.  It used to count
+    as "TV not reached": the second route then sent the key again, and a toggle sent twice
+    turns the TV off and back on."""
+    state = tmp_path / "state" / "power.json"
+    h = Harness(tmp_path, patch=LINK_DOWN_BY_DESIGN | TOGGLE, power_state_path=state)
+    h.remote.key_gate = asyncio.Event()  # the key stays down until the test says otherwise
+    first = await h.service.handle_event("suspend", budget=2.5)
+    assert first["ok"] and first["detail"] == "TV off (Bluetooth)", first
+    assert h.remote.cut_keys == ["POWER"] and h.remote.keys == []  # down, then released early
+    assert "Bluetooth: sent POWER (cut short, and released)" in first["steps"]
+    assert "out of time (2.5s) with the key down; it was released at once" in first["steps"]
+    # The TV was most probably switched off, and that is what is remembered.
+    assert json.loads(state.read_text())["last"] == "off"
+
+    h.remote.key_gate = None
+    second = await h.service.handle_event("suspend", budget=6.0)  # e.g. the sleep hook
+    assert second["skipped"] and "duplicate" in second["detail"]
+    assert h.remote.keys == [] and h.remote.cut_keys == ["POWER"] and len(h.remote.ensure_calls) == 1
+
+    up = await wake(h)  # so the wake turns it back on
+    assert up["ok"] and not up["skipped"] and h.remote.key_names() == ["POWER"]
+
+
+async def test_a_repeat_that_is_cut_short_does_not_make_a_failure_of_the_key_before_it(tmp_path):
+    h = Harness(tmp_path, patch={"power": {"off_repeat": 2, "repeat_gap": 0.1}})
+    h.remote.state.connected = h.remote.state.ready = True
+    gate = asyncio.Event()
+
+    async def gap(seconds):  # the second press finds the gate closed
+        h.sleeps.append(seconds)
+        h.remote.key_gate = gate
+        await asyncio.sleep(0)
+
+    h.service._sleep = gap
+    record = await h.service.handle_event("suspend", budget=2.5)
+    assert record["ok"] and h.remote.key_names() == ["SLEEP"] and h.remote.cut_keys == ["SLEEP"]
+    assert "Bluetooth: sent SLEEP x2 (cut short, and released)" in record["steps"]
+
+
+# --------------------------------------------------------------------------- a longer route reports first
+
+
+@pytest.mark.parametrize("bluetooth", [{"reconnect_on_drop": False}, {"idle_disconnect_seconds": 60.0}])
+async def test_a_longer_route_that_reports_first_uses_its_time_when_the_link_is_down_by_design(tmp_path, bluetooth):
+    """logind's route does not always act (no logind; one that cannot tell a reboot from a
+    power-off).  The sleep hook's 6 s or the stop signal's 8 s are then all this cycle gets,
+    and the wait for the TV used to end after ``off_connect_timeout`` all the same."""
+    patch = {"bluetooth": bluetooth | {"off_connect_timeout": 0.3}}
+    h = Harness(tmp_path, remote=FakeRemote(connect_after=0.6), patch=patch)
+    record = await h.service.handle_event("suspend", budget=6.0)
+    assert record["ok"] and record["detail"] == "TV off (Bluetooth)" and h.remote.key_names() == ["SLEEP"]
+    assert h.remote.ensure_calls == [pytest.approx(6.0 - 0.08 - 0.4 - 0.1)]
+    assert not any(step.startswith("second attempt") for step in record["steps"])  # it is the first
+    again = await h.service.handle_event("suspend", budget=3.5)
+    assert again["skipped"] and "duplicate" in again["detail"]
+
+
+async def test_a_longer_route_does_not_wait_longer_when_the_link_is_kept_up_by_design(tmp_path):
+    # A link that is down then means a TV that does not answer: as for the second attempt.
+    h = Harness(tmp_path, remote=FakeRemote(connect_after=None), patch={"bluetooth": {"off_connect_timeout": 0.3}})
+    record = await h.service.handle_event("shutdown", budget=8.0)
+    assert not record["ok"] and "did not connect within 0.3s" in record["detail"]
+    assert h.remote.ensure_calls == [0.3]
+
+
+@pytest.mark.parametrize("bluetooth", [{"reconnect_on_drop": False}, {"idle_disconnect_seconds": 60.0}])
+@pytest.mark.parametrize("off_connect_timeout", [0.3, 1.0, 3.0, 10.0])
+async def test_the_first_route_waits_for_the_tv_as_long_as_it_did_before(tmp_path, bluetooth, off_connect_timeout):
+    """With logind's default 5 s the first route has 3.5 s, and ``off_connect_timeout`` of
+    them for the call, whatever the settings: the longer wait is for longer routes only."""
+    from tcl_me_remo import lifecycle
+
+    # Without a budget, and with the one the daemon derives from logind's default.
+    for budget in (None, lifecycle.DEFAULT_MAX_DELAY - lifecycle.BUDGET_MARGIN):
+        patch = {"bluetooth": bluetooth | {"off_connect_timeout": off_connect_timeout}}
+        h = Harness(tmp_path, remote=FakeRemote(connect_after=0.0), patch=patch)
+        assert (await h.service.handle_event("suspend", budget=budget))["ok"]
+        assert h.remote.ensure_calls == [off_connect_timeout]
+
+    # And with the shipped settings the sum alone says so: what 3.5 s leave for the call
+    # (less the key press, the pause after it and a margin) is not more than the 3 s it had.
+    shipped = C.default_config().bluetooth
+    left = service_module.DEFAULT_DOWN_BUDGET - shipped.key_press_ms / 1000.0 - service_module.FLUSH_SECONDS - 0.1
+    assert left <= shipped.off_connect_timeout
 
 
 # --------------------------------------------------------------------------- a down event nobody followed
@@ -615,6 +717,65 @@ async def test_a_machine_that_slept_is_not_mistaken_for_one_that_never_went_down
     assert h.service.phase == Phase.DOWN
     assert not (await h.service.handle_event("resume"))["skipped"]  # ...and is handled as a wake
     assert h.remote.key_names()[-1] == "WAKE"
+
+
+async def test_the_late_resume_of_a_suspend_that_was_given_up_as_stale_is_still_a_wake(tmp_path):
+    """A suspend can take longer than two minutes to fail, without the clocks showing a
+    sleep.  Its resume then finds the phase "running" and used to be dropped as a duplicate,
+    which left the TV we had turned off dark."""
+    stale = service_module.STALE_DOWN_SECONDS
+    h = Harness(tmp_path, patch={"power": {"on_repeat": 1}, "input": {"method": "none"}})
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.handle_event("suspend"))["ok"]
+    assert h.service.check_still_up(time.monotonic() + stale + 10) and h.service.phase == Phase.RUNNING
+    up = await h.service.handle_event("resume")
+    assert up["ok"] and not up["skipped"] and h.remote.key_names() == ["SLEEP", "WAKE"]
+    # One resume, not every one from now on: the second report of it is a duplicate again.
+    again = await h.service.handle_event("resume")
+    assert again["skipped"] and "duplicate" in again["detail"] and h.remote.key_names() == ["SLEEP", "WAKE"]
+
+
+async def test_the_resume_owed_after_the_stale_rule_is_forgotten_at_the_next_down_event(tmp_path):
+    stale = service_module.STALE_DOWN_SECONDS
+    h = Harness(tmp_path, patch={"power": {"on_repeat": 1}, "input": {"method": "none"}})
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.handle_event("suspend"))["ok"]
+    assert h.service.check_still_up(time.monotonic() + stale + 10)
+    # A shutdown begins and is called off: a new cycle, and no resume belongs to it.
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.handle_event("shutdown"))["ok"]
+    h.service.cancel_shutdown()
+    assert h.service.phase == Phase.RUNNING
+    late = await h.service.handle_event("resume")
+    assert late["skipped"] and "duplicate" in late["detail"] and h.remote.key_names() == ["SLEEP", "SLEEP"]
+
+    # And a real resume settles it as well: after a sleep the clocks show, nothing is owed.
+    h2 = Harness(tmp_path, patch={"power": {"on_repeat": 1}, "input": {"method": "none"}})
+    await h2.service.handle_event("suspend")
+    assert h2.service.check_still_up(time.monotonic() + stale + 10)
+    assert not (await wake(h2))["skipped"]
+    assert (await h2.service.handle_event("resume"))["skipped"]
+
+
+async def test_a_down_event_that_still_stands_is_looked_at_again_a_full_period_later(tmp_path):
+    """The daemon found the machine on its way down, only slowly (see test_daemon): the down
+    event stands, and systemd is not asked again at every tick."""
+    stale = service_module.STALE_DOWN_SECONDS
+    h = Harness(tmp_path)
+    await h.service.handle_event("shutdown")
+    handled = time.monotonic()
+    assert not h.service.down_event_is_stale(handled + stale - 10)
+    assert h.service.down_event_is_stale(handled + stale + 10)
+    h.service._down_since -= stale + 10  # as if that had been a good two minutes ago
+    assert h.service.down_event_is_stale()
+    h.service.down_event_stands()
+    confirmed = time.monotonic()
+    assert not h.service.down_event_is_stale()
+    assert not h.service.down_event_is_stale(confirmed + stale - 10)
+    assert h.service.down_event_is_stale(confirmed + stale + 10)
+    assert h.service.phase == Phase.DOWN and h.remote.resumes == 0
+    # Asking changes nothing; only check_still_up acts.
+    assert h.service.check_still_up(confirmed + stale + 10) and h.service.phase == Phase.RUNNING
 
 
 # --------------------------------------------------------------------------- the link after boot and wake
@@ -1265,6 +1426,56 @@ async def test_discrete_power_keys_are_sent_whatever_was_sent_before(tmp_path):
     assert h.remote.key_names() == ["WAKE", "WAKE"]
 
 
+async def test_a_power_key_sent_over_the_wifi_assist_is_remembered_like_any_other(tmp_path):
+    """Whether the on toggle is sent on a wake hangs on the last power key having been an
+    "off", and the "off" of a suspend with the link down may well be the assist's SLEEP."""
+    patch = TOGGLE | {
+        "wifi": {"enabled": True, "host": "tv.lan"},
+        "bluetooth": {"off_connect_timeout": 0.3, "connect_timeout": 1.0},
+    }
+    wifi = FakeWifi()
+    h = Harness(tmp_path, remote=FakeRemote(connect_after=None), wifi=wifi, patch=patch)
+    record = await h.service.handle_event("suspend")
+    assert record["ok"] and record["detail"] == "TV off (Wi-Fi)" and h.remote.keys == []
+    h.remote.connect_after = 0.0
+    up = await wake(h)
+    assert up["ok"] and not up["skipped"] and h.remote.key_names() == ["POWER"]  # it was our "off"
+
+    # The other way round: "off" over Bluetooth, then "on" over Wi-Fi.  The TV is on, and the
+    # next wake must not toggle it.
+    assert (await h.service.tv_off())["ok"] and h.remote.key_names() == ["POWER", "POWER"]
+    await h.remote.disconnect()
+    h.remote.connect_after = None
+    on = await h.service.tv_on()
+    assert on["ok"] and on["detail"] == "TV on (Wi-Fi)" and wifi.keys[-1] == ("tv.lan", 224)
+    sent = len(wifi.keys)
+    up = await wake(h)
+    assert up["skipped"] and "is a toggle" in up["detail"]
+    assert h.remote.key_names() == ["POWER", "POWER"] and len(wifi.keys) == sent
+
+
+async def test_an_on_key_cut_short_by_a_suspend_is_remembered_as_sent(tmp_path):
+    """The machine is sent back to sleep while "TV on" has the toggle down.  The TV got it
+    (the transport releases it), so it is on; with a suspend that leaves the TV alone, a
+    service that did not count that key would toggle the TV off at the next wake."""
+    h = Harness(tmp_path, patch=TOGGLE | {"events": {"suspend_tv_off": False}})
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.tv_off())["ok"]  # by hand: off, and known to be
+    h.remote.key_gate = asyncio.Event()
+    waking = asyncio.create_task(wake(h))
+    await asyncio.wait_for(h.remote.key_waiting.wait(), 10)  # the on toggle is down
+    assert (await h.service.handle_event("suspend"))["skipped"]
+    interrupted = await waking
+    assert interrupted["error_code"] == "interrupted"
+    assert "Bluetooth: sent POWER (cut short, and released)" in interrupted["steps"]
+    assert h.remote.cut_keys == ["POWER"]
+
+    h.remote.key_gate = None
+    up = await wake(h)
+    assert up["skipped"] and "is a toggle" in up["detail"]
+    assert h.remote.key_names() == ["POWER"] and h.remote.cut_keys == ["POWER"]  # nothing since
+
+
 async def test_input_method_none(tmp_path):
     h = Harness(tmp_path, patch={"input": {"method": "none"}})
     record = await h.service.tv_on()
@@ -1358,6 +1569,184 @@ async def test_a_caller_that_goes_away_takes_its_held_key_with_it(tmp_path):
     assert h.service._key_task is None and h.remote.keys == []
     h.remote.honour_hold = False
     assert await h.service.send_key("HOME") == {"key": "HOME"}  # the key lock is free again
+
+
+@pytest.mark.parametrize("how", ["the caller went away", "a suspend cut it"])
+async def test_a_power_key_by_hand_that_is_cut_short_leaves_the_direction_unknown(tmp_path, how):
+    """Held by hand for a part of the time asked for, it may or may not have done what a
+    full press does.  What was remembered before no longer holds either."""
+    state = tmp_path / "state" / "power.json"
+    remembered = []  # ... at the moment the off key of the suspend goes out
+
+    class Remote(FakeRemote):
+        async def send_key(self, spec, hold):
+            if spec == "POWER" and state.exists():
+                remembered.append(json.loads(state.read_text())["last"])
+                self.key_gate = None
+            await super().send_key(spec, hold)
+
+    h = Harness(tmp_path, remote=Remote(), patch=TOGGLE, power_state_path=state)
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.tv_off())["ok"] and json.loads(state.read_text())["last"] == "off"
+    h.remote.key_gate = asyncio.Event()
+    held = asyncio.create_task(h.service.send_key("WAKE", 10.0))
+    await asyncio.wait_for(h.remote.key_waiting.wait(), 10)
+
+    if how == "the caller went away":
+        held.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await held
+        assert json.loads(state.read_text())["last"] == ""
+        up = await wake(h)  # the toggle is not risked on a TV that may be on
+        assert up["skipped"] and "is a toggle" in up["detail"] and h.remote.key_names() == ["POWER"]
+    else:
+        assert (await h.service.handle_event("suspend"))["ok"]
+        with pytest.raises(RpcError) as err:
+            await held
+        assert err.value.code == "busy"
+        assert remembered == [""] and h.remote.key_names() == ["POWER", "POWER"]
+        assert json.loads(state.read_text())["last"] == "off"  # the off key that followed is a new fact
+
+
+async def test_tv_off_by_hand_waits_its_turn_behind_a_key_held_by_hand(tmp_path):
+    """Only a machine that is going down cuts a held key short: it cannot wait.  "TV off" by
+    hand can.  It has 20 s and a key is held for 10 s at most, so both requests are carried
+    out in the order they were made, and nobody is told that the machine is going to sleep
+    when it is not."""
+    assert service_module.macro.MAX_HOLD + 1.0 < service_module.MANUAL_OFF_BUDGET
+    h = Harness(tmp_path)
+    h.remote.state.connected = h.remote.state.ready = True
+    h.remote.key_gate = asyncio.Event()
+    held = asyncio.create_task(h.service.send_key("OK", 5.0))
+    await asyncio.wait_for(h.remote.key_waiting.wait(), 10)
+    off = asyncio.create_task(h.service.tv_off())
+    await asyncio.sleep(0.3)
+    assert not held.done() and not off.done() and h.remote.keys == [] and h.remote.cut_keys == []
+    h.remote.key_gate.set()
+    assert await held == {"key": "OK"}
+    record = await off
+    assert record["ok"] and record["detail"] == "TV off (Bluetooth)"
+    assert h.remote.key_names() == ["OK", "SLEEP"] and h.remote.cut_keys == []
+    assert not any("cut" in step for step in record["steps"])
+
+
+class StubbornRemote(FakeRemote):
+    """A transport that does not give way: its OK key ignores being cancelled until ``let_go``."""
+
+    def __init__(self, *, one_key_at_a_time):
+        super().__init__()
+        self.one_key_at_a_time = one_key_at_a_time
+        self.holding = asyncio.Event()
+        self.let_go = asyncio.Event()
+
+    async def _hold_on(self):
+        self.holding.set()
+        while not self.let_go.is_set():
+            try:
+                await self.let_go.wait()
+            except asyncio.CancelledError:
+                pass
+
+    async def send_key(self, spec, hold):
+        if spec != "OK":
+            return await super().send_key(spec, hold)
+        if self.one_key_at_a_time:
+            async with self._send_lock:
+                await self._hold_on()
+        else:
+            await self._hold_on()
+        self.keys.append((spec, hold))
+
+
+async def test_the_power_key_does_not_wait_for_a_held_key_that_will_not_end(tmp_path):
+    """The wait for the cut key's task had no bound, and the attempt's time could not end it
+    either.  (The shipped transport gives way at once; this is the guard for one that does not.)"""
+    h = Harness(tmp_path, remote=StubbornRemote(one_key_at_a_time=False))
+    h.remote.state.connected = h.remote.state.ready = True
+    held = asyncio.create_task(h.service.send_key("OK", 5.0))
+    await asyncio.wait_for(h.remote.holding.wait(), 10)
+    down = asyncio.create_task(h.service.handle_event("suspend", budget=3.5))
+    finished, _ = await asyncio.wait({down}, timeout=15)
+    try:
+        assert finished, "the down event is still waiting for the held key"
+        record = down.result()
+        assert record["ok"] and record["detail"] == "TV off (Bluetooth)"
+        assert h.remote.key_names() == ["SLEEP"] and not held.done()  # out, with the other key still down
+        assert "a key that was being held by hand did not end within 0.2s of being cut" in record["steps"]
+        assert h.service.phase == Phase.DOWN and h.remote.disconnects == 1
+    finally:
+        h.remote.let_go.set()
+        await asyncio.gather(held, down, return_exceptions=True)
+
+
+async def test_a_power_key_stuck_behind_a_held_key_is_neither_sent_nor_tried_again(tmp_path):
+    """Same transport, but sending one key at a time as the real one does: the power key
+    waits behind the key that will not end until the time is up.  Whether it went out cannot
+    be said, so nothing is claimed, nothing is remembered and no second attempt is made."""
+    state = tmp_path / "state" / "power.json"
+    remote = StubbornRemote(one_key_at_a_time=True)
+    h = Harness(tmp_path, remote=remote, patch=LINK_DOWN_BY_DESIGN, power_state_path=state)
+    h.remote.state.connected = h.remote.state.ready = True
+    assert (await h.service.tv_off())["ok"] and json.loads(state.read_text())["last"] == "off"
+    h.remote.state.connected = h.remote.state.ready = True
+    held = asyncio.create_task(h.service.send_key("OK", 5.0))
+    await asyncio.wait_for(h.remote.holding.wait(), 10)
+    down = asyncio.create_task(h.service.handle_event("suspend", budget=1.0))
+    finished, _ = await asyncio.wait({down}, timeout=15)
+    try:
+        assert finished, "the down event is still waiting for the held key"
+        record = down.result()
+        assert not record["ok"] and "waiting behind a key held by hand" in record["detail"]
+        assert h.remote.key_names() == ["SLEEP"] and h.remote.cut_keys == []  # the manual "TV off" only
+        assert json.loads(state.read_text())["last"] == ""
+        second = await h.service.handle_event("suspend", budget=6.0)
+        assert second["skipped"] and "duplicate" in second["detail"]
+    finally:
+        h.remote.let_go.set()
+        await asyncio.gather(held, down, return_exceptions=True)
+
+
+class HalfReadyRemote(FakeRemote):
+    """The TV connects, but is not ready for keys in the time given (it has not written all
+    of its subscriptions yet).  The transport says so in ``state.error``."""
+
+    said = "the TV connected but was not ready for keys in time"
+
+    async def ensure_ready(self, timeout, *, wake=False):
+        self.ensure_calls.append(timeout)
+        self._state.connected = True
+        self._state.error = self.said
+        return False
+
+
+async def test_a_tv_that_connected_but_was_not_ready_is_not_reported_as_not_connected(tmp_path):
+    patch = LINK_DOWN_BY_DESIGN | {"input": {"method": "none"}}
+    h = Harness(tmp_path, remote=HalfReadyRemote(), patch=patch)
+    said = HalfReadyRemote.said
+    with pytest.raises(RpcError) as err:
+        await h.service.send_key("HOME")  # "tcl-me-remo key HOME"
+    assert err.value.code == "tv_unreachable" and err.value.message == said
+    for record in (await h.service.tv_on(), await h.service.tv_off(), await h.service.run_macro("HOME")):
+        assert not record["ok"] and record["detail"] == f"Bluetooth: {said}", record
+    first = await h.service.handle_event("suspend", budget=3.5)
+    assert not first["ok"] and first["detail"] == f"Bluetooth: {said}" and "did not connect" not in first["detail"]
+    # It is still a TV that could not be readied in time: the second route tries again.
+    second = await h.service.handle_event("suspend", budget=6.0)
+    assert not second["skipped"] and second["detail"] == f"Bluetooth: {said}"
+
+    # A transport that left no sentence gets one; a TV that is not connected, the old ones.
+    h.remote.said = ""
+    h.remote.state.error = ""
+    with pytest.raises(RpcError) as err:
+        await h.service.send_key("HOME")
+    assert err.value.message == "the TV connected but was not ready for keys in time"
+    patch = {"bluetooth": {"connect_timeout": 1.0, "off_connect_timeout": 0.3}}
+    gone = Harness(tmp_path, remote=FakeRemote(connect_after=None), patch=patch)
+    gone.remote.state.error = "the TV did not connect over Bluetooth"  # what the transport says of this
+    with pytest.raises(RpcError) as err:
+        await gone.service.send_key("HOME")
+    assert err.value.message == "the TV is not connected over Bluetooth"
+    assert (await gone.service.tv_off())["detail"] == "Bluetooth: the TV did not connect within 0.3s"
 
 
 async def test_rpc_surface(tmp_path):
@@ -1591,6 +1980,18 @@ async def test_text_from_a_request_is_not_kept_at_length(tmp_path):
     with pytest.raises(RpcError) as err:
         await rpc("nope" * 100_000, {})
     assert len(err.value.message) < 200
+    # The name of an event and of a setting that does not exist were still given whole.
+    for method, params in (
+        ("event", {"name": "\u00e9" * 300_000}),
+        ("set_config", {"patch": {"\u00e9" * 300_000: 1}}),
+        ("set_config", {"patch": {"input": {"k" * 300_000: 1}}}),
+    ):
+        with pytest.raises(RpcError) as err:
+            await rpc(method, params)
+        assert err.value.code in ("bad_request", "invalid_config") and len(err.value.message) < 200, method
+    with pytest.raises(RpcError) as err:
+        await h.service.handle_event("e" * 300_000)
+    assert err.value.code == "bad_request" and len(err.value.message) < 200
     assert h.remote.keys == []
     assert len(json.dumps(h.service.status())) < 20_000
     assert service_module.MAX_DETAIL_CHARS < 1000 and C.describe()["input"]["macro"]["maxlen"] == 1024

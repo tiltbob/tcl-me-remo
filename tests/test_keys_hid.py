@@ -56,7 +56,10 @@ def test_a_power_toggle_is_recognised_by_its_usage_however_it_is_spelled():
     assert [keys.power_effect(spec) for spec in ("WAKE", "S:83", "SLEEP", "c:32", "S:82")] == [
         "on", "on", "off", "off", "unknown",
     ]  # fmt: skip
-    assert [keys.power_effect(spec) for spec in ("HOME", "K:3C", "no such key")] == ["", "", ""]
+    # Consumer 0x34 ("Sleep Mode") is KEY_SLEEP to Linux as well: an "off" key, and no toggle.
+    assert keys.power_effect("C:0034") == "off" and keys.power_effect("c:34") == "off"
+    assert not keys.is_power_toggle("C:0034")
+    assert [keys.power_effect(spec) for spec in ("HOME", "K:3C", "C:0033", "no such key")] == ["", "", "", ""]
     # Raw specs keep their spelling: saved macros and settings are not rewritten to names.
     assert keys.resolve("S:81").spec == "S:81" and keys.resolve("c:30").spec == "C:0030"
 

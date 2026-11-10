@@ -12,8 +12,9 @@ One JSON object per line in each direction:
 <- {"id": 1, "ok": false, "error": {"code": "busy", "message": "busy with 'tv_on' (boot); try again shortly"}}
 ```
 
-`id` is echoed back untouched. `params` may be omitted. A connection can carry any number of
-requests, answered in order.
+`id` is echoed back untouched; it may be any JSON value that takes at most 1024 bytes (a
+longer one is refused with `bad_request`, and that reply has `id` null). `params` may be
+omitted. A connection can carry any number of requests, answered in order.
 
 Every request line gets exactly one reply line, whatever it holds. The limits:
 
@@ -21,14 +22,19 @@ Every request line gets exactly one reply line, whatever it holds. The limits:
   thrown away and answered with `bad_request` ("message too large"); the connection stays
   usable. A line that has not ended after 8 MiB gets the same answer and the connection is
   closed.
-- Numbers must be finite. `NaN` and `Infinity` are refused (`bad_request`), and so is a
+- Numbers must be finite, wherever in the request they stand (the `id` and parameters that
+  no method reads included). `NaN` and `Infinity` are refused (`bad_request`), and so is a
   number that is one in effect, such as `1e999`. Every number a method takes has a range,
   given below.
 - At most 32 clients are served at once. The next one is sent one line, an error with the
-  code `busy` and `id` null, and is disconnected.
+  code `busy` and `id` null, and is disconnected: once its request has arrived, or after a
+  second without one.
 - A connection that has not delivered a complete request line for 30 seconds is closed.
   The time a request takes to be answered does not count: `tv_on` and `event` can take
   minutes, and the connection waits for them.
+- Replies have to be read. A connection whose client has left so much unread that the
+  service cannot write any more is closed, with what it did not read, when that has lasted
+  30 seconds.
 
 A second service started by hand (`tcl-me-remo daemon`) while one is answering on the socket
 exits at once, and leaves the socket to the first.
@@ -104,8 +110,6 @@ being held is released so that the "TV off" key does not have to wait for it.
 
 ## Error codes
 
-| Code | Meaning |
-|---|---|
 A code reaches a client in one of two places: as the `error.code` of a reply ("reply" below),
 or as the `error_code` of an [action record](#action-record) ("record"). Actions (`tv_on`,
 `tv_off`, `switch_input`, `run_macro`, `event`) do not fail the request when the TV cannot
@@ -123,19 +127,24 @@ program can test.
 | `bad_key` | reply | `send_key`: unknown key name |
 | `bad_macro` | record; reply | The macro text is invalid or would run for too long. As a reply only from `run_macro`, for text over 1024 characters, which is not looked at |
 | `not_configured` | record | The action has nothing configured (input switching off, no macro, no app link) |
-| `tv_unreachable` | record; reply | Turning the TV on or off: no transport reached it (the detail says what each one answered). A macro: the TV did not connect in time. As a reply from `send_key` |
+| `tv_unreachable` | record; reply | Turning the TV on or off: no transport reached it (the detail says what each one answered), or the time for it ran out (`ran out of time (3.5s)`). A macro: the TV did not connect in time. As a reply from `send_key` |
 | `not_paired`, `no_adapter`, `bluetooth_off`, `not_connected`, `not_subscribed`, `bluetooth_error` | reply; record | Bluetooth problems. In a record when a macro (or switching the input with one) could not start; a failed power action reports `tv_unreachable` |
 | `wifi_not_configured`, `wifi_not_paired`, `wifi_unreachable`, `wifi_error` | reply; record | Wi-Fi assist problems. In a record when the input was to be switched over Wi-Fi |
 | `wifi_unavailable`, `pairing_failed` | reply | The Wi-Fi assist is not part of this build / pairing with the TV failed |
 | `interrupted` | record | A suspend or shutdown (or the service stopping) ended the action before it was done |
-| `timeout` | record | The action ran out of time. (Also raised by the client library, see below) |
 | `internal` | reply; record | A bug in the service; details are in the log |
+
+The message of an error is a sentence for a person. What the request held is quoted in it
+cut short (a key, a method, a setting's name or value), and no message is longer than 2000
+characters.
 
 The client library (`ipc.call`, `ipc.call_sync`) adds three of its own, for the cases in
 which there is no reply to pass on: `unavailable` (the socket cannot be reached or the
 connection broke), `timeout` (no answer in the time the caller allowed) and `bad_reply`
-(the answer could not be read). The CLI ends with exit code 3 for `unavailable`, 1 for
-every other error and for an action that failed, 2 for a mistake in its arguments.
+(the answer could not be read). The service itself never sends `timeout`: an action that
+runs out of time fails with `tv_unreachable`. The CLI ends with exit code 3 for
+`unavailable`, 1 for every other error and for an action that failed, 2 for a mistake in
+its arguments.
 
 ## Action record
 
@@ -214,14 +223,29 @@ while the TV shows its code; `pairing_host` is the TV that is being paired, or e
 - `busy` names the running action (`"tv_on (boot)"`) or is empty.
 - `bluetooth.ready` means keys can be sent right now. `delivery` says how they travel:
   `bluez` (normal GATT notifications) or `raw` (see [how-it-works](how-it-works.md)).
+  Through `bluez` that normally means the TV has subscribed to all three key reports. The
+  exception is a TV that renewed only some of its subscriptions while direct delivery is
+  not in use: `ready` stays true, keys of the subscribed reports are sent, and `send_key`
+  (and a macro or power action through it) answers `not_subscribed` for a key in one of
+  the others; the message ends in "(it renewed its subscription for some keys only, and
+  this key is not among them)".
 - `bluetooth.error` is one sentence for the user, empty when there is nothing to say: the
   last problem that kept the TV from being reached, or else a note about pairing mode. While
   `pairing` is true it can hold a warning that needs acting on at that moment (the machine
   is also discoverable over classic Bluetooth); after pairing mode closed without a TV it
   says how it ended. It is cleared when the TV becomes ready and when pairing mode opens.
+  While `ready` is true it can still hold the sentence of a single key that failed for
+  want of its subscription; it goes when the missing subscriptions arrive.
   A request that is refused only because pairing mode is open gets `not_paired` as its
   answer and leaves this field alone.
-- `bluetooth.subscribed` is about the paired TV; it is `false` whenever no TV is paired.
+- `bluetooth.subscribed` is about the paired TV; it is `false` whenever no TV is paired,
+  and true from the first of the TV's three per-report subscriptions, so it does not say
+  that every key has a way to the TV.
+- A key that was being held and had to be let go early is answered with `not_subscribed`
+  ("the TV ended a subscription to key reports while HOME was held"; the link is still up)
+  or `not_connected` ("the Bluetooth link dropped ...", "... was closed ...", "key delivery
+  was changed in the settings while HOME was held"). The release reaches the TV first
+  wherever it still can.
 - `wifi.available` says whether this build has the Wi-Fi assist; `enabled`, `host` and
   `name` are the settings; `paired`, `pairing` and `pairing_host` are the
   [Wi-Fi pairing state](#wi-fi-pairing-state).
@@ -239,7 +263,10 @@ while the TV shows its code; `pairing_host` is the TV that is being paired, or e
   Single values that could not be used (the default is in effect) are dropped from the
   list when the settings are next saved. A file of which nothing could be read is moved
   aside as `config.json.broken` next to it, and the entry that says so stays until the
-  service restarts.
+  service restarts. A later start that finds the kept file and no settings file (nothing
+  was changed in between) has an entry that names the kept file again; it is over when the
+  file has been mended and moved back, deleted, or new settings have been saved, at the
+  start after that.
 
 ## `get_config`
 

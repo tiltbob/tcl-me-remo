@@ -46,6 +46,10 @@ class FakeRemote:
         # at ``key_gate`` (an asyncio.Event the test sets) and says so in ``key_waiting``.
         self.key_gate: asyncio.Event | None = None
         self.key_waiting = asyncio.Event()
+        # Keys whose press was cancelled while they were down.  The real transport sends the
+        # press at once and releases a key that is cancelled, so the TV got each of these as
+        # a whole (short) key press although ``keys`` does not list it.
+        self.cut_keys: list[str] = []
 
     @property
     def state(self) -> BleState:
@@ -72,10 +76,14 @@ class FakeRemote:
         if not self._state.ready:
             raise TransportError("not_connected", "the TV is not connected")
         async with self._send_lock:
-            if self.key_gate is not None:
-                self.key_waiting.set()
-                await self.key_gate.wait()
-            await asyncio.sleep(self.key_delay + (hold if self.honour_hold else 0.0))
+            try:
+                if self.key_gate is not None:
+                    self.key_waiting.set()
+                    await self.key_gate.wait()
+                await asyncio.sleep(self.key_delay + (hold if self.honour_hold else 0.0))
+            except asyncio.CancelledError:
+                self.cut_keys.append(spec)
+                raise
             self.keys.append((spec, hold))
 
     async def start_pairing(self, timeout: float) -> None:
