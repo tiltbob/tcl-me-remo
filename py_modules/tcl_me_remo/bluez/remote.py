@@ -672,8 +672,7 @@ class BleRemote:
         self._registered = True
         self._links = 1 if self._connected else 0
         self._paired_this_registration = False
-        if self._error.startswith("could not register") or self._error == "the Bluetooth adapter is gone":
-            self._error = ""
+        self._error = ""  # whatever went wrong before, this is a fresh start
         self._log_handles()
         self._call_in_background()
         self._wakeup.fire()
