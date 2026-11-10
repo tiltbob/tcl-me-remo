@@ -117,6 +117,14 @@ async def _socket_call(method, params, timeout):
     return reply
 
 
+def _installed_modules():
+    """The py_modules directory of the installed service (not the plugin's own copy)."""
+    for path in INSTALLED_MODULES:
+        if os.path.isdir(os.path.join(path, "tcl_me_remo")):
+            return path
+    return INSTALLED_MODULES[0]
+
+
 def _failure(code, message):
     return {"ok": False, "error": {"code": code, "message": message}}
 
@@ -142,10 +150,7 @@ class Plugin:
         # us to stop.  So nothing is removed here: a timer checks later whether the plugin is
         # really gone and only then removes the service.  Settings and the TV pairing are kept
         # either way.
-        modules = next(
-            (path for path in INSTALLED_MODULES if os.path.isdir(os.path.join(path, "tcl_me_remo"))),
-            INSTALLED_MODULES[0],
-        )
+        modules = _installed_modules()
         argv = [
             "systemd-run",
             f"--on-active={ORPHAN_CHECK_DELAY}",
