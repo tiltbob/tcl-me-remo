@@ -360,6 +360,27 @@ async def test_resume_waits_for_the_down_action_instead_of_cancelling_it(tmp_pat
     assert h.remote.key_names()[0] == "SLEEP" and "WAKE" in h.remote.key_names()[1:]
 
 
+async def test_queued_event_does_not_block_a_suspend(tmp_path):
+    # A manual action is running, a wake event is waiting its turn behind it, and then the
+    # machine suspends: the suspend must still get through at once.
+    h = Harness(tmp_path)
+    h.service._sleep = asyncio.sleep  # the manual tv_on now really waits 2 s before its macro
+    manual = asyncio.create_task(h.service.tv_on())
+    await asyncio.sleep(0.05)
+    h.clock.sleep_for(60)
+    queued = asyncio.create_task(h.service.handle_event("resume"))
+    await asyncio.sleep(0.05)
+    h.service._sleep = lambda seconds: asyncio.sleep(0)
+    started = asyncio.get_running_loop().time()
+    down = await h.service.handle_event("suspend", budget=3.0)
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert down["ok"] and h.remote.key_names()[-1] == "SLEEP"
+    assert not (await manual)["ok"]
+    late = await asyncio.wait_for(queued, 5)
+    assert late["skipped"] and "superseded" in late["detail"]
+    assert h.remote.key_names()[-1] == "SLEEP"  # the queued wake did not undo the TV-off
+
+
 async def test_simulated_events_do_not_touch_bookkeeping(tmp_path):
     h = Harness(tmp_path)
     record = await h.service.handle_event("suspend", simulate=True)

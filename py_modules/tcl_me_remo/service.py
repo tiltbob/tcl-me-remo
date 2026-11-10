@@ -119,6 +119,7 @@ class Service:
         self.phase = Phase.RUNNING
         self._offset_seen = self._sleep_offset()
         self._boot_handled = False
+        self._down_epoch = 0  # counts real down events; lets a queued up event notice one
         self._action: asyncio.Task[dict[str, Any]] | None = None
         self._action_name = ""
         self._action_trigger = ""
@@ -175,7 +176,13 @@ class Service:
         if not (want_on or want_input):
             return self._skipped("tv_on", name, f"nothing is set to happen on {name}")
 
+        epoch = self._down_epoch
+
         async def action(trace: Trace) -> str:
+            if self._down_epoch != epoch:
+                # This event waited behind another action and the machine has started going
+                # down since: turning the TV on now would undo the "TV off" just sent.
+                raise _Skip(f"superseded: the machine went down before {name} was handled")
             gate = await display.wait_for_gate(cfg.display, sys_root=self._sys_root)
             if not gate.ok:
                 raise _Skip(gate.reason)
@@ -193,6 +200,7 @@ class Service:
                     await asyncio.gather(asyncio.shield(current), return_exceptions=True)
                 return self._skipped("tv_off", name, f"duplicate {name} event ignored")
             self.phase = Phase.GOING_DOWN
+            self._down_epoch += 1
             self._offset_seen = self._sleep_offset()
         try:
             return await self._down_action(name, budget if budget is not None else DEFAULT_DOWN_BUDGET)
@@ -474,17 +482,26 @@ class Service:
             log.log(level, "%s (%s): %s%s", name, trigger, "skipped: " if skipped else "" if ok else "FAILED: ", detail)
             return record
 
-        async with self._start_lock:
-            current = self._action
-            if current is not None and not current.done():
-                if mode == "reject":
+        while True:
+            async with self._start_lock:
+                current = self._action
+                busy = current is not None and not current.done()
+                if busy and mode == "reject":
                     raise self._busy()
-                if mode == "preempt":
+                if busy and mode == "preempt":
+                    assert current is not None
                     current.cancel()
-                await asyncio.gather(current, return_exceptions=True)
-            task: asyncio.Task[dict[str, Any]] = asyncio.ensure_future(runner())
-            self._action, self._action_name, self._action_trigger = task, name, trigger
-            self._action_is_down = is_down
+                    await asyncio.gather(current, return_exceptions=True)
+                    busy = False
+                if not busy:
+                    task: asyncio.Task[dict[str, Any]] = asyncio.ensure_future(runner())
+                    self._action, self._action_name, self._action_trigger = task, name, trigger
+                    self._action_is_down = is_down
+                    break
+            # "queue": wait for the running action outside the lock, so that a down event
+            # arriving meanwhile can still pre-empt it, then try again.
+            assert current is not None
+            await asyncio.gather(asyncio.shield(current), return_exceptions=True)
 
         # shield: if *our caller* goes away (a UI closing its socket) the action carries on
         # and still records its outcome.
