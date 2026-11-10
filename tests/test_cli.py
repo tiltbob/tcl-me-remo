@@ -85,6 +85,25 @@ async def test_status_plain_and_json(running):
     assert json.loads(out)["bluetooth"]["adapter"] == "hci0"
 
 
+def test_status_says_whether_the_link_is_ready_and_how_keys_are_delivered():
+    def bluetooth_line(**state):
+        out = io.StringIO()
+        link = {"available": True, "powered": True, "paired": True, "adapter": "hci0", "tv_name": "TV", **state}
+        cli._print_status({"version": "x", "enabled": True, "bluetooth": link}, out)
+        return next(line for line in out.getvalue().splitlines() if line.startswith("bluetooth:"))
+
+    # The documents tell people to look for exactly these words.
+    ready = bluetooth_line(connected=True, subscribed=False, ready=True, delivery="raw")
+    assert "connected, ready (delivery: raw)" in ready
+    ready = bluetooth_line(connected=True, subscribed=True, ready=True, delivery="bluez")
+    assert "connected, ready (delivery: bluez)" in ready
+    # After a boot or wake the link is up and the TV has subscribed, but nothing was sent yet.
+    resting = bluetooth_line(connected=True, subscribed=True, ready=False)
+    assert "no key sent on this link yet" in resting and "waiting" not in resting
+    assert "waiting for the TV to subscribe" in bluetooth_line(connected=True, subscribed=False, ready=False)
+    assert "calling the TV" in bluetooth_line(connected=False, advertising=True)
+
+
 async def test_config_show_get_set(running):
     code, out, _ = await running("config")
     assert code == 0 and "input.hdmi_port = 1" in out and 'power.on_key = "WAKE"' in out

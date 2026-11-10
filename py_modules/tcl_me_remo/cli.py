@@ -165,7 +165,13 @@ def _print_status(status: dict[str, Any], out: Any) -> None:
     elif not bt.get("paired"):
         link = "no TV paired (run: tcl-me-remo pair)"
     elif bt.get("ready"):
-        link = "connected"
+        # "delivery: bluez" is the ordinary path; "delivery: raw" is direct delivery, used for a
+        # TV that did not renew its subscription after a reboot (docs/how-it-works.md).
+        delivery = bt.get("delivery")
+        link = f"connected, ready (delivery: {delivery})" if delivery else "connected, ready"
+    elif bt.get("connected") and bt.get("subscribed"):
+        # The resting state after a boot or wake: the link is up, nothing was sent on it yet.
+        link = "connected (no key sent on this link yet)"
     elif bt.get("connected"):
         link = "connected, waiting for the TV to subscribe"
     elif bt.get("advertising"):
