@@ -501,6 +501,25 @@ async def test_shipped_defaults_do_not_press_navigation_keys(tmp_path):
     assert down["ok"] and remote.key_names() == ["WAKE", "SLEEP"]
 
 
+async def test_wake_measures_are_requested_only_when_turning_the_tv_on(tmp_path):
+    # The wake beacon can rouse a suspended TV.  That is wanted for "TV on" and for nothing
+    # else: waking a TV to tell it to sleep, or to press a key, would leave it on.
+    h = Harness(tmp_path)
+    await h.service.tv_on(switch_input=False)
+    assert h.remote.wake_flags == [True]
+
+    for action in (h.service.tv_off, h.service.switch_input, lambda: h.service.send_key("HOME")):
+        await h.remote.disconnect()
+        h.remote.wake_flags.clear()
+        await action()
+        assert h.remote.wake_flags == [False], action
+
+    await h.remote.disconnect()
+    h.remote.wake_flags.clear()
+    await h.service.handle_event("suspend")
+    assert h.remote.wake_flags == [False]
+
+
 async def test_power_toggle_is_never_repeated(tmp_path):
     h = Harness(tmp_path, patch={"power": {"on_key": "POWER", "on_repeat": 3}, "input": {"method": "none"}})
     assert (await h.service.tv_on())["ok"]

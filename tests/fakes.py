@@ -29,6 +29,7 @@ class FakeRemote:
         self.fail_code: str | None = None
         self.keys: list[tuple[str, float]] = []
         self.ensure_calls: list[float] = []
+        self.wake_flags: list[bool] = []
         self.disconnects = 0
         self.pairing_calls: list[float] = []
         self.forgotten = 0
@@ -42,8 +43,9 @@ class FakeRemote:
     def apply_config(self, cfg) -> None:
         self.config = cfg
 
-    async def ensure_ready(self, timeout: float) -> bool:
+    async def ensure_ready(self, timeout: float, *, wake: bool = False) -> bool:
         self.ensure_calls.append(timeout)
+        self.wake_flags.append(wake)
         if self.fail_code:
             raise TransportError(self.fail_code, f"bluetooth problem: {self.fail_code}")
         if self._state.ready:

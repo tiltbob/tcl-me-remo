@@ -71,13 +71,17 @@ class Remote(Protocol):
     def apply_config(self, cfg: BluetoothConfig) -> None:
         """Adopt new settings (TV address, device name, timings).  Must not block."""
 
-    async def ensure_ready(self, timeout: float) -> bool:
+    async def ensure_ready(self, timeout: float, *, wake: bool = False) -> bool:
         """Make the TV connect to us and subscribe to key notifications.
 
         Advertises to the bonded TV if there is no link.  Returns True as soon as keys can
         be sent, False if the TV did not show up within ``timeout`` seconds.  Raises
         :class:`TransportError` when waiting is pointless (no bonded TV, adapter missing or
         off).
+
+        ``wake`` says the caller is about to turn the TV on, which allows measures that
+        rouse a suspended TV (the wake beacon).  It must be False for everything else:
+        waking a TV in order to tell it to sleep would leave it on.
         """
 
     async def send_key(self, spec: str, hold: float) -> None:

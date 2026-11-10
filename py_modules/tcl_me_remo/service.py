@@ -296,7 +296,7 @@ class Service:
         repeat = cfg.power.on_repeat if on else cfg.power.off_repeat
         if keys.resolve(key).spec == "POWER":
             repeat = 1  # a toggle sent twice undoes itself, and TCL shows a shutdown dialog
-        if not await self._ble_ready(trace, connect_timeout):
+        if not await self._ble_ready(trace, connect_timeout, wake=on):
             raise RpcError("tv_unreachable", f"the TV did not connect within {connect_timeout:g}s")
         for index in range(repeat):
             if index:
@@ -334,11 +334,11 @@ class Service:
                 await asyncio.gather(*pending, return_exceptions=True)
         raise RpcError("tv_unreachable", "; ".join(sorted(problems)))
 
-    async def _ble_ready(self, trace: Trace, timeout: float) -> bool:
+    async def _ble_ready(self, trace: Trace, timeout: float, *, wake: bool = False) -> bool:
         if self.remote.state.ready:
             return True
         started = time.monotonic()
-        ready = await self.remote.ensure_ready(timeout)
+        ready = await self.remote.ensure_ready(timeout, wake=wake)
         if ready:
             self._note(trace, f"Bluetooth: TV connected after {time.monotonic() - started:.1f}s")
         return ready
