@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tcl-me-remo status:*)",
+      "Bash(tcl-me-remo doctor:*)",
+      "Bash(tcl-me-remo logs:*)",
+      "Bash(tcl-me-remo keys:*)",
+      "Bash(tcl-me-remo config)",
+      "Bash(bluetoothctl show:*)",
+      "Bash(bluetoothctl devices:*)",
+      "Bash(bluetoothctl info:*)",
+      "Bash(journalctl:*)",
+      "Bash(systemctl status:*)",
+      "Bash(systemctl is-active:*)",
+      "Bash(systemctl is-enabled:*)",
+      "Bash(systemctl cat:*)",
+      "Bash(systemd-inhibit --list:*)",
+      "Bash(busctl tree:*)",
+      "Bash(uname:*)",
+      "Bash(cat /etc/os-release)",
+      "Bash(cat /sys/power/mem_sleep)",
+      "Bash(lsusb:*)",
+      "Bash(rfkill list:*)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(ruff check:*)"
+    ]
+  }
+}
