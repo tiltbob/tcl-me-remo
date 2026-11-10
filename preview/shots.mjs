@@ -363,6 +363,18 @@ async function main() {
     await page.context().close();
   }
   {
+    // Another Bluetooth pairing screen is open on this machine: the service warns while its
+    // own pairing mode is open, which is when the warning can still be acted on.
+    const page = await open("pairing next to another pairing screen", QAM, { scenario: "unpaired", pair: "never", classic: "1" });
+    await button(page, "Pair TV").click();
+    check("an open pairing mode shows what the service warns about", (await sees(page, "Pairing mode is open")) && (await sees(page, "Bluetooth problem: this machine is also discoverable over classic Bluetooth")));
+    await shot(page, "pair-dialog-warning", false);
+    await button(page, "Cancel pairing").click();
+    await sleep(300);
+    check("and the warning goes away with pairing mode", (await page.getByRole("dialog").count()) === 0 && (await page.getByText("discoverable over classic Bluetooth").count()) === 0);
+    await page.context().close();
+  }
+  {
     const page = await open("pairing refused", QAM, { scenario: "unpaired", fail: "pair_start" });
     await button(page, "Pair TV").click();
     check("a refused pair_start shows the service's reason", (await sees(page, "Pairing mode could not be opened")) && (await sees(page, "Bluetooth is turned off in SteamOS")));
@@ -665,6 +677,14 @@ async function main() {
     await toggle(page, "Keep calling the TV").click();
     await sleep(300);
     check("Keep calling the TV is bluetooth.reconnect_on_drop", (await lastPatch(page)) === '{"bluetooth":{"reconnect_on_drop":false}}', await lastPatch(page));
+    const delivery = page.getByRole("combobox", { name: "Direct delivery" });
+    const offered = (await delivery.locator("option").allTextContents()).map((text) => text.trim());
+    check("Direct delivery offers its four choices, the careful one first", JSON.stringify(offered) === JSON.stringify(["Automatic", "On", "Off", "Always"]), JSON.stringify(offered));
+    check("and says in plain words what each one does", (await sees(page, "only on Linux 6.17 or newer", 2000)) && (await sees(page, "On: Used when the TV needs it, on any kernel.", 2000)) && (await sees(page, "has to be paired again after each restart", 2000)) && (await sees(page, "Always: Used for every key", 2000)));
+    await delivery.selectOption({ label: "On" });
+    await sleep(300);
+    const shownDelivery = await delivery.evaluate((element) => element.selectedOptions[0].label);
+    check("On is bluetooth.raw_notify = on, a value the service accepts", (await lastPatch(page)) === '{"bluetooth":{"raw_notify":"on"}}' && shownDelivery === "On" && (await page.getByText("bluetooth.raw_notify: must be").count()) === 0, `${await lastPatch(page)} / ${shownDelivery}`);
     await page.getByRole("combobox", { name: "Wake beacon (experimental)" }).selectOption({ label: "Custom" });
     await sleep(300);
     await page.getByRole("button", { name: "Edit", exact: true }).last().click();

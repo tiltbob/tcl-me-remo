@@ -1,6 +1,8 @@
 """Readiness, key delivery and link handling within one bluetoothd lifetime."""
 
 import asyncio
+import errno
+import logging
 import time
 
 import fake_bluez
@@ -618,6 +620,203 @@ async def test_disconnect_survives_being_cut_short(h):
     assert h.bluez.advert is None
 
 
+# --------------------------------------------------------------------------- ending the link at once (before sleep)
+
+#: Management "Disconnect" (0x0014) on hci0 for AA:BB:CC:DD:EE:FF, a public address.
+DISCONNECT_TV = bytes.fromhex("1400 0000 0700 ffeeddccbbaa 01")
+
+
+async def test_fast_disconnect_ends_the_link_through_the_kernel(h):
+    """Before suspend there is no time for bluetoothd's two seconds, and the reason code matters."""
+    h.bluez.disconnect_delay = 30.0  # bluetoothd's way would take far too long to go unnoticed
+    remote, tv = await h.paired_remote(reconnect_on_drop=True)
+    assert await remote.ensure_ready(2.0)
+    h.bluez.events.clear()
+    started = time.monotonic()
+    await remote.disconnect(fast=True)
+    assert time.monotonic() - started < remote_module.FAST_DISCONNECT_WAIT + SLOW
+    assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 0
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    state = remote.state
+    assert not state.ready and state.delivery == "" and state.error == ""
+    assert h.mgmt.opened == 1 and h.mgmt.closed == 1  # the control socket was given back
+
+    # Parked exactly as after a normal disconnect: no calling until there is something to send.
+    await asyncio.sleep(0.1)
+    assert "advert_registered" not in h.bluez.event_names() and not remote.state.advertising
+    await remote.disconnect(fast=True)  # no link: nothing to ask anybody for
+    assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 0
+    assert await remote.ensure_ready(5.0) is True and tv.connections == 2
+
+
+async def test_manual_disconnect_keeps_going_through_bluetoothd(h):
+    remote, tv = await h.paired_remote()
+    assert await remote.ensure_ready(2.0)
+    await remote.disconnect()
+    assert h.mgmt.commands == [] and h.mgmt.opened == 0 and h.bluez.disconnect_calls == 1
+    assert not tv.connected and not remote.state.connected
+
+
+async def test_fast_disconnect_names_the_tv_by_the_kind_of_address_it_has(h):
+    """The kernel looks a link up by address and address type; a static random identity is type 2."""
+    h.bluez.disconnect_delay = 30.0
+    remote, tv = await h.paired_remote(identity_type="random")
+    assert await remote.ensure_ready(2.0)
+    await remote.disconnect(fast=True)
+    assert h.mgmt.commands == [bytes.fromhex("1400 0000 0700 ffeeddccbbaa 02")]
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    assert h.bluez.disconnect_calls == 0
+
+
+async def test_fast_disconnect_follows_the_kernel_when_it_lists_the_link_under_a_private_address(h):
+    h.bluez.disconnect_delay = 30.0
+    remote, tv = await h.paired_remote(rpa="4A:11:22:33:44:55")
+    assert await remote.ensure_ready(2.0)
+    assert remote.state.tv_address == TV
+    tv.kernel_keeps_rpa = True  # bluetoothd says AA:BB:... (public); the kernel never resolved the address
+    await remote.disconnect(fast=True)
+    assert h.mgmt.commands == [bytes.fromhex("1400 0000 0700 55443322114a 02")]
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    assert h.bluez.disconnect_calls == 0
+
+
+async def test_fast_disconnect_lets_the_last_report_out_first(h, monkeypatch):
+    """A link ended under a key-up that is still on its way would leave the TV awake."""
+    monkeypatch.setattr(remote_module, "REPORT_FLUSH", 0.2)
+    remote, tv = await h.paired_remote()
+    assert await remote.ensure_ready(2.0)
+    before = len(tv.received)
+    seen = []
+    find = h.mgmt.find
+
+    def watched(*args):
+        seen.append((time.monotonic(), len(tv.received)))
+        return find(*args)
+
+    h.mgmt.find = watched
+    key = asyncio.ensure_future(remote.send_key("SLEEP", 5.0))
+    await eventually(lambda: len(tv.received) == before + 1, what="the key press")
+    started = time.monotonic()
+    await remote.disconnect(fast=True)
+    # The key was released at once, and the kernel was asked only after the pause for it.
+    assert tv.received[before:] == [(CONSUMER, bytes.fromhex("32000000"), "bluez"), (CONSUMER, bytes(4), "bluez")]
+    assert len(seen) == 1 and seen[0][1] == before + 2 and seen[0][0] - started >= 0.2
+    with pytest.raises(TransportError) as err:
+        await key
+    assert "closed while SLEEP was held" in err.value.message
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+
+
+async def test_fast_disconnect_is_not_taken_back_when_the_caller_stops_waiting(h):
+    """The service gives it half a second; whatever happens in that time, the kernel is asked."""
+    h.bluez.disconnect_delay = 30.0
+    h.mgmt.disconnect_delay = 0.3
+    remote, tv = await h.paired_remote()
+    assert await remote.ensure_ready(2.0)
+    await remote.send_key("SLEEP", 0.01)  # so that the pause for the last report is still running
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(remote.disconnect(fast=True), 0.01)
+    assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 0
+    assert h.mgmt.opened == 1 and h.mgmt.closed == 1  # nothing is left open behind a caller that left
+    # Not usable any more even though the link is still up for a moment...
+    assert tv.connected and not remote.state.ready
+    with pytest.raises(TransportError):
+        await remote.send_key("HOME", 0.01)
+    # ...and when it goes down that is not mistaken for the TV dropping us.
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    assert h.bluez.advert is None
+
+
+async def test_fast_disconnect_does_not_wait_for_a_tv_that_stopped_answering(h):
+    """The controller reports the link down only when the TV acknowledged or timed out."""
+    h.bluez.disconnect_delay = 30.0
+    h.mgmt.completes = False
+    remote, tv = await h.paired_remote()
+    assert await remote.ensure_ready(2.0)
+    started = time.monotonic()
+    await remote.disconnect(fast=True)
+    elapsed = time.monotonic() - started
+    assert remote_module.FAST_DISCONNECT_WAIT <= elapsed < remote_module.FAST_DISCONNECT_WAIT + SLOW
+    # The kernel has the request: that is all there is to do, bluetoothd is not asked as well.
+    assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 0 and h.mgmt.closed == 1
+    assert tv.connected and remote.state.connected and not remote.state.ready
+    await tv.drop()
+    await eventually(lambda: not remote.state.connected)
+
+
+@pytest.mark.parametrize(
+    "fault, why",
+    [
+        ("no sockets", "no Bluetooth socket support"),
+        ("not root", "must run as root"),
+        ("busy", "another disconnect is under way"),
+        ("unknown link", "no such link"),
+        ("no address type", "what kind of address"),
+        ("two candidates", "none is listed as the TV"),
+    ],
+)
+async def test_fast_disconnect_falls_back_to_bluetoothd(h, fault, why, caplog):
+    caplog.set_level(logging.INFO)
+    remote, tv = await h.paired_remote(rpa="4A:11:22:33:44:55" if fault == "two candidates" else "")
+    assert await remote.ensure_ready(2.0)
+    if fault == "no sockets":
+        h.mgmt.open_error = OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+    elif fault == "not root":
+        h.mgmt.refuse_status = 0x14
+    elif fault == "busy":
+        h.mgmt.refuse_status = 0x0A
+    elif fault == "unknown link":
+        tv.identity_type = "random"  # the kernel tracks the link by another address type than BlueZ reports
+    elif fault == "no address type":
+        tv._set(AddressType="")
+        await asyncio.sleep(0.05)
+    else:
+        # Somebody else's device is connected to us as well and the kernel lists neither link
+        # under the TV's address: nothing says which one is the TV, so nothing is guessed.
+        tv.kernel_keeps_rpa = True
+        other = h.bluez.add_device("5B:00:00:00:00:01", name="Phone")
+        await other.connect()
+    await remote.disconnect(fast=True)
+    assert h.bluez.disconnect_calls == 1 and not tv.connected and not remote.state.connected
+    assert why in caplog.text and "asking BlueZ, which takes two seconds" in caplog.text
+    assert h.mgmt.opened == h.mgmt.closed
+    if fault == "two candidates":
+        assert h.mgmt.commands == [] and other.connected
+
+
+async def test_fast_disconnect_falls_back_when_the_kernel_refuses_a_moment_later(h, caplog):
+    """Kernels from 6.11 on accept the command and look for the link afterwards."""
+    caplog.set_level(logging.INFO)
+    remote, tv = await h.paired_remote()
+    assert await remote.ensure_ready(2.0)
+    h.mgmt.refuse_status, h.mgmt.refuse_delay = 0x02, 0.05
+    await remote.disconnect(fast=True)
+    assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 1
+    assert not tv.connected and not remote.state.connected and h.mgmt.opened == h.mgmt.closed == 1
+    assert "the kernel did not end the TV link (status 0x02)" in caplog.text
+
+
+async def test_fast_disconnect_calls_off_a_connection_attempt_like_the_normal_one(h):
+    remote, tv = await parted(h)
+    tv.auto_connect = False
+    waiting = asyncio.ensure_future(remote.ensure_ready(30))
+    await eventually(lambda: h.bluez.advert is not None)
+    await remote.disconnect(fast=True)
+    assert await asyncio.wait_for(waiting, SLOW) is False
+    assert h.bluez.advert is None and h.mgmt.commands == [] and h.mgmt.opened == 0
+
+
+async def test_fast_disconnect_with_direct_delivery_settles_the_kernel_afterwards(h):
+    """The link that carried injected packets ends the fast way too; the repair follows as usual."""
+    remote, tv = await h.paired_remote(raw_notify="always")
+    assert await remote.ensure_ready(2.0) and remote.state.delivery == "raw"
+    await remote.send_key("SLEEP", 0.01)
+    await remote.disconnect(fast=True)
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    await eventually(lambda: h.raw.commands != [], what="the repair after the link closed")
+    assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 0
+
+
 async def test_ensure_ready_waits_out_a_link_that_is_being_closed(h):
     h.bluez.disconnect_delay = 0.2
     remote, tv = await h.paired_remote()
@@ -677,6 +876,71 @@ async def test_reconnect_on_drop_keeps_calling_the_tv_in_the_background(h):
     await eventually(lambda: h.bluez.advert is not None)
     remote.apply_config(quick_config(tv_address=TV, reconnect_on_drop=False))
     await eventually(lambda: h.bluez.advert is None, what="background calling to stop")
+
+
+async def test_resume_link_lets_background_calling_start_again(h):
+    """After a wake in which nothing is sent to the TV the link would otherwise stay parked."""
+    remote, tv = await h.paired_remote(reconnect_on_drop=True)
+    assert await remote.ensure_ready(2.0)
+    await remote.disconnect(fast=True)  # what the service does before the machine sleeps
+    await eventually(lambda: not tv.connected and not remote.state.connected)
+    h.bluez.events.clear()
+    await asyncio.sleep(0.1)
+    assert "advert_registered" not in h.bluez.event_names()  # parked
+
+    remote.resume_link()  # synchronous: the service calls it on its way into every boot and resume
+    await eventually(lambda: "advert_registered" in h.bluez.event_names(), what="background calling after the wake")
+    registered = [props for name, props in h.bluez.events if name == "advert_registered"]
+    assert (registered[0]["MinInterval"], registered[0]["MaxInterval"]) == (150, 250)  # the relaxed one
+    await eventually(lambda: remote.state.connected and h.bluez.advert is None, what="the TV to call back")
+    assert tv.connections == 2 and not remote.state.ready
+    remote.resume_link()  # nothing parked: nothing happens
+    await asyncio.sleep(0.05)
+    assert tv.connections == 2 and h.bluez.advert is None
+    assert await remote.ensure_ready(3.0) is True  # the next suspend finds the link up
+
+
+async def test_resume_link_does_nothing_without_reconnect_on_drop(h):
+    remote, tv = await parted(h)  # reconnect_on_drop is off
+    remote.resume_link()
+    await asyncio.sleep(0.1)
+    assert h.bluez.event_names() == [] and not remote.state.advertising and not tv.connected
+    # Switching the option on later picks the link up: the wake has been noted.
+    remote.apply_config(quick_config(tv_address=TV, reconnect_on_drop=True))
+    await eventually(lambda: remote.state.connected, what="background calling once it is wanted")
+
+
+async def test_resume_link_leaves_a_link_alone_that_is_meant_to_be_down_when_idle(h):
+    """With an idle time-out the user wants the radio free; only a key starts that time-out."""
+    remote, tv = await h.paired_remote(reconnect_on_drop=True, idle_disconnect_seconds=30)
+    assert await remote.ensure_ready(2.0)
+    await remote.disconnect(fast=True)
+    await eventually(lambda: not remote.state.connected)
+    h.bluez.events.clear()
+    remote.resume_link()
+    await asyncio.sleep(0.1)
+    assert h.bluez.event_names() == [] and not tv.connected
+    assert await remote.ensure_ready(3.0) is True  # there is something to send: now it is called
+
+
+async def test_resume_link_never_raises(h, monkeypatch, caplog):
+    remote = await h.remote(reconnect_on_drop=True, start=False)
+    remote.resume_link()  # not started
+    await remote.start()
+    remote.resume_link()  # no TV bonded
+    await asyncio.sleep(0.05)
+    assert h.bluez.advert is None
+
+    tv = h.bluez.add_device()
+    tv.auto_connect = True
+    await h.pair(remote, tv)
+    await remote.disconnect()
+    with monkeypatch.context() as patch:
+        patch.setattr(remote, "_call_in_background", lambda: 1 / 0)
+        remote.resume_link()
+    assert "could not resume background calling" in caplog.text
+    await remote.stop()
+    remote.resume_link()  # stopped
 
 
 async def test_reconnect_on_drop_starts_calling_a_bonded_tv_at_start_up(h):

@@ -164,9 +164,13 @@ class BluetoothConfig:
     raw_notify: str = field(
         default="auto",
         metadata=_meta(
-            choices=("auto", "off", "always"),
-            help="Deliver keys straight to the radio when BlueZ has lost the TV's subscription (after a reboot). "
-            "'off' means such a TV has to be paired again after each reboot.",
+            choices=("auto", "on", "off", "always"),
+            help="Direct delivery: send keys straight to the radio when BlueZ has lost the TV's subscription "
+            "(after a reboot; Android 11 to 13). 'auto' uses it only where it has no side effects, on Linux "
+            "6.17 and later. 'on' uses it on any kernel; on older ones it disturbs the kernel's Bluetooth "
+            "packet accounting, which the service repairs afterwards (unverified). 'off' never uses it: such "
+            "a TV then has to be paired again after each reboot. 'always' sends every key this way "
+            "(diagnostic).",
         ),
     )
     reconnect_on_drop: bool = field(

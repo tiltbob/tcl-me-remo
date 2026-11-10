@@ -131,12 +131,22 @@ action decided there was nothing to do (disabled, display gate closed, duplicate
 - `busy` names the running action (`"tv_on (boot)"`) or is empty.
 - `bluetooth.ready` means keys can be sent right now. `delivery` says how they travel:
   `bluez` (normal GATT notifications) or `raw` (see [how-it-works](how-it-works.md)).
+- `bluetooth.error` is one sentence for the user, empty when there is nothing to say: the
+  last problem that kept the TV from being reached, or else a note about pairing mode. While
+  `pairing` is true it can hold a warning that needs acting on at that moment (the machine
+  is also discoverable over classic Bluetooth); after pairing mode closed without a TV it
+  says how it ended. It is cleared when the TV becomes ready and when pairing mode opens.
+- `bluetooth.subscribed` is about the paired TV; it is `false` whenever no TV is paired.
 - `input.macro` is the macro that will run, with the preset resolved and `{port}` filled in.
 
 ## `get_config`
 
 - `config` is the full settings document (the same JSON as the config file).
 - `schema` mirrors its shape; every leaf is `{type, default, help, min?, max?, maxlen?, choices?}`.
+  Clients should offer what `choices` lists rather than a fixed set: `bluetooth.raw_notify`,
+  for one, takes `auto`, `on`, `off` and `always`.
+  With `auto` on a Linux kernel before 6.17 direct delivery is not used; a TV that needs it
+  then fails with `not_subscribed`, and the message names the kernel and the way out.
 - `presets` lists the built-in input macros: `{name, title, description, template}`.
 - `keys` lists the named keys: `{name, label, page, usage, android}`.
 - `link_presets` lists the built-in TV-input links for the Wi-Fi assist:

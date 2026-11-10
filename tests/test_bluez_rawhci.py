@@ -170,6 +170,37 @@ def test_dev_id_and_kernel_version_helpers():
     assert rawhci.kernel_needs_credit_repair("weird")
 
 
+@pytest.mark.parametrize(
+    "release, version, free",
+    [
+        ("7.2.7-valve3-1-neptune", (7, 2), True),
+        ("6.17.0", (6, 17), True),
+        ("6.17.2-arch1-1", (6, 17), True),
+        ("6.100.1", (6, 100), True),                   # compared as numbers, not as text
+        ("6.16.12-200.fc42.x86_64", (6, 16), False),
+        ("6.11.11-valve19", (6, 11), False),
+        ("6.1.52-valve16-1-neptune-61", (6, 1), False),
+        ("5.17.3", (5, 17), False),                    # the major version counts first
+        ("garbage", None, False),
+        ("", None, False),
+        ("v6.17", None, False),
+        ("6", None, False),
+    ],
+)
+def test_direct_delivery_is_free_only_on_kernels_known_to_clamp(release, version, free):
+    """What ``raw_notify = auto`` rests on: unknown counts as old."""
+    assert rawhci.kernel_version(release) == version
+    assert rawhci.direct_delivery_is_free(release) is free
+    assert rawhci.kernel_needs_credit_repair(release) is not free
+
+
+def test_kernel_helpers_default_to_the_running_kernel(monkeypatch):
+    monkeypatch.setattr(rawhci.platform, "release", lambda: "6.18.44-fc-v338")
+    assert rawhci.kernel_version() == (6, 18) and rawhci.direct_delivery_is_free()
+    monkeypatch.setattr(rawhci.platform, "release", lambda: "6.11.11-valve19")
+    assert not rawhci.direct_delivery_is_free() and rawhci.kernel_needs_credit_repair()
+
+
 # --------------------------------------------------------------------------- RawLink with a fake backend
 
 

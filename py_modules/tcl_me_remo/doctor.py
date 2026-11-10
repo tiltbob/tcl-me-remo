@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import __version__, display, paths, system
+from .bluez import rawhci
 from .ipc import RpcError, call_sync
 
 Runner = Callable[[list[str], float], Awaitable[tuple[int, str]]]
@@ -108,15 +109,65 @@ def read_adapters(sys_root: Path = Path("/sys")) -> list[dict[str, str]]:
     return found
 
 
+def direct_delivery_check(kernel: str, setting: str | None) -> dict[str, str]:
+    """One line on direct delivery: the kernel, ``bluetooth.raw_notify``, and what the two come to.
+
+    Direct delivery reaches a TV that did not subscribe again after a reboot (Android 11 to
+    13).  Before Linux 6.17 it disturbs the kernel's Bluetooth packet accounting, so ``auto``
+    leaves it alone there; see docs/how-it-works.md, "After a reboot".  ``setting`` is None
+    when the service could not be asked.
+    """
+    version = rawhci.kernel_version(kernel)
+    free = rawhci.direct_delivery_is_free(kernel)
+    fixed = ".".join(str(part) for part in rawhci.FIXED_KERNEL)
+    if version is None:
+        where = f"kernel {kernel!r} (version not recognised, treated as older than {fixed})"
+    else:
+        where = f"kernel {kernel}"
+    disturbs = (
+        f"before Linux {fixed} it disturbs the kernel's Bluetooth packet accounting, which the service repairs "
+        "after each link (unverified); if controllers or headsets stall, set it to 'auto'"
+    )
+    needs_pairing = "a TV that does not subscribe again after a reboot (Android 11 to 13) has to be paired again"
+    status = OK
+    if setting is None:
+        status = UNKNOWN
+        would = "would be used when the TV needs it" if free else "would not be used on this kernel"
+        meaning = f"the service did not say; with the default 'auto' direct delivery {would}"
+        return _check("direct delivery", status, f"{where}, raw_notify unknown: {meaning}")
+    if setting == "off":
+        meaning = f"never used; {needs_pairing}"
+    elif setting == "auto" and not free:
+        meaning = (
+            f"not used on this kernel (only from Linux {fixed} on, where it has no side effects); {needs_pairing}, "
+            "or set raw_notify to 'on'"
+        )
+    elif setting in ("auto", "on"):
+        meaning = "used when the TV needs it"
+        if free:
+            meaning += f" (no side effects from Linux {fixed} on)"
+        else:
+            status, meaning = WARN, f"{meaning}; {disturbs}"
+    elif setting == "always":
+        meaning = "used for every key (a diagnostic setting)"
+        if not free:
+            status, meaning = WARN, f"{meaning}; {disturbs}"
+    else:
+        status, meaning = UNKNOWN, "a value this version does not know"
+    return _check("direct delivery", status, f"{where}, raw_notify = {setting}: {meaning}")
+
+
 async def collect(
     run: Runner = system.run_command,
     *,
     call: Callable[..., Any] | None = None,
     root: Path = Path("/"),
+    kernel: str | None = None,
 ) -> dict[str, Any]:
     """Gather the report as a JSON-serialisable dict."""
     sys_root = root / "sys"
     checks: list[dict[str, str]] = []
+    kernel = kernel if kernel is not None else platform.release()
 
     # ---------------------------------------------------------------- system
     os_release = read_os_release(root)
@@ -127,7 +178,7 @@ async def collect(
             "os": os_release.get("PRETTY_NAME") or os_release.get("NAME", "unknown"),
             "os_id": os_release.get("ID", ""),
             "os_version": os_release.get("VERSION_ID", "") or os_release.get("BUILD_ID", ""),
-            "kernel": platform.release(),
+            "kernel": kernel,
             "python": platform.python_version(),
             "python_has_af_bluetooth": hasattr(__import__("socket"), "AF_BLUETOOTH"),
             "systemd": systemd_out.splitlines()[0] if systemd_out else "",
@@ -209,8 +260,8 @@ async def collect(
     _, enabled = await run(["systemctl", "is-enabled", SERVICE_UNIT], 3.0)
     status: dict[str, Any] | None = None
     problem = ""
+    caller = call or (lambda method: call_sync(paths.socket_path(), method, timeout=5.0))
     try:
-        caller = call or (lambda method: call_sync(paths.socket_path(), method, timeout=5.0))
         status = await asyncio.to_thread(caller, "status")
     except RpcError as exc:
         problem = exc.message
@@ -243,6 +294,21 @@ async def collect(
         if last and not last.get("ok"):
             what = f"{last.get('name')} ({last.get('trigger')})"
             checks.append(_check("last action", WARN, f"{what} failed: {last.get('detail')}"))
+
+    raw_notify: str | None = None
+    if status is not None:
+        try:
+            reply = await asyncio.to_thread(caller, "get_config")
+            value = reply["config"]["bluetooth"]["raw_notify"]
+            raw_notify = value if isinstance(value, str) else None
+        except Exception:  # noqa: BLE001 - an older or half-working service: the line then says "unknown"
+            raw_notify = None
+    report["direct_delivery"] = {
+        "kernel": kernel,
+        "raw_notify": raw_notify,
+        "side_effect_free": rawhci.direct_delivery_is_free(kernel),
+    }
+    checks.append(direct_delivery_check(kernel, raw_notify))
 
     # ---------------------------------------------------------------- suspend plumbing
     code, inhibit_out = await run(["systemd-inhibit", "--list", "--no-pager", "--no-legend"], 5.0)

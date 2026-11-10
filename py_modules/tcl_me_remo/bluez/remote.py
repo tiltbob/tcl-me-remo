@@ -15,7 +15,8 @@ The facts that shape it (BlueZ 5.79+ and Android sources, see the research notes
   TV is not connected, so that the link is already up when a key must go out in the few
   seconds before suspend.  Never otherwise: with that option off a TV in standby is not
   poked unless there is something to send, and a link we closed on purpose (disconnect(),
-  idle time-out) stays closed until the next ensure_ready.
+  idle time-out) is "parked": it stays closed until the next ensure_ready, or until the
+  service says the machine has woken up again (resume_link).
 * **Readiness cannot be observed.**  bluetoothd tells us the link is up (``Device1.Connected``)
   but neither that it is encrypted nor that the TV's HID host finished setting up, so a
   settle delay stands in for both.
@@ -24,6 +25,8 @@ The facts that shape it (BlueZ 5.79+ and Android sources, see the research notes
   when bluetoothd restarts (every boot).  Android 14+ then subscribes again after the Service
   Changed indication; Android 11-13 never does, bluetoothd silently drops our notifications,
   and the only way to reach the TV short of pairing again is direct delivery (rawhci.py).
+  That path disturbs the kernel's packet accounting before Linux 6.17, so by default
+  (``raw_notify = auto``) it is used only from that version on; see ``_direct_delivery``.
 * **The first link after a registration is special.**  The Service Changed indication that
   bluetoothd sends on it makes Android 11-13 forget, for that connection, which
   notifications its HID host wanted.  Direct delivery therefore starts on the second link:
@@ -32,7 +35,8 @@ The facts that shape it (BlueZ 5.79+ and Android sources, see the research notes
   answers once the link is down.  That is too long for the moments before suspend, so with
   ``reconnect_on_drop`` the bounce is done in the background as soon as it is known to be
   needed, not when the first key is due.  For the same reason a key that is down is released
-  before a link is given up on purpose.
+  before a link is given up on purpose, and the link is ended through the kernel instead
+  (mgmt.py) when the machine is about to sleep: ``disconnect(fast=True)``.
 * **A bond is refused a second time.**  bluetoothd rejects pairing with a device it still
   holds a bond for, without asking any agent (``JustWorksRepairing = never``).  Every bond
   this service caused and no longer wants is therefore removed: the old TV's before a new
@@ -50,6 +54,7 @@ import asyncio
 import dataclasses
 import logging
 import math
+import platform
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,6 +69,7 @@ from .adapter import ADAPTER, AGENT_MANAGER, BLUEZ, BLUEZ_ROOT, DEVICE, GATT_MAN
 from .advert import Advertiser, AdvertSettings, Beacon
 from .agent import AGENT_CAPABILITY, AGENT_PATH, PairingAgent
 from .gatt import APP_ROOT, SERVICE_HANDLE, GattCharacteristic, HidApplication
+from .mgmt import LinkCloser, MgmtError
 from .rawhci import RawError, RawLink
 from .store import StateStore
 
@@ -87,6 +93,13 @@ KNOWN_SILENT_WAIT = 0.5
 DISCONNECT_WAIT = 3.5
 #: A requested disconnect that has not happened after this long is considered failed.
 CLOSING_GIVE_UP = 6.0
+#: disconnect(fast=True): a report handed over less than this long ago is given time to go out
+#: before the kernel is told to end the link (the controller may drop what it still holds).
+REPORT_FLUSH = 0.15
+#: disconnect(fast=True): how long the link is watched after the kernel has the request.  The
+#: request stands whatever happens; this only lets the caller see the result when it is quick.
+FAST_DISCONNECT_WAIT = 0.3
+FAST_DISCONNECT_POLL = 0.02
 #: Pause before advertising again after bluetoothd released or refused the advertisement.
 ADVERT_RETRY = 1.0
 PAIRING_TICK = 1.0
@@ -123,6 +136,14 @@ CLASSIC_VISIBLE = (
 NOT_SUBSCRIBED = (
     "the TV is connected but will not receive keys until it is paired again: it did not renew its "
     "subscription after Bluetooth restarted on this machine. Pair the TV again, or use the Wi-Fi assist"
+)
+#: The same situation when direct delivery would be allowed but the kernel is too old for it to
+#: be used without being asked.  ``{kernel}`` is the running kernel's release.
+NOT_SUBSCRIBED_OLD_KERNEL = (
+    "the TV is connected but will not receive keys: it did not renew its subscription after Bluetooth "
+    "restarted on this machine. Direct delivery could reach it, but is not used automatically on this "
+    "kernel ({kernel}; before Linux 6.17 it can disturb other Bluetooth devices). Set Direct delivery "
+    "(bluetooth.raw_notify) to 'on' to use it anyway, or pair the TV again, or use the Wi-Fi assist"
 )
 
 
@@ -204,12 +225,19 @@ class BleRemote:
         on_paired: PairedCallback | None = None,
         state_path: Path | None = None,
         raw_link: RawLink | None = None,
+        link_closer: LinkCloser | None = None,
+        kernel_release: str | None = None,
     ):
         self._bus = bus
         self._cfg = dataclasses.replace(cfg)
         self.on_paired: PairedCallback | None = on_paired
         self._store = StateStore(state_path)
-        self._raw = raw_link if raw_link is not None else RawLink()
+        #: The running kernel's release, e.g. "6.11.11-valve19-1-neptune-611".  It decides whether
+        #: direct delivery is used without being asked for, and whether its traces need a repair.
+        self._kernel = kernel_release if kernel_release is not None else platform.release()
+        self._raw_is_free = rawhci.direct_delivery_is_free(self._kernel)
+        self._raw = raw_link if raw_link is not None else RawLink(repair_credits=not self._raw_is_free)
+        self._closer = link_closer if link_closer is not None else LinkCloser()
 
         self._app: HidApplication | None = None
         self._watcher = BluezWatcher(bus, on_change=self._evaluate, on_owner_change=self._owner_changed)
@@ -239,6 +267,7 @@ class BleRemote:
         self._pairing_note = ""               # how the last pairing window ended / what is wrong with the open one
         self._held: int | None = None         # report id of the key that is down right now
         self._last_activity = 0.0
+        self._last_report_at = 0.0            # when the last input report was handed over
         self._advert_not_before = 0.0
         self._agent_registered = False
 
@@ -345,6 +374,7 @@ class BleRemote:
         # A debt the raw path left with the kernel stays on record (state file): it can only be
         # settled once the TV link is down, which the next start takes care of.
         self._raw.detach()
+        self._closer.close()
         for what, undo in (
             ("agent", lambda: self._bus.unexport(AGENT_PATH, self._agent)),
             ("advertisement", self._advertiser.unexport),
@@ -406,7 +436,7 @@ class BleRemote:
             self._evaluate()
             if self._ready and old.idle_disconnect_seconds != cfg.idle_disconnect_seconds:
                 self._restart_idle_watch()
-            if self._ready and self._delivery == "raw" and cfg.raw_notify == "off":
+            if self._ready and self._delivery == "raw" and self._direct_delivery() == "off":
                 # Direct delivery was just forbidden: keys can no longer reach the TV.
                 self._release_held()
                 self._ready, self._delivery = False, ""
@@ -567,18 +597,49 @@ class BleRemote:
             self._pairing_note = ""
             self._evaluate()
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, *, fast: bool = False) -> None:
+        """See :meth:`tcl_me_remo.interfaces.Remote.disconnect`.
+
+        ``fast`` ends the link through the kernel (mgmt.py): at once instead of after
+        bluetoothd's two seconds, and with the same reason code.  The request is made before
+        anything here waits for bluetoothd, and is not taken back if the caller stops waiting.
+        Whenever that way is not open the usual one is taken.
+        """
         self._abort += 1
         self._parked = True
         self._wakeup.fire()
-        await self._cancel_task("_reconnect_task")
-        await self._advertiser.stop()
+        asked_kernel = False
+        try:
+            if fast and self._connected:
+                asked_kernel = await self._kernel_disconnect()
+            await self._cancel_task("_reconnect_task")
+            await self._advertiser.stop()
+            if asked_kernel and await self._kernel_disconnect_took():
+                return
+        finally:
+            self._closer.close()
         if not self._connected:
             return
         try:
             await self._request_disconnect(time.monotonic() + DISCONNECT_WAIT)
         except (DBusError, TimeoutError, OSError) as exc:
             raise self._fail("bluetooth_error", f"could not disconnect the TV: {_describe(exc)}") from None
+
+    def resume_link(self) -> None:
+        """See :meth:`tcl_me_remo.interfaces.Remote.resume_link`.  Never raises."""
+        try:
+            if not self._started or self._stopped or not self._parked:
+                return
+            if self._cfg.idle_disconnect_seconds > 0:
+                # The user wants the link down while nothing is sent; calling the TV now would
+                # bring up a link that no idle time-out ever closes (it starts with a key).
+                return
+            self._parked = False
+            if self._keeping_link():
+                log.info("the machine is awake again: calling the TV in the background")
+            self._call_in_background()
+        except Exception:  # noqa: BLE001 - a courtesy call on the way up must never fail
+            log.exception("could not resume background calling")
 
     # ================================================================== BlueZ state tracking
 
@@ -875,7 +936,7 @@ class BleRemote:
     def _needs_bounce(self) -> bool:
         """The TV will need direct delivery, which cannot work on the current link."""
         assert self._app is not None
-        mode = self._cfg.raw_notify
+        mode = self._direct_delivery()
         return (
             self._connected
             and self._first_link()
@@ -994,6 +1055,32 @@ class BleRemote:
             self._closing_at = None  # bluetoothd never dropped it; treat the link as alive
             return False
         return True
+
+    def _direct_delivery(self) -> str:
+        """What ``bluetooth.raw_notify`` comes to on this kernel: ``off``, ``needed`` or ``always``.
+
+        ``needed`` is "when the TV has not subscribed".  ``auto`` means that only where the
+        injected packets leave no trace (Linux 6.17 and later, see rawhci.py): on an older
+        kernel the repair this module does afterwards is derived from source and unverified,
+        and what it would have to prevent - a stalled transmit queue for the user's game
+        controllers - is far worse, and far harder to trace back to us, than a TV that did
+        not turn on.  ``on`` is the user saying they want it anyway.
+        """
+        mode = self._cfg.raw_notify
+        if mode == "always":
+            return "always"
+        if mode == "on" or (mode == "auto" and self._raw_is_free):
+            return "needed"
+        return "off"
+
+    def _not_subscribed(self) -> str:
+        if self._cfg.raw_notify == "auto" and not self._raw_is_free:
+            if rawhci.kernel_version(self._kernel) is None:
+                kernel = f"its version, {self._kernel!r}, could not be read"
+            else:
+                kernel = f"Linux {self._kernel}"
+            return NOT_SUBSCRIBED_OLD_KERNEL.format(kernel=kernel)
+        return NOT_SUBSCRIBED
 
     def _resubscribe_wait(self) -> float:
         full = float(self._cfg.resubscribe_wait)
@@ -1128,7 +1215,7 @@ class BleRemote:
 
                 since = now - self._connected_at
                 settle = self._cfg.settle_ms / 1000.0
-                mode = self._cfg.raw_notify
+                mode = self._direct_delivery()
                 if self._app.subscribed and mode != "always":
                     ready_at = self._bluez_ready_at()
                     if now >= ready_at:
@@ -1140,8 +1227,11 @@ class BleRemote:
                     # Android 14+ needs a few seconds to rediscover us and subscribe again.
                     wait = self._resubscribe_wait() - since
                 elif mode == "off":
+                    # The link stays as it is (no bounce: nothing would use the second link),
+                    # and what was learnt about the TV is kept all the same - the next boot
+                    # then reports this after a moment instead of after the full wait.
                     self._note_silent()
-                    raise self._fail("not_subscribed", NOT_SUBSCRIBED)
+                    raise self._fail("not_subscribed", self._not_subscribed())
                 elif since < settle:
                     # Also before a bounce: the Service Changed indication must have reached the
                     # TV on this link, or it would simply arrive on the next one.
@@ -1223,6 +1313,60 @@ class BleRemote:
         except (DBusError, TimeoutError, OSError) as exc:
             log.warning("could not drop the TV link: %s", _describe(exc))
 
+    async def _kernel_disconnect(self) -> bool:
+        """Have the kernel end the TV link now (mgmt.py).  True if it has taken the request.
+
+        Never raises anything but a cancellation, and even then the request is made first:
+        a link the kernel ends by itself at suspend is ended with the wrong reason.
+        """
+        path = self._connected_path
+        self._release_held()
+        # From here on the link is on its way out, as in _request_disconnect: nothing more is
+        # sent on it and a waiting ensure_ready does not take it for a link to use.
+        self._closing_at = time.monotonic()
+        self._ready, self._delivery = False, ""
+        self._raw.detach()
+        # A report handed to bluetoothd or the controller a moment ago - the release above,
+        # the key-up of SLEEP when the caller ran out of time - must be on the air before the
+        # link goes, or the TV never sees the key come up (it sleeps on key-up).
+        pause = self._last_report_at + REPORT_FLUSH - time.monotonic()
+        try:
+            if pause > 0:
+                await asyncio.sleep(pause)
+        finally:
+            asked = self._ask_kernel_to_disconnect(path)
+        return asked
+
+    def _ask_kernel_to_disconnect(self, path: str) -> bool:
+        if not self._connected or self._connected_path != path or not self._adapter_path:
+            return False
+        props = self._watcher.interface(path, DEVICE) or {}
+        try:
+            self._closer.request(
+                rawhci.dev_id_from_adapter(self._adapter_path), self._cfg.tv_address, str(props.get("AddressType", ""))
+            )
+        except (MgmtError, RawError) as exc:
+            log.info("could not end the TV link through the kernel (%s); asking BlueZ, which takes two seconds", exc)
+            return False
+        return True
+
+    async def _kernel_disconnect_took(self) -> bool:
+        """Watch a link the kernel was asked to end.  False if the kernel refused after all."""
+        until = time.monotonic() + FAST_DISCONNECT_WAIT
+        while self._connected:
+            status = self._closer.status()
+            if status == 0:
+                break  # down in the kernel; bluetoothd's word follows
+            if status is not None:
+                log.info("the kernel did not end the TV link (status 0x%02X); asking BlueZ instead", status)
+                self._closing_at = None
+                return False
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break  # the kernel has the request; no need to watch it being carried out
+            await self._wakeup.wait(min(FAST_DISCONNECT_POLL, remaining))
+        return True
+
     # ================================================================== key delivery
 
     def _deliver(self, report_id: int, payload: bytes) -> None:
@@ -1234,6 +1378,7 @@ class BleRemote:
         """
         assert self._app is not None
         char = self._app.reports[report_id]
+        self._last_report_at = time.monotonic()
         if self._delivery == "raw" and (self._cfg.raw_notify == "always" or not char.notifying):
             handle, _source = self._app.report_value_handle(report_id)
             try:
@@ -1610,6 +1755,10 @@ class BleRemote:
         finally:
             if self._pairing is window:
                 self._pairing = None
+            if self._pairing_note == CLASSIC_VISIBLE:
+                # That was a warning about the open window.  How a window ended is a note of
+                # its own, and a window the user closed leaves none.
+                self._pairing_note = ""
             self._call_in_background()
             self._wakeup.fire()
 

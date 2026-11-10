@@ -31,6 +31,9 @@ class FakeRemote:
         self.ensure_calls: list[float] = []
         self.wake_flags: list[bool] = []
         self.disconnects = 0
+        self.fast_disconnects = 0   # how many of them asked for the link to end at once
+        self.disconnect_delay = 0.0
+        self.resumes = 0            # resume_link() calls
         self.pairing_calls: list[float] = []
         self.forgotten = 0
         self.config: Any = None
@@ -76,9 +79,14 @@ class FakeRemote:
         self._state.tv_address = self._state.tv_name = ""
         self._state.connected = self._state.ready = False
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, *, fast: bool = False) -> None:
         self.disconnects += 1
+        self.fast_disconnects += int(fast)
+        await asyncio.sleep(self.disconnect_delay)
         self._state.connected = self._state.ready = False
+
+    def resume_link(self) -> None:
+        self.resumes += 1
 
     def key_names(self) -> list[str]:
         return [spec for spec, _ in self.keys]

@@ -582,6 +582,12 @@ async def test_pairing_warns_while_the_adapter_itself_is_discoverable(h, caplog)
     # The adapter's setting is somebody else's: we never write it.
     assert sets(h, "Discoverable") == [] and h.bluez.adapter.props["Discoverable"] is True
 
+    # The warning is about an open window: cancelling one leaves nothing behind.
+    await remote.start_pairing(30)
+    assert "discoverable over classic Bluetooth" in remote.state.error
+    await remote.cancel_pairing()
+    assert not remote.state.pairing and remote.state.error == ""
+
 
 # --------------------------------------------------------------------------- what bluetoothd keeps of a removed TV
 

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tcl_me_remo import doctor
 from tcl_me_remo.ipc import ServiceUnavailable
 
@@ -83,6 +85,17 @@ def by_name(report):
     return {check["name"]: check for check in report["checks"]}
 
 
+def service(raw_notify="auto", status=STATUS):
+    """A control socket that answers ``status`` and ``get_config`` like the service."""
+
+    def call(method):
+        if method == "get_config":
+            return {"config": {"bluetooth": {"raw_notify": raw_notify}}, "schema": {}}
+        return status
+
+    return call
+
+
 async def test_healthy_system(tmp_path):
     report = await doctor.collect(make_runner(), call=lambda method: STATUS, root=make_root(tmp_path))
     json.dumps(report)
@@ -145,6 +158,76 @@ async def test_specific_faults(tmp_path):
     assert checks["TV pairing"]["status"] == "warn"
     assert checks["suspend lock"]["status"] == "fail"
     assert report["bluetooth"]["experimental"] is True
+
+
+@pytest.mark.parametrize(
+    "kernel, setting, status, said",
+    [
+        # Linux 6.17 and later: no side effects, so "auto" uses it.
+        ("7.2.7-valve3-1-neptune", "auto", "ok", "used when the TV needs it (no side effects from Linux 6.17 on)"),
+        ("6.17.0", "auto", "ok", "used when the TV needs it"),
+        ("6.17.0", "on", "ok", "used when the TV needs it"),
+        ("6.17.0", "off", "ok", "never used; a TV that does not subscribe again after a reboot"),
+        ("6.17.0", "always", "ok", "used for every key (a diagnostic setting)"),
+        # Older kernels: "auto" leaves it alone and says how to get it.
+        ("6.11.11-valve19", "auto", "ok", "not used on this kernel (only from Linux 6.17 on"),
+        ("6.16.12-200.fc42.x86_64", "auto", "ok", "or set raw_notify to 'on'"),
+        ("6.11.11-valve19", "off", "ok", "never used"),
+        # The user asked for it on a kernel it disturbs: say what to watch for.
+        ("6.11.11-valve19", "on", "warn", "used when the TV needs it; before Linux 6.17 it disturbs"),
+        ("6.11.11-valve19", "always", "warn", "if controllers or headsets stall, set it to 'auto'"),
+        # A release that cannot be read counts as old.
+        ("garbage", "auto", "ok", "not used on this kernel"),
+        ("garbage", "on", "warn", "the service repairs after each link (unverified)"),
+        # The service could not be asked, or says something newer than this doctor.
+        ("6.17.0", None, "unknown", "with the default 'auto' direct delivery would be used when the TV needs it"),
+        ("6.11.11-valve19", None, "unknown", "with the default 'auto' direct delivery would not be used"),
+        ("6.17.0", "sometimes", "unknown", "a value this version does not know"),
+    ],
+)
+def test_direct_delivery_line_names_kernel_setting_and_meaning(kernel, setting, status, said):
+    check = doctor.direct_delivery_check(kernel, setting)
+    assert check["name"] == "direct delivery" and check["status"] == status
+    detail = check["detail"]
+    assert said in detail and "\n" not in detail
+    assert kernel in detail  # the version is named, readable or not
+    assert f"raw_notify = {setting}" in detail if setting else "raw_notify unknown" in detail
+    if kernel == "garbage":
+        assert "version not recognised, treated as older than 6.17" in detail
+
+
+async def test_report_states_the_direct_delivery_situation(tmp_path):
+    root = make_root(tmp_path)
+    old = await doctor.collect(make_runner(), call=service("auto"), root=root, kernel="6.11.11-valve19-1-neptune-611")
+    check = by_name(old)["direct delivery"]
+    assert check["status"] == "ok"
+    assert check["detail"].startswith("kernel 6.11.11-valve19-1-neptune-611, raw_notify = auto: not used on this")
+    assert old["direct_delivery"] == {
+        "kernel": "6.11.11-valve19-1-neptune-611",
+        "raw_notify": "auto",
+        "side_effect_free": False,
+    }
+    assert old["system"]["kernel"] == "6.11.11-valve19-1-neptune-611"
+    assert "[ ok ] direct delivery: kernel 6.11.11-valve19-1-neptune-611, raw_notify = auto" in doctor.render(old)
+
+    risky = await doctor.collect(make_runner(), call=service("on"), root=root, kernel="6.11.11-valve19-1-neptune-611")
+    assert by_name(risky)["direct delivery"]["status"] == "warn"
+    assert "[warn] direct delivery" in doctor.render(risky)
+
+    new = await doctor.collect(make_runner(), call=service("auto"), root=root, kernel="6.17.2-arch1-1")
+    assert by_name(new)["direct delivery"]["status"] == "ok" and new["direct_delivery"]["side_effect_free"] is True
+
+    # Without an injected kernel it is the running one, and a service that cannot say is "unknown".
+    here = await doctor.collect(make_runner(), call=lambda method: STATUS, root=root)
+    assert here["direct_delivery"]["kernel"] == doctor.platform.release()
+    assert by_name(here)["direct delivery"]["status"] == "unknown"
+
+    def down(method):
+        raise ServiceUnavailable("cannot reach the tcl-me-remo service")
+
+    stopped = await doctor.collect(make_runner(), call=down, root=root, kernel="6.17.0")
+    assert by_name(stopped)["direct delivery"]["status"] == "unknown"
+    assert "raw_notify unknown" in by_name(stopped)["direct delivery"]["detail"]
 
 
 def test_parsers(tmp_path):

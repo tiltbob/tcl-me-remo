@@ -185,11 +185,21 @@ export const BluetoothPage: FC = () => {
           state={state}
           path="bluetooth.raw_notify"
           label="Direct delivery"
-          description="After SteamOS restarts, some TVs (Android 11 to 13) never ask for keys again although they are listening. Direct delivery sends keys to them anyway. Designed from source code; not confirmed on a TV."
+          description="After SteamOS restarts, some TVs (Android 11 to 13) never ask for keys again although they are listening. Direct delivery sends keys to them anyway, past the Bluetooth service. On Linux kernels before 6.17 that upsets the kernel's count of Bluetooth packets; this service repairs the count afterwards, but if the repair fell short, controllers and headsets could stall. Designed from source code; not confirmed on a TV."
+          showAllHints={true}
           choices={[
-            { value: "auto", label: "Automatic", hint: "Used only when the TV has not subscribed after a restart." },
-            { value: "off", label: "Off", hint: "Never used. Keys may stop arriving after a restart until you pair again." },
-            { value: "always", label: "Always", hint: "Used for every key." },
+            {
+              value: "auto",
+              label: "Automatic",
+              hint: "Used when the TV needs it, but only on Linux 6.17 or newer, where it has no side effects. On an older kernel it is not used, and a Bluetooth problem at the top of this page says so when a TV needs it.",
+            },
+            { value: "on", label: "On", hint: "Used when the TV needs it, on any kernel." },
+            {
+              value: "off",
+              label: "Off",
+              hint: "Never used. A TV that needs it has to be paired again after each restart of SteamOS.",
+            },
+            { value: "always", label: "Always", hint: "Used for every key, even when the TV has subscribed. For testing." },
           ]}
         />
         <SettingSlider

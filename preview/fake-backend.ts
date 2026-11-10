@@ -9,6 +9,7 @@
 //   ?scenario=default | unpaired | no-service | stopped | failed | installing
 //   &fail=tv_off,send_key   make these calls fail
 //   &pair=3                 seconds until pairing completes ("never" to let it time out)
+//   &classic=1              another Bluetooth pairing screen is open: pairing mode warns about it
 //   &statusDelay=1500       milliseconds a status request takes
 
 import type {
@@ -43,6 +44,11 @@ class RpcFailure extends Error {
 const TV_NAME = "Living Room TV";
 const TV_ADDRESS = "AA:BB:CC:DD:EE:FF";
 const TV_HOST = "192.168.1.50";
+// What the service puts into bluetooth.error while pairing mode is open and the adapter itself
+// is discoverable (bluez/remote.py, CLASSIC_VISIBLE).
+const CLASSIC_VISIBLE =
+  "this machine is also discoverable over classic Bluetooth (is another Bluetooth pairing screen open?). " +
+  "A TV may then try to pair the wrong way and give up; close other pairing screens and try again";
 
 const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -220,6 +226,8 @@ export class FakeBackend {
   private logs: string[] = [];
   private startedAt = Date.now() - 512_000;
   private pairingUntil = 0;
+  /** The adapter itself is discoverable (knob "classic"): an open pairing mode says so. */
+  private classicVisible = false;
   private pairTimer = 0;
   private configProblems: string[] = [];
   /** True while the pretend start-up install runs (scenario "installing"). */
@@ -241,6 +249,7 @@ export class FakeBackend {
     else if (pair) this.pairSeconds = Number(pair);
     const slow = query.get("statusDelay");
     if (slow) this.statusDelay = Number(slow);
+    this.classicVisible = query.get("classic") === "1";
     this.enter(query.get("scenario") ?? "default");
   }
 
@@ -578,11 +587,18 @@ export class FakeBackend {
   private stopPairing(): void {
     window.clearTimeout(this.pairTimer);
     Object.assign(this.bluetooth, { pairing: false, pairing_seconds_left: 0, advertising: this.bluetooth.paired && !this.bluetooth.connected });
+    // A warning about the open pairing mode goes away with it.
+    if (this.bluetooth.error === CLASSIC_VISIBLE) this.bluetooth.error = "";
   }
 
   private startPairing(timeout: number): void {
     this.pairingUntil = Date.now() + timeout * 1000;
-    Object.assign(this.bluetooth, { pairing: true, pairing_seconds_left: timeout, advertising: true, error: "" });
+    Object.assign(this.bluetooth, {
+      pairing: true,
+      pairing_seconds_left: timeout,
+      advertising: true,
+      error: this.classicVisible ? CLASSIC_VISIBLE : "",
+    });
     this.log("INFO", `pairing mode open for ${timeout}s`);
     window.clearTimeout(this.pairTimer);
     if (this.pairSeconds === null) return;

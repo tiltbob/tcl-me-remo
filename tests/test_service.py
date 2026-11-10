@@ -333,6 +333,142 @@ async def test_cancelled_shutdown_returns_to_running(tmp_path):
     assert not (await h.service.handle_event("shutdown"))["skipped"]
 
 
+@pytest.mark.parametrize("patch", [None, {"enabled": False}, {"events": {"suspend_tv_off": False}}])
+async def test_down_events_end_the_link_at_once(tmp_path, patch):
+    """Whatever the down action did or skipped, the link is ended by us and not by the kernel."""
+    h = Harness(tmp_path, patch=patch)
+    h.remote.state.connected = h.remote.state.ready = True
+    await h.service.handle_event("suspend")
+    assert h.remote.disconnects == 1 and h.remote.fast_disconnects == 1
+    assert not h.remote.state.connected
+
+
+async def test_the_fast_disconnect_still_runs_when_the_action_ran_out_of_budget(tmp_path):
+    h = Harness(tmp_path, remote=FakeRemote(connect_after=None), patch={"bluetooth": {"off_connect_timeout": 30.0}})
+    record = await h.service.handle_event("shutdown", budget=0.1)
+    assert not record["ok"] and "ran out of time" in record["detail"]
+    assert h.remote.disconnects == 1 and h.remote.fast_disconnects == 1
+
+
+async def test_manual_disconnect_is_not_the_fast_one(tmp_path):
+    h = Harness(tmp_path)
+    h.remote.state.connected = h.remote.state.ready = True
+    await h.service.rpc("disconnect", {})
+    assert h.remote.disconnects == 1 and h.remote.fast_disconnects == 0
+
+
+async def test_final_disconnect_is_bounded_and_fits_into_logind_s_wait(tmp_path, monkeypatch):
+    from tcl_me_remo import lifecycle
+    from tcl_me_remo import service as service_module
+
+    # The arithmetic: budget + disconnect must leave room before logind stops waiting, both
+    # with the default budget and with the one derived from logind's setting.
+    spare = 0.5
+    assert service_module.DEFAULT_DOWN_BUDGET + service_module.DISCONNECT_SECONDS <= lifecycle.DEFAULT_MAX_DELAY - spare
+    assert service_module.DISCONNECT_SECONDS <= lifecycle.BUDGET_MARGIN - spare
+
+    # A transport that does not come back is not waited for beyond DISCONNECT_SECONDS.
+    monkeypatch.setattr(service_module, "DISCONNECT_SECONDS", 0.05)
+    h = Harness(tmp_path)
+    h.remote.state.connected = h.remote.state.ready = True
+    h.remote.disconnect_delay = 30.0
+    started = asyncio.get_running_loop().time()
+    record = await h.service.handle_event("suspend")
+    assert asyncio.get_running_loop().time() - started < 5.0
+    assert record["ok"] and h.remote.fast_disconnects == 1 and h.service.phase == Phase.DOWN
+
+
+# --------------------------------------------------------------------------- the link after boot and wake
+
+
+async def test_every_real_boot_and_resume_resumes_the_link_once(tmp_path):
+    h = Harness(tmp_path)
+    await h.service.handle_event("boot")
+    assert h.remote.resumes == 1
+    await h.service.handle_event("boot")  # duplicate
+    assert h.remote.resumes == 1
+    await h.service.handle_event("resume")  # no suspend before it and the clocks agree: duplicate
+    assert h.remote.resumes == 1
+
+    await h.service.handle_event("suspend")
+    h.clock.sleep_for(600)
+    assert h.remote.resumes == 1  # going down resumes nothing
+    await h.service.handle_event("resume")
+    assert h.remote.resumes == 2
+    await h.service.handle_event("resume")  # the sleep.target unit after logind
+    assert h.remote.resumes == 2
+
+    # A sleep nobody announced, noticed by the clocks alone, is a real resume too.
+    h.clock.sleep_for(600)
+    await h.service.handle_event("resume")
+    assert h.remote.resumes == 3
+
+
+async def test_simulated_events_do_not_resume_the_link(tmp_path):
+    h = Harness(tmp_path)
+    await h.service.handle_event("boot", simulate=True)
+    await h.service.handle_event("resume", simulate=True)
+    await h.service.handle_event("suspend", simulate=True)
+    assert h.remote.resumes == 0
+
+
+@pytest.mark.parametrize(
+    "patch, connectors, reason",
+    [
+        ({"enabled": False}, None, "turned off"),
+        ({"events": {"resume_tv_on": False, "resume_switch_input": False}}, None, "nothing is set"),
+        (None, {"card0-eDP-1": "connected", "card0-DP-1": "disconnected"}, "no external display"),
+    ],
+)
+async def test_the_link_is_resumed_on_a_wake_in_which_nothing_is_sent(tmp_path, patch, connectors, reason):
+    """Otherwise the link the suspend closed stays down until the next suspend needs it."""
+    h = Harness(tmp_path, patch=patch, connectors=connectors)
+    await h.service.handle_event("suspend")
+    h.clock.sleep_for(60)
+    h.remote.ensure_calls.clear()
+    h.remote.keys.clear()
+    record = await h.service.handle_event("resume")
+    assert record["skipped"] and reason in record["detail"]
+    assert h.remote.resumes == 1 and h.remote.ensure_calls == [] and h.remote.keys == []
+
+
+async def test_the_link_is_resumed_before_anything_else_is_decided(tmp_path):
+    order = []
+
+    class Remote(FakeRemote):
+        def resume_link(self):
+            order.append("resume_link")
+            super().resume_link()
+
+        async def ensure_ready(self, timeout, *, wake=False):
+            order.append("ensure_ready")
+            return await super().ensure_ready(timeout, wake=wake)
+
+    h = Harness(tmp_path, remote=Remote())
+    await h.service.handle_event("boot")
+    assert order[:2] == ["resume_link", "ensure_ready"]
+
+
+async def test_a_failing_resume_link_does_not_cost_the_wake_action(tmp_path, caplog):
+    class Remote(FakeRemote):
+        def resume_link(self):
+            raise RuntimeError("boom")
+
+    h = Harness(tmp_path, remote=Remote())
+    record = await h.service.handle_event("boot")
+    assert record["ok"] and "WAKE" in h.remote.key_names()
+    assert "could not resume the Bluetooth link" in caplog.text
+
+
+async def test_a_shutdown_that_is_called_off_resumes_the_link(tmp_path):
+    h = Harness(tmp_path)
+    h.service.cancel_shutdown()  # nothing was going down: nothing to resume
+    assert h.remote.resumes == 0
+    await h.service.handle_event("shutdown")
+    h.service.cancel_shutdown()
+    assert h.remote.resumes == 1 and h.service.phase == Phase.RUNNING
+
+
 async def test_suspend_preempts_a_running_wake_sequence(tmp_path):
     h = Harness(tmp_path)
     h.service._sleep = asyncio.sleep  # real time: the 2 s delay_after_wake keeps tv_on busy

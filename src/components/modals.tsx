@@ -148,6 +148,13 @@ export const PairModal: FC<{ closeModal?: () => void }> = ({ closeModal }) => {
                 Pick <b>{name}</b> in the list and confirm.
               </li>
             </ol>
+            {bluetooth?.pairing && bluetooth.error && (
+              // What the service has to say about the open pairing mode matters now, not after
+              // it has timed out: for one, that another Bluetooth pairing screen is in the way.
+              <p style={{ ...paragraph, color: colors.warn, overflowWrap: "anywhere" }}>
+                Bluetooth problem: {bluetooth.error}
+              </p>
+            )}
             <p style={{ ...paragraph, color: colors.dim }}>
               If this machine does not show up: check that Bluetooth is on in SteamOS, move closer, and on the TV
               remove any earlier pairing with this machine first.

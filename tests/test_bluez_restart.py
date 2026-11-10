@@ -463,6 +463,122 @@ async def test_raw_notify_off_reports_not_subscribed(h):
     assert await remote.ensure_ready(5.0) is True and remote.state.delivery == "bluez"
 
 
+# --------------------------------------------------------------------------- (c2) what "auto" makes of the kernel
+
+
+@pytest.mark.parametrize(
+    "kernel, named",
+    [
+        (fake_bluez.OLD_KERNEL, "Linux 6.11.11-valve19-1-neptune-611"),
+        ("6.16.12-200.fc42.x86_64", "Linux 6.16.12-200.fc42.x86_64"),
+        ("garbage", "its version, 'garbage', could not be read"),  # unknown counts as old
+    ],
+)
+async def test_auto_does_not_use_direct_delivery_on_a_kernel_it_would_disturb(h, kernel, named):
+    remote, tv = await rebooted(h, android=12, raw_notify="auto", kernel=kernel)
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(5.0)
+    message = err.value.message
+    assert err.value.code == "not_subscribed"
+    # The user is told exactly what is going on and what the two ways out are.
+    assert "not used automatically on this kernel" in message and named in message and "6.17" in message
+    assert "(bluetooth.raw_notify) to 'on'" in message and "pair the TV again" in message
+    state = remote.state
+    assert state.connected and not state.ready and state.error == message
+    # Like "off": the link is left alone (a second link would be of no use), nothing is opened.
+    assert remote.bounces == 0 and tv.connections == 2 and h.raw.opened == 0 and h.raw.packets == []
+    assert h.bluez.advert is None
+    # What was learnt about the TV is kept: it is a fact about the TV, not about the kernel.
+    assert hint(h) is False
+    with pytest.raises(TransportError):
+        await remote.send_key("HOME", 0.01)
+
+    # "on" is the user's word that they want it anyway; it takes effect without a restart.
+    remote.apply_config(quick_config(tv_address=TV, raw_notify="on"))
+    assert await remote.ensure_ready(5.0) is True
+    assert remote.state.delivery == "raw" and remote.state.error == "" and remote.bounces == 1
+    await remote.send_key("HOME", 0.01)
+    assert tv.keys("raw") == [(CONSUMER, HOME), (CONSUMER, bytes(4))]
+    assert debt(h) == rawhci.boot_id()  # this kernel needs the repair
+
+    # ... and back: "auto" withdraws it at once, in the middle of a ready link.
+    remote.apply_config(quick_config(tv_address=TV, raw_notify="auto"))
+    assert not remote.state.ready and remote.state.delivery == ""
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(5.0)
+    assert err.value.code == "not_subscribed" and remote.bounces == 1
+
+
+@pytest.mark.parametrize("kernel", [fake_bluez.NEW_KERNEL, "6.17.0", "7.2.7-valve3-1-neptune"])
+async def test_auto_uses_direct_delivery_where_it_leaves_no_trace(h, kernel):
+    remote, tv = await rebooted(h, android=12, raw_notify="auto", kernel=kernel)
+    assert await remote.ensure_ready(5.0) is True
+    assert remote.state.delivery == "raw" and remote.bounces == 1 and hint(h) is False
+    await remote.send_key("HOME", 0.01)
+    assert tv.keys("raw") == [(CONSUMER, HOME), (CONSUMER, bytes(4))] and tv.ignored == []
+    # Nothing to repair on such a kernel: no record on disk, no command after the link closed.
+    assert debt(h) == ""
+    await tv.drop()
+    await eventually(lambda: not remote.state.connected)
+    await asyncio.sleep(0.1)
+    assert h.raw.commands == [] and debt(h) == ""
+
+
+async def test_on_uses_direct_delivery_on_a_new_kernel_too_without_a_repair(h):
+    remote, tv = await rebooted(h, android=12, raw_notify="on", kernel=fake_bluez.NEW_KERNEL)
+    assert await remote.ensure_ready(5.0) is True and remote.state.delivery == "raw"
+    await remote.send_key("HOME", 0.01)
+    await tv.drop()
+    await eventually(lambda: not remote.state.connected)
+    await asyncio.sleep(0.1)
+    assert h.raw.commands == [] and debt(h) == ""
+
+
+async def test_background_policy_does_not_bounce_a_link_direct_delivery_will_not_use(h):
+    """auto on an old kernel: the TV is called and left connected; reconnecting it would gain nothing."""
+    remote, tv = await rebooted(h, android=12, raw_notify="auto", reconnect_on_drop=True)
+    await eventually(lambda: remote.state.connected and h.bluez.advert is None, what="the TV to connect")
+    await asyncio.sleep(0.5)  # longer than resubscribe_wait and the settle time
+    assert remote.bounces == 0 and tv.connections == 2 and h.raw.opened == 0
+
+    # Before suspend the answer is immediate and honest, which leaves the Wi-Fi assist its time.
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(3.0)
+    assert err.value.code == "not_subscribed" and remote.bounces == 0
+
+    # Allowing it starts the preparation right away, without anybody asking for the TV.
+    remote.apply_config(quick_config(tv_address=TV, raw_notify="on", reconnect_on_drop=True))
+    await eventually(lambda: remote.bounces == 1 and tv.connections == 3 and remote.state.connected, what="bounce")
+    assert await remote.ensure_ready(3.0) is True and remote.state.delivery == "raw"
+
+
+async def test_a_tv_known_to_stay_silent_is_reported_sooner_when_direct_delivery_is_not_used(h):
+    remote, tv = await rebooted(h, android=12, raw_notify="auto", resubscribe_wait=4.0)
+    assert remote._resubscribe_wait() == 4.0
+    with pytest.raises(TransportError):
+        await remote.ensure_ready(10.0)
+    assert hint(h) is False
+
+    # Another reboot: the full wait would only keep the Wi-Fi assist from having its turn.
+    await remote.stop()
+    await h.bluez.restart()
+    fresh = await h.remote(tv_address=TV, raw_notify="auto", resubscribe_wait=4.0)
+    assert fresh._resubscribe_wait() < 0.3
+    started = time.monotonic()
+    with pytest.raises(TransportError) as err:
+        await fresh.ensure_ready(10.0)
+    assert err.value.code == "not_subscribed" and time.monotonic() - started < 4.0 - 0.5
+
+    # A TV that subscribes after all (it got its Android 14 update) is believed again.
+    await tv.subscribe()
+    assert await fresh.ensure_ready(5.0) is True and fresh.state.delivery == "bluez" and hint(h) is True
+
+
+async def test_always_is_unchanged_by_the_kernel(h):
+    remote, tv = await h.paired_remote(android=12, raw_notify="always", kernel=fake_bluez.OLD_KERNEL)
+    assert await remote.ensure_ready(5.0) is True and remote.state.delivery == "raw"
+
+
 @pytest.mark.parametrize(
     "error, text",
     [

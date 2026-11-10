@@ -24,15 +24,31 @@ class TransportError(RpcError):
     """A transport cannot do what was asked, for a reason the user can act on.
 
     Codes used: ``not_paired``, ``no_adapter``, ``bluetooth_off``, ``not_connected``,
-    ``not_subscribed`` (the TV is connected but will not receive keys until it is paired
-    again), ``bluetooth_error``, ``wifi_not_configured``, ``wifi_not_paired``,
-    ``wifi_unreachable``, ``wifi_error``, ``pairing_failed``.
+    ``not_subscribed`` (the TV is connected but will not receive keys: it has to be paired
+    again, or direct delivery has to be allowed - the message says which applies),
+    ``bluetooth_error``, ``wifi_not_configured``, ``wifi_not_paired``, ``wifi_unreachable``,
+    ``wifi_error``, ``pairing_failed``.
     """
 
 
 @dataclass
 class BleState:
-    """Snapshot of the Bluetooth remote, shown verbatim in the UI."""
+    """Snapshot of the Bluetooth remote, shown verbatim in the UI.
+
+    ``subscribed`` is about the paired TV only: it is False whenever no TV is paired, even if
+    BlueZ still holds the subscription of a TV that has been forgotten since.
+
+    ``error`` is one human-readable sentence, "" when there is nothing to say.  It carries,
+    in this order of precedence: the last problem that stopped the TV from being reached
+    (the message of the :class:`TransportError` that was raised, or why a wait ended without
+    the TV, e.g. "the TV did not connect over Bluetooth"; for ``not_subscribed`` it says
+    whether pairing again or allowing direct delivery is the way out); otherwise something
+    about pairing mode - while it is open, a warning that needs acting on *now* (this machine
+    is also discoverable over classic Bluetooth), and after it closed without a TV, how it
+    ended (timed out, interrupted because Bluetooth went away, the TV's address was not
+    reported).  A window the user cancelled, and one that paired a TV, leave nothing.  All of
+    it is cleared when the TV becomes ready for keys and when pairing mode is opened.
+    """
 
     available: bool = False        # BlueZ is reachable and an adapter exists
     adapter: str = ""              # e.g. "hci0"
@@ -47,9 +63,9 @@ class BleState:
     tv_name: str = ""
     connected: bool = False        # the TV currently holds a link to us
     ready: bool = False            # connected and settled: keys can be sent right now
-    subscribed: bool = False       # BlueZ holds the TV's notification subscription
+    subscribed: bool = False       # BlueZ holds the paired TV's notification subscription (see above)
     delivery: str = ""             # how keys travel while ready: "bluez" or "raw" ("" if not ready)
-    error: str = ""                # last problem, human readable ("" when fine)
+    error: str = ""                # last problem or pairing note, human readable (see above)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -93,13 +109,45 @@ class Remote(Protocol):
     async def start_pairing(self, timeout: float) -> None:
         """Open pairing mode: become discoverable and accept one bond for ``timeout`` seconds."""
 
-    async def cancel_pairing(self) -> None: ...
+    async def cancel_pairing(self) -> None:
+        """Close pairing mode and return once everything it changed has been put back.
+
+        Usually that is immediate.  It takes about two seconds when a TV bonded in the
+        window without finishing: its bond is removed again (it would block that TV's next
+        attempt), and BlueZ drops the TV's link before it answers.  A TV that has just
+        finished pairing is still stored.  Does nothing when pairing mode is not open.
+        """
 
     async def forget(self) -> None:
         """Remove the bond with the TV."""
 
-    async def disconnect(self) -> None:
-        """Drop the link to the TV (and stop advertising) if there is one."""
+    async def disconnect(self, *, fast: bool = False) -> None:
+        """Drop the link to the TV (and stop advertising) if there is one.
+
+        The link is then "parked": the TV is not called again until the next
+        :meth:`ensure_ready` or :meth:`resume_link`, whatever ``reconnect_on_drop`` says.
+
+        Without ``fast`` this returns when the link is down, which takes about two seconds
+        (BlueZ's own delay).  ``fast=True`` is for the moments before the machine sleeps or
+        powers off: the link is ended at once and with the reason code a remote control gives
+        (0x13, "remote user terminated connection") - if the machine went down with the link
+        up, the kernel would end it with "power off" (0x15), after which several Android
+        versions do not connect to a remote again by themselves.  The request to end the link
+        is made within a fraction of a second (a report sent just before is given that time
+        to go out) and is not taken back if the caller stops waiting; the call returns when
+        the link is down or shortly after the request was made, whichever comes first.  Where
+        the fast way is not available it falls back to the normal one.
+        """
+
+    def resume_link(self) -> None:
+        """The machine is awake (again): a parked link may be brought up in the background.
+
+        Called by the service at every boot and resume, before it decides whether anything
+        is sent to the TV.  Synchronous, cheap, never raises.  It only lifts what
+        :meth:`disconnect` imposed: nothing happens unless ``reconnect_on_drop`` is on and a
+        TV is bonded, and a link that is configured to be dropped when idle
+        (``idle_disconnect_seconds``) stays down until there is something to send.
+        """
 
 
 class WifiAssist(Protocol):

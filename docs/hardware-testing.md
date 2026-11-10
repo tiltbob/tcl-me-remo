@@ -65,6 +65,38 @@ check that advertising is on (look for `LE Set Advertising Enable` / extended ad
 If the TV starts pairing and fails: run `sudo busctl monitor org.bluez` during the attempt;
 the question is whether `RequestAuthorization` reached this service's agent or Steam's.
 
+Two more runs, once plain pairing works. Forget the TV on both sides before each.
+
+**T1a. With another Bluetooth pairing screen open.** In Desktop Mode open the Bluetooth
+settings page (it makes the adapter discoverable over classic Bluetooth for as long as it is
+open), leave it open and start pairing mode.
+
+Expected: the pairing dialog and `tcl-me-remo status` show a Bluetooth problem that says the
+machine is also discoverable over classic Bluetooth; the warning goes away within a second or
+two of closing the settings page, and comes back if it is opened again.
+
+Record: whether the warning appeared, what the TV's list showed while the page was open (the
+machine once, twice, as what kind of device), and whether pairing from the TV worked in that
+state. If it failed, a `btmon` trace shows whether the TV tried classic pairing (`Connect
+Request` / `IO Capability Request` instead of an LE connection). `bluetoothctl show | grep
+Discoverable` before and after confirms that the service did not change the setting.
+
+**T1b. A pairing aborted half-way, then pairing again.** Start pairing mode, choose the
+machine on the TV, and as soon as the TV says it is pairing or connecting, leave the TV's
+pairing screen (Back), or switch the TV off at the wall. Then either let pairing mode time
+out or cancel it.
+
+Expected: no TV is stored (`tcl-me-remo status` shows none). If the TV got as far as bonding,
+the log has `removed the bond of … which paired without completing`, `bluetoothctl devices
+Paired` no longer lists the TV, and cancelling took up to about two seconds instead of
+returning at once. A second, normal pairing right afterwards works; on the TV, remove the
+half-made entry first if it shows one.
+
+Record: how far the TV got (the log says whether it bonded), how long cancel took, whether
+the bond was gone afterwards, and whether the second pairing worked. If the second pairing
+is refused without any prompt, check `bluetoothctl devices Paired`: a leftover bond is the
+cause, and that is a bug to report with the log.
+
 ## T2. Keys arrive and mean the right thing
 
 With the TV on:
@@ -140,6 +172,46 @@ and whether `TV off` came through `Bluetooth` or failed. Repeat with the TV link
 the TV off and on with its own remote first): the service then has about 3 seconds to
 reconnect.
 
+**T5a. How the link ends, and whether the TV comes back.** The service ends the link itself
+just before the machine sleeps, so that the TV is told "remote user terminated" (0x13) and
+not "power off" (0x15), which the kernel would send. Neither that this happens nor that it
+makes a difference has been seen on hardware. Record a trace across the suspend, in a
+terminal that survives it (ssh, or Desktop Mode), and read it afterwards:
+
+```sh
+sudo btmon -w /tmp/t5.btsnoop        # start, suspend and wake as above, wait 30 s, Ctrl+C
+btmon -r /tmp/t5.btsnoop | grep -E -A6 "MGMT Command: Disconnect|HCI Command: Disconnect|Disconnect Complete|LE.*Connection Complete"
+```
+
+In the trace, before the suspend:
+
+- `@ MGMT Command: Disconnect (0x0014)` with the TV's address: the service's request. A line
+  `could not end the TV link through the kernel` in `tcl-me-remo logs` instead means it fell
+  back to BlueZ; record the reason it gives.
+- `< HCI Command: Disconnect` with `Reason: Remote User Terminated Connection (0x13)`, and
+  `> HCI Event: Disconnect Complete` with `Reason: Connection Terminated By Local Host
+  (0x16)`, both before the machine sleeps. A Disconnect with `Remote Device Terminated due
+  to Power Off (0x15)` for the TV's handle means the kernel got there first: record the
+  times of both.
+- The key-up of `SLEEP` (an `ATT: Handle Value Notification` with an all-zero value) goes
+  out before the Disconnect, and the TV turns off.
+
+After the wake, without touching anything: does `tcl-me-remo status` show `connected` again
+within about ten seconds (`Keep calling the TV` on), and does the trace show the TV's `LE
+Connection Complete`? This is the question the reason code is about. Record it together with
+the TV's Android version.
+
+For comparison, once: `sudo systemctl stop tcl-me-remo` with the TV connected, suspend, wake,
+`sudo systemctl start tcl-me-remo`. Now the kernel ends the link (0x15 in the trace). Does
+the TV connect after this wake as well? If it reconnects after 0x13 and not after 0x15 (or
+the other way round, or always, or never), that is worth a line in `hardware-results/` on
+its own.
+
+Also try a wake on which nothing is sent to the TV (`tcl-me-remo config events.resume_tv_on
+false`, and `events.resume_switch_input false`): the log should show `the machine is awake
+again: calling the TV in the background`, and the link should be back without any action
+having run. Set the options back afterwards.
+
 ## T6. After a reboot (the subscription problem)
 
 BlueZ forgets which keys the TV subscribed to whenever `bluetoothd` restarts, which includes
@@ -159,6 +231,55 @@ Record: `delivery` (`bluez` means the TV re-subscribed, `raw` means direct deliv
 the log shows a reconnect ("bounce") and whether HOME reached the TV. Take a
 `sudo btmon -w /tmp/t6.btsnoop` trace of this test; it shows the Service Changed indication,
 any CCC writes by the TV, and the injected notification.
+
+What happens next depends on the kernel. `tcl-me-remo doctor` has a `direct delivery` line
+that names the kernel and says what the setting comes to; `uname -r` is the same version.
+
+**If the TV subscribes again** (`delivery: bluez`): Android 14 or newer, nothing more to
+test here. Record it.
+
+**If it does not, on Linux 6.17 or newer** (direct delivery is used by default):
+
+- In the trace, each key is two `ATT: Handle Value Notification` packets (press, release)
+  on the TV's connection handle that BlueZ did not send: handle `0x010a`, `0x010e` or
+  `0x0112`, the second with an all-zero value. HOME is `0x010e` with value `23 02 00 00`.
+- The TV reacts to the key. With adb, `getevent -lt` shows it arriving.
+- `sudo dmesg | grep "sent 0 < count"` shows one kernel warning per injected packet. That
+  is expected on these kernels and is the whole of the side effect; record that the lines
+  are there and that nothing else is.
+
+**If it does not, on a kernel before 6.17** (SteamOS 3.7's 6.11, for one): with the default
+`auto`, `tcl-me-remo connect` fails with a message that names the kernel and says direct
+delivery is not used automatically. Record the message. Then, with the person's agreement
+(the next steps touch the Bluetooth accounting their controllers depend on; have a second
+way to control the machine at hand):
+
+```sh
+tcl-me-remo config bluetooth.raw_notify on
+tcl-me-remo connect ; tcl-me-remo status ; tcl-me-remo key HOME
+```
+
+- As above: the injected notifications in the trace, and the TV reacting.
+- Send about ten keys, then close the link (`tcl-me-remo disconnect`) with the trace still
+  running. Right after the TV's `Disconnect Complete` the trace must show `< HCI Command: LE
+  Read Buffer Size` that BlueZ did not send, and its `Command Complete`. Record the `Num
+  data packets` (LE buffer count) in that answer. If it is 0, the controller shares its
+  buffers with classic Bluetooth and a `Read Buffer Size` command must follow; record
+  whether it did.
+- For the shared-buffer case, compare with the classic figure `hciconfig hci0` prints
+  (`ACL MTU: <size>:<count>`). The LE figure is only in the controller's own answer; do not
+  ask for it by hand with `hcitool cmd`, the question itself resets the kernel's count.
+- Then the part that matters to the user. Connect a Bluetooth LE controller (an Xbox
+  Series or 8BitDo pad in LE mode) and a Bluetooth headset, and use both for a few minutes:
+  inputs arrive without lag or drop-outs, audio plays without stutter, and turning the
+  controller off and on reconnects it. Do this once after a single key and once after
+  thirty or more (`for i in $(seq 15); do tcl-me-remo key DOWN; tcl-me-remo key UP; done`,
+  then disconnect): the count of transmit slots the repair has to restore grows with the
+  number of keys.
+- If anything stalls: `tcl-me-remo doctor`, the trace, `sudo dmesg | tail -50`, then switch
+  Bluetooth off and on (that resets the controller's counters) and set `bluetooth.raw_notify`
+  back to `auto`. This is the result that decides whether `on` may ever become the default
+  on these kernels; write it down either way.
 
 Then the real thing: put the TV in standby, reboot the machine, and see whether the TV comes
 on. `tcl-me-remo logs -n 60` afterwards shows the boot action.

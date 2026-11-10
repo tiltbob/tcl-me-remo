@@ -1,4 +1,4 @@
-"""A fake ``org.bluez`` for the private test bus, plus a fake TV and a fake raw HCI backend.
+"""A fake ``org.bluez`` for the private test bus, plus a fake TV and fake kernel sockets (raw HCI, management).
 
 The fake follows what bluetoothd 5.79 does where the product depends on it:
 
@@ -48,7 +48,7 @@ import logging
 from typing import Any, Callable
 
 from tcl_me_remo import dbus
-from tcl_me_remo.bluez import BleRemote, rawhci
+from tcl_me_remo.bluez import BleRemote, mgmt, rawhci
 from tcl_me_remo.bluez import remote as remote_module
 from tcl_me_remo.config import BluetoothConfig
 from tcl_me_remo.dbus import DBusError, Message, MessageFlag, MessageType, Variant
@@ -167,17 +167,29 @@ class _App:
 class FakeDevice:
     """A peer device as bluetoothd sees it, driven by the test as if it were the TV."""
 
-    def __init__(self, bluez: FakeBluez, adapter: str, address: str, *, name: str, rpa: str, android: int):
+    def __init__(
+        self,
+        bluez: FakeBluez,
+        adapter: str,
+        address: str,
+        *,
+        name: str,
+        rpa: str,
+        android: int,
+        identity_type: str = "public",
+    ):
         self.bluez = bluez
         self.adapter = adapter
         self.identity = address.upper()
+        #: Kind of the identity address: "public", or "random" for a static random address.
+        self.identity_type = identity_type
         self.rpa = rpa.upper()
         self.name = name
         self.android = android
         self.path_address = self.rpa or self.identity
         self.props: dict[str, Any] = {
             "Address": self.path_address,
-            "AddressType": "random" if self.rpa else "public",
+            "AddressType": "random" if self.rpa else identity_type,
             "Name": name,
             "Alias": name or self.path_address.replace(":", "-"),
             "Adapter": adapter,
@@ -189,6 +201,9 @@ class FakeDevice:
         }
         self.present = False
         self.conn_handle = 0
+        #: The kernel never resolved the TV's private address: it lists the link under that
+        #: address although bluetoothd reports the device under its identity address.
+        self.kernel_keeps_rpa = False
         #: Behave like the Android HID host: reconnect when bonded and a connectable advert appears.
         self.auto_connect = False
         self.connect_delay = 0.02
@@ -220,7 +235,14 @@ class FakeDevice:
     @property
     def hci_address(self) -> str:
         """The address the kernel lists for the link: the identity once the IRK is known."""
+        if self.kernel_keeps_rpa and self.rpa:
+            return self.rpa
         return self.identity if self.bonded else self.path_address
+
+    @property
+    def hci_address_type(self) -> str:
+        """The kind of address the kernel tracks the link by ("public" or "random")."""
+        return self.identity_type if self.hci_address == self.identity else "random"
 
     def _set(self, **changes: Any) -> None:
         self.props.update(changes)
@@ -300,7 +322,7 @@ class FakeDevice:
                 return False
         if self.rpa:
             # Key distribution delivered the identity address; the object path stays.
-            self._set(Address=self.identity, AddressType="public")
+            self._set(Address=self.identity, AddressType=self.identity_type)
         self._set(Paired=True, Bonded=True)
         self.listening = True
         return True
@@ -450,6 +472,7 @@ class FakeBluez:
         self.unsupported_advert_properties: set[str] = set()
         self.max_adverts = 5
         self.disconnect_delay = 0.03                # real bluetoothd: 2 s
+        self.disconnect_calls = 0                   # Device1.Disconnect calls received
         self.power_on_delay = 0.02
         self.advert_register_delay = 0.0            # a busy bluetoothd answers RegisterAdvertisement late
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -558,13 +581,18 @@ class FakeBluez:
         android: int = 12,
         adapter: str = "hci0",
         bonded: bool = False,
+        identity_type: str = "public",
     ) -> FakeDevice:
         """Create a peer.  ``bonded=True`` gives a TV that paired in an earlier daemon life."""
-        device = FakeDevice(self, f"{ROOT}/{adapter}", address, name=name, rpa=rpa, android=android)
+        device = FakeDevice(
+            self, f"{ROOT}/{adapter}", address, name=name, rpa=rpa, android=android, identity_type=identity_type
+        )
         self.devices.append(device)
         if bonded:
             device.path_address = device.identity
-            device.props.update(Address=device.identity, AddressType="public", Paired=True, Bonded=True, Trusted=True)
+            device.props.update(
+                Address=device.identity, AddressType=identity_type, Paired=True, Bonded=True, Trusted=True
+            )
             device.service_changed_pending = True
             if self.running:
                 self.add_device_object(device)
@@ -730,6 +758,7 @@ class FakeBluez:
                 return await self._remove_device(adapter, body[0], after)
         device = self.device_at(path) if path else None
         if device is not None and interface == DEVICE and member == "Disconnect":
+            self.disconnect_calls += 1
             if device.connected:
                 await asyncio.sleep(self.disconnect_delay)  # the reply comes once the link is down
                 await device.drop()
@@ -1135,6 +1164,114 @@ class _FakeRawBackend:
             self._dev_id = -1
 
 
+# --------------------------------------------------------------------------- fake management socket
+
+
+class FakeMgmtHub:
+    """Stands in for the kernel side of a management control socket (mgmt.py).
+
+    "Disconnect" is looked up the way the kernel does it: by the address *and* the address
+    type it tracks the link by.  A link that is found goes down a moment later, as it would
+    once the controller reports Disconnection Complete, and bluetoothd (the fake one) then
+    says so on D-Bus; the command's own answer follows that, as in the kernel.
+    """
+
+    def __init__(self, bluez: FakeBluez):
+        self.bluez = bluez
+        self.open_error: OSError | None = None
+        self.send_error: OSError | None = None
+        #: Answer every Disconnect with this status instead of carrying it out (0x0A = busy).
+        self.refuse_status: int | None = None
+        #: Seconds until that refusal arrives.  Kernels from 6.11 on look the link up in a work
+        #: item, so "not connected" comes a moment after the command was accepted.
+        self.refuse_delay = 0.0
+        #: False: the controller never reports the link down (the TV stopped answering).
+        self.completes = True
+        self.disconnect_delay = 0.01
+        self.opened = 0
+        self.closed = 0
+        self.commands: list[bytes] = []   # every packet written to a control socket
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def backend(self) -> _FakeMgmtBackend:
+        return _FakeMgmtBackend(self)
+
+    def closer(self, raw: FakeRawHub) -> mgmt.LinkCloser:
+        return mgmt.LinkCloser(self.backend, raw.backend)
+
+    def find(self, dev_id: int, address: bytes, address_type: int) -> FakeDevice | None:
+        wanted = rawhci.format_bdaddr(address)
+        kind = {mgmt.BDADDR_LE_PUBLIC: "public", mgmt.BDADDR_LE_RANDOM: "random"}.get(address_type)
+        for device in self.bluez.devices:
+            if device.adapter == f"{ROOT}/hci{dev_id}" and device.connected:
+                if device.hci_address == wanted and device.hci_address_type == kind:
+                    return device
+        return None
+
+    def spawn(self, coro: Any) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+
+class _FakeMgmtBackend:
+    def __init__(self, hub: FakeMgmtHub):
+        self._hub = hub
+        self._open = False
+        self._events: list[bytes] = []
+
+    def open(self) -> None:
+        if self._hub.open_error is not None:
+            raise self._hub.open_error
+        self._open = True
+        self._hub.opened += 1
+
+    def _answer(self, dev_id: int, opcode: int, status: int, params: bytes = b"") -> None:
+        body = opcode.to_bytes(2, "little") + bytes([status]) + params
+        self._events.append(mgmt.EV_CMD_COMPLETE.to_bytes(2, "little") + dev_id.to_bytes(2, "little")
+                            + len(body).to_bytes(2, "little") + body)  # fmt: skip
+
+    def send(self, packet: bytes) -> None:
+        if self._hub.send_error is not None:
+            raise self._hub.send_error
+        self._hub.commands.append(bytes(packet))
+        opcode, dev_id, length = (int.from_bytes(packet[i : i + 2], "little") for i in (0, 2, 4))
+        params = packet[6:]
+        if opcode != mgmt.OP_DISCONNECT or length != len(params) or length != 7:
+            self._answer(dev_id, opcode, 0x0D)  # invalid parameters
+            return
+        if self._hub.refuse_status is not None:
+            if self._hub.refuse_delay > 0:
+                self._hub.spawn(self._refuse_later(dev_id, self._hub.refuse_status, params))
+            else:
+                self._answer(dev_id, opcode, self._hub.refuse_status, params)
+            return
+        device = self._hub.find(dev_id, params[:6], params[6])
+        if device is None:
+            self._answer(dev_id, opcode, 0x02, params)  # not connected
+        elif self._hub.completes:
+            self._hub.spawn(self._carry_out(device, dev_id, params))
+
+    async def _refuse_later(self, dev_id: int, status: int, params: bytes) -> None:
+        await asyncio.sleep(self._hub.refuse_delay)
+        if self._open:
+            self._answer(dev_id, mgmt.OP_DISCONNECT, status, params)
+
+    async def _carry_out(self, device: FakeDevice, dev_id: int, params: bytes) -> None:
+        await asyncio.sleep(self._hub.disconnect_delay)
+        await device.drop()
+        if self._open:
+            self._answer(dev_id, mgmt.OP_DISCONNECT, 0x00, params)
+
+    def receive(self) -> bytes | None:
+        return self._events.pop(0) if self._events else None
+
+    def close(self) -> None:
+        if self._open:
+            self._open = False
+            self._hub.closed += 1
+
+
 @contextlib.asynccontextmanager
 async def running(**kwargs: Any):
     """``async with fake_bluez.running() as bluez`` - a started fake that is stopped afterwards."""
@@ -1170,17 +1307,28 @@ def quick_config(**overrides: Any) -> BluetoothConfig:
         "key_gap_ms": 20,
         # Most tests want to see exactly the advertising they asked for.
         "reconnect_on_drop": False,
+        # The reboot tests are about direct delivery itself, on the kind of kernel that needs
+        # its traces repaired (Harness.kernel).  What "auto" makes of a kernel is tested by name.
+        "raw_notify": "on",
     }
     values.update(overrides)
     return BluetoothConfig(**values)
 
 
+#: Kernel releases for the two cases the transport tells apart (rawhci.FIXED_KERNEL).
+OLD_KERNEL = "6.11.11-valve19-1-neptune-611"
+NEW_KERNEL = "6.17.2-arch1-1"
+
+
 class Harness:
-    """A fake bluetoothd, a fake raw HCI hub and a factory for remotes wired to both."""
+    """A fake bluetoothd, fake kernel sockets and a factory for remotes wired to them."""
 
     def __init__(self, bluez: FakeBluez, tmp_path: Any):
         self.bluez = bluez
         self.raw = FakeRawHub(bluez)
+        self.mgmt = FakeMgmtHub(bluez)
+        #: The kernel the remotes believe they run on, unless a test names another.
+        self.kernel = OLD_KERNEL
         self.state_path = tmp_path / "bluetooth.json"
         self.paired: list[tuple[str, str]] = []   # what on_paired was called with
         self._buses: list[Any] = []
@@ -1191,11 +1339,24 @@ class Harness:
         self._buses.append(bus)
         return bus
 
-    async def remote(self, cfg: BluetoothConfig | None = None, *, start: bool = True, **overrides: Any) -> BleRemote:
+    async def remote(
+        self,
+        cfg: BluetoothConfig | None = None,
+        *,
+        start: bool = True,
+        kernel: str | None = None,
+        **overrides: Any,
+    ) -> BleRemote:
         """A started remote on its own bus connection; ``overrides`` are config fields."""
         cfg = dataclasses.replace(cfg, **overrides) if cfg is not None else quick_config(**overrides)
+        kernel = kernel if kernel is not None else self.kernel
         remote = BleRemote(
-            await self.bus(), cfg, state_path=self.state_path, raw_link=self.raw.link(repair_credits=True)
+            await self.bus(),
+            cfg,
+            state_path=self.state_path,
+            raw_link=self.raw.link(repair_credits=rawhci.kernel_needs_credit_repair(kernel)),
+            link_closer=self.mgmt.closer(self.raw),
+            kernel_release=kernel,
         )
 
         async def on_paired(address: str, name: str) -> None:
@@ -1216,11 +1377,11 @@ class Harness:
         await eventually(lambda: not remote.state.pairing and remote.state.paired, what="pairing to complete")
 
     async def paired_remote(
-        self, *, android: int = 12, rpa: str = "", **overrides: Any
+        self, *, android: int = 12, rpa: str = "", identity_type: str = "public", **overrides: Any
     ) -> tuple[BleRemote, FakeDevice]:
         """A remote and a TV that paired with it in this bluetoothd lifetime; the link is up."""
         remote = await self.remote(**overrides)
-        tv = self.bluez.add_device(android=android, rpa=rpa)
+        tv = self.bluez.add_device(android=android, rpa=rpa, identity_type=identity_type)
         tv.auto_connect = True
         await self.pair(remote, tv)
         return remote, tv

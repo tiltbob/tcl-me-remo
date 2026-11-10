@@ -63,6 +63,12 @@ What it costs - read this before relying on it
       the link was still up.
     * Linux >= 6.17 clamps both places.  Nothing leaks, but the kernel logs a warning
       ("hcon ... sent 0 < count 1") for every injected packet.
+
+    The repair is derived from source like everything else here, and what it has to prevent
+    (a stalled transmit queue for the user's game controllers) is worse than what this path
+    cures.  remote.py therefore uses the path of its own accord only where no repair is
+    needed (``bluetooth.raw_notify = auto``, :func:`direct_delivery_is_free`); on older
+    kernels the user has to ask for it (``on``).
     * A kernel L2CAP frame that the controller is still receiving in fragments could be
       interrupted by an injected packet.  Reports are sent on an idle link, well after
       connection set-up, and LE controllers with data length extension do not fragment at
@@ -294,15 +300,56 @@ def dev_id_from_adapter(adapter: str) -> int:
     return int(match.group(1))
 
 
-def kernel_needs_credit_repair(release: str | None = None) -> bool:
-    """True for kernels that leak transmit credits after injected packets (see module docs)."""
+def kernel_version(release: str | None = None) -> tuple[int, int] | None:
+    """``"6.11.11-valve19-1-neptune-611"`` -> ``(6, 11)``; None if the text does not start like a version."""
     match = re.match(r"(\d+)\.(\d+)", release if release is not None else platform.release())
-    if not match:
-        return True  # unknown: the repair is harmless on a fixed kernel
-    return (int(match.group(1)), int(match.group(2))) < FIXED_KERNEL
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def direct_delivery_is_free(release: str | None = None) -> bool:
+    """Whether injected packets leave the kernel's packet accounting alone (module docstring).
+
+    True from Linux 6.17 on, which clamps the counters.  A release that cannot be read counts
+    as old: the decision this feeds ("use direct delivery without being asked") must err on
+    the side of the user's other Bluetooth devices.
+    """
+    version = kernel_version(release)
+    return version is not None and version >= FIXED_KERNEL
+
+
+def kernel_needs_credit_repair(release: str | None = None) -> bool:
+    """True for kernels that leak transmit credits after injected packets (see module docs).
+
+    An unreadable release counts as old here too: the repair is harmless on a fixed kernel.
+    """
+    return not direct_delivery_is_free(release)
 
 
 # --------------------------------------------------------------------------- OS access
+
+
+def open_hci_socket(dev_id: int, channel: int) -> socket.socket:
+    """An HCI socket bound to ``dev_id`` on ``channel``.  Raises ``OSError``.
+
+    The numeric address family works even when Python was built without Bluetooth support;
+    only bind() needs that support to build the address.  Python's own bind() can moreover
+    only name the raw channel (before 3.14), so every other channel, and every Python without
+    Bluetooth support, binds through libc with a ``struct sockaddr_hci`` packed here.
+    """
+    sock = socket.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
+    try:
+        if channel == HCI_CHANNEL_RAW and hasattr(socket, "AF_BLUETOOTH"):
+            sock.bind((dev_id,))
+        else:
+            libc = ctypes.CDLL(None, use_errno=True)
+            address = _SOCKADDR_HCI.pack(AF_BLUETOOTH, dev_id, channel)
+            if libc.bind(sock.fileno(), address, len(address)) != 0:
+                code = ctypes.get_errno()
+                raise OSError(code, os.strerror(code))
+    except BaseException:
+        sock.close()
+        raise
+    return sock
 
 
 class RawBackend(Protocol):
@@ -336,26 +383,7 @@ class HciSocketBackend:
 
     def open(self, dev_id: int) -> None:
         self.close()
-        # The numeric family works even when Python was built without Bluetooth support;
-        # only address parsing in bind() needs that support.
-        sock = socket.socket(AF_BLUETOOTH, socket.SOCK_RAW, BTPROTO_HCI)
-        try:
-            if hasattr(socket, "AF_BLUETOOTH"):
-                sock.bind((dev_id,))
-            else:
-                self._bind_with_libc(sock.fileno(), dev_id)
-        except BaseException:
-            sock.close()
-            raise
-        self._sock, self._dev_id = sock, dev_id
-
-    @staticmethod
-    def _bind_with_libc(fd: int, dev_id: int) -> None:
-        libc = ctypes.CDLL(None, use_errno=True)
-        address = _SOCKADDR_HCI.pack(AF_BLUETOOTH, dev_id, HCI_CHANNEL_RAW)
-        if libc.bind(fd, address, len(address)) != 0:
-            code = ctypes.get_errno()
-            raise OSError(code, os.strerror(code))
+        self._sock, self._dev_id = open_hci_socket(dev_id, HCI_CHANNEL_RAW), dev_id
 
     def _need(self) -> socket.socket:
         if self._sock is None:
@@ -399,7 +427,7 @@ class HciSocketBackend:
             self._sock = None
 
 
-def _explain(exc: OSError) -> str:
+def explain_os_error(exc: OSError) -> str:
     if exc.errno in (errno.EPERM, errno.EACCES):
         return "the service lacks permission for raw Bluetooth access (it must run as root)"
     if exc.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT):
@@ -456,7 +484,7 @@ class RawLink:
             connection = find_tv_link(backend.connections(), tv_address)
         except OSError as exc:
             self._close(backend)
-            raise RawError(_explain(exc)) from None
+            raise RawError(explain_os_error(exc)) from None
         except RawError:
             self._close(backend)
             raise
@@ -472,7 +500,7 @@ class RawLink:
         try:
             self._backend.send(packet)
         except OSError as exc:
-            raise RawError(_explain(exc)) from None
+            raise RawError(explain_os_error(exc)) from None
         self.injected += 1
 
     def detach(self) -> None:
@@ -528,9 +556,9 @@ class RawLink:
         except OSError as exc:
             if exc.errno in (errno.ENODEV, errno.ENETDOWN):
                 # The controller is gone or off: its counters start from scratch when it is back.
-                log.debug("raw: nothing to rebuild, %s", _explain(exc))
+                log.debug("raw: nothing to rebuild, %s", explain_os_error(exc))
             else:
-                log.warning("raw: could not rebuild the kernel's credit count: %s", _explain(exc))
+                log.warning("raw: could not rebuild the kernel's credit count: %s", explain_os_error(exc))
         finally:
             self._close(backend)
 

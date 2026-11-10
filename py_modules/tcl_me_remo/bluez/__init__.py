@@ -5,6 +5,7 @@
     agent.py    the pairing agent used inside the pairing window
     adapter.py  a live mirror of bluetoothd's adapters and devices
     rawhci.py   direct delivery of notifications when bluetoothd has lost the TV's subscription
+    mgmt.py     ending the TV link at once, through the kernel, before the machine sleeps
     store.py    the little that must be remembered across reboots
     remote.py   BleRemote, the state machine that implements interfaces.Remote
 """

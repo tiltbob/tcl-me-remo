@@ -47,7 +47,8 @@ EVENTS = UP_EVENTS + DOWN_EVENTS
 
 # Seconds a "down" action may take when the caller gives no budget.  logind lets delay
 # inhibitors hold a suspend/shutdown for InhibitDelayMaxSec (5 s by default); the budget plus
-# the final disconnect (DISCONNECT_SECONDS) must stay under that.
+# the final disconnect (DISCONNECT_SECONDS) must stay under that, with room for the lock to be
+# released: 3.5 + 0.5 = 4.0 of 5 s.
 DEFAULT_DOWN_BUDGET = 3.5
 # Budget for a manually requested "TV off".
 MANUAL_OFF_BUDGET = 20.0
@@ -56,6 +57,10 @@ MANUAL_OFF_BUDGET = 20.0
 FLUSH_SECONDS = 0.4
 # A change of more than this in (CLOCK_BOOTTIME - CLOCK_MONOTONIC) means the machine slept.
 SLEEP_JUMP_SECONDS = 1.0
+# How long the final disconnect of a down action is waited for.  It is a fast one (the
+# transport asks the kernel, which ends the link at once and with the reason code a remote
+# control uses); the transport makes that request within the first fraction of this time and
+# does not take it back when the wait ends, so the wait only bounds how long we look on.
 DISCONNECT_SECONDS = 0.5
 HISTORY_LENGTH = 20
 
@@ -151,7 +156,22 @@ class Service:
 
     def cancel_shutdown(self) -> None:
         """A shutdown was called off (logind PrepareForShutdown(false)): we are running again."""
+        went_down = self.phase != Phase.RUNNING
         self.phase = Phase.RUNNING
+        if went_down:
+            self._resume_link()  # the down action closed the link for a shutdown that is not coming
+
+    def _resume_link(self) -> None:
+        """Tell the Bluetooth remote that the machine is up (again): it may call the TV again.
+
+        The link the last down action closed stays closed until something is sent, and on a
+        wake where nothing is (display check, settings) that would be the next suspend, which
+        then has three seconds to get the TV back.
+        """
+        try:
+            self.remote.resume_link()
+        except Exception:  # noqa: BLE001 - never raises by contract; a lifecycle event must not die of it
+            log.exception("could not resume the Bluetooth link")
 
     async def _handle_up(self, name: str, simulate: bool) -> dict[str, Any]:
         if not simulate:
@@ -167,6 +187,8 @@ class Service:
                     return self._skipped("tv_on", name, "duplicate resume event ignored")
             self.phase = Phase.RUNNING
             self._offset_seen = self._sleep_offset()
+            # A real boot or wake, whatever is decided below about the TV.
+            self._resume_link()
 
         cfg = self.cfg
         want_on = bool(getattr(cfg.events, f"{name}_tv_on"))
@@ -229,15 +251,18 @@ class Service:
                 return await self._do_tv_off(trace)
             finally:
                 # Leave no half-open link behind: after a suspend the radio state is gone and
-                # a stale "connected" would swallow the wake key.  Shielded so that running
-                # out of budget does not skip it.
+                # a stale "connected" would swallow the wake key.  And end it ourselves, at
+                # once: a link the kernel ends as part of suspend or power-off is ended with
+                # reason "power off" (0x15), after which several Android versions do not call
+                # a remote back, while the reason a remote itself gives (0x13) is the one
+                # they all handle.  Shielded so that running out of budget does not skip it.
                 await asyncio.shield(self._disconnect_quietly())
 
         return await self._run_action("tv_off", name, action, mode="preempt", budget=budget)
 
     async def _disconnect_quietly(self) -> None:
         try:
-            await asyncio.wait_for(self.remote.disconnect(), DISCONNECT_SECONDS)
+            await asyncio.wait_for(self.remote.disconnect(fast=True), DISCONNECT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - best effort on the way down
             log.debug("disconnect before going down failed: %s", exc)
 
