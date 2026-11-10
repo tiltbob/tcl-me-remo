@@ -242,5 +242,14 @@ export interface ServiceInfo {
   installed_version: string;
   bundled_version: string;
   needs_update: boolean;
+  /** Where the service's code is installed (empty when it is not). */
+  install_dir?: string;
   problems: string[];
+}
+
+/** What `install_service` reports on success: what was done, plus the resulting state. */
+export interface InstallResult extends Partial<ServiceInfo> {
+  changed?: boolean;
+  restarted?: boolean;
+  log?: string[];
 }
