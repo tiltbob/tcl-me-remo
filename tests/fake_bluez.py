@@ -1183,7 +1183,7 @@ class FakeMgmtHub:
         #: Answer every Disconnect with this status instead of carrying it out (0x0A = busy).
         self.refuse_status: int | None = None
         #: Seconds until that refusal arrives.  Kernels from 6.11 on look the link up in a work
-        #: item, so "not connected" comes a moment after the command was accepted.
+        #: item, so "no such link" (status 0x0E there) comes a moment after the command was accepted.
         self.refuse_delay = 0.0
         #: False: the controller never reports the link down (the TV stopped answering).
         self.completes = True

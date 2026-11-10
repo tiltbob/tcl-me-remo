@@ -77,6 +77,7 @@ def test_parse_reply():
 def test_statuses_are_put_in_plain_words():
     assert "no such link" in mgmt.describe_status(0x02)
     assert "another disconnect" in mgmt.describe_status(0x0A)
+    assert "no longer has such a link" in mgmt.describe_status(0x0E)
     assert "must run as root" in mgmt.describe_status(0x14)
     assert mgmt.describe_status(0x7F) == "the kernel answered with status 0x7F"
 

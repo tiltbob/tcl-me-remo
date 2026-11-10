@@ -11,8 +11,9 @@ Why this exists
     terminated connection due to power off" (``hci_suspend_sync`` / ``hci_power_off_sync``:
     ``hci_disconnect_all_sync(hdev, HCI_ERROR_REMOTE_POWER_OFF)``).  Several Android versions'
     HID host re-arm their background connection to a remote only for certain reasons; 0x13
-    "remote user terminated connection", which real remotes send, is among them from Android
-    13 on, 0x15 is not (research notes, correction C2).  Whether a TV calls back after the
+    "remote user terminated connection", which real remotes send, is among them in Android
+    13 and 14, 0x15 is not (research notes, correction C2; Android 16 re-arms for any
+    reason, Android 11 and 12 for a time-out only).  Whether a TV calls back after the
     machine wakes may therefore depend on which of the two it was told.
 
 What it does
@@ -98,6 +99,9 @@ _STATUS_TEXT = {
     0x03: "the kernel could not do it",
     0x0A: "another disconnect is under way on this controller",
     0x0D: "the kernel rejected the address",
+    # What kernels from 6.11 on answer when the link is not there: they look for it in a work
+    # item after accepting the command, and -ENOTCONN maps to "disconnected", not 0x02.
+    0x0E: "the kernel no longer has such a link",
     0x0F: "the Bluetooth controller is switched off",
     0x11: "the kernel has no such Bluetooth controller",
     0x14: "the service lacks permission to manage Bluetooth (it must run as root)",

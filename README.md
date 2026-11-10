@@ -139,6 +139,7 @@ tcl-me-remo logs -n 100
 | `input.method` | `none` | `macro`, `wifi` or `none` |
 | `input.hdmi_port` | 1 | The HDMI port the machine is on |
 | `bluetooth.reconnect_on_drop` | on | Keep calling the TV while it is not connected |
+| `bluetooth.raw_notify` | `auto` | Direct key delivery for TVs that do not re-subscribe after a reboot: `auto` (Linux 6.17 and later only), `on`, `off` |
 | `power.on_key`, `power.off_key` | `WAKE`, `SLEEP` | The keys used for power |
 
 All settings, with their limits, are listed by `tcl-me-remo config` and editable in the panel.
@@ -153,7 +154,10 @@ hooks, and says what is wrong in plain words.
 - **The TV turns on by itself.** Turn off *Keep calling the TV*
   (`bluetooth.reconnect_on_drop`).
 - **Keys stopped working after a reboot.** `tcl-me-remo status` shows how keys are being
-  delivered. See [after a reboot](docs/how-it-works.md#after-a-reboot); pairing again always
+  delivered, and `tcl-me-remo doctor` says whether direct delivery, the way around a TV that
+  does not re-subscribe after a reboot, is in use. On Linux kernels before 6.17 it is not
+  used unless you set `bluetooth.raw_notify` to `on`; the error message says so when that is
+  the reason. See [after a reboot](docs/how-it-works.md#after-a-reboot); pairing again always
   restores things.
 - **The machine does not show up on the TV when pairing.** Pairing mode closes after two
   minutes; open it again. Remove any earlier pairing between the TV and this machine first.

@@ -50,12 +50,16 @@ both sides.
 If the machine does not show up in the TV's list:
 
 - Make sure Bluetooth is on in SteamOS and pairing mode is still open.
+- Close other Bluetooth settings or pairing pages on the SteamOS machine. While one of them
+  is open the machine can also be visible as an ordinary Bluetooth device; the TV may then
+  try to pair the wrong way and give up. The pairing dialog warns when it sees this.
 - If the TV was ever paired with this machine as an ordinary Bluetooth device (for audio, for
   instance), remove that pairing on the TV first.
 - Move the machine closer for the pairing step.
 
 To start over, choose **Forget TV** in the panel *and* remove *SteamOS Remote* under
-Remotes & Accessories on the TV. Both sides have to forget before pairing again.
+Remotes & Accessories on the TV. Both sides have to forget before pairing again. Cancelling
+a pairing that got halfway can take a couple of seconds while the half-made bond is removed.
 
 ## Check that it works
 

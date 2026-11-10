@@ -789,11 +789,11 @@ async def test_fast_disconnect_falls_back_when_the_kernel_refuses_a_moment_later
     caplog.set_level(logging.INFO)
     remote, tv = await h.paired_remote()
     assert await remote.ensure_ready(2.0)
-    h.mgmt.refuse_status, h.mgmt.refuse_delay = 0x02, 0.05
+    h.mgmt.refuse_status, h.mgmt.refuse_delay = 0x0E, 0.05  # mgmt_errno_status(-ENOTCONN)
     await remote.disconnect(fast=True)
     assert h.mgmt.commands == [DISCONNECT_TV] and h.bluez.disconnect_calls == 1
     assert not tv.connected and not remote.state.connected and h.mgmt.opened == h.mgmt.closed == 1
-    assert "the kernel did not end the TV link (status 0x02)" in caplog.text
+    assert "the kernel did not end the TV link (status 0x0E)" in caplog.text
 
 
 async def test_fast_disconnect_calls_off_a_connection_attempt_like_the_normal_one(h):

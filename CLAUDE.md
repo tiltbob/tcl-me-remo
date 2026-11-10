@@ -14,7 +14,8 @@ touching the CLI or the plugin.
 - `py_modules/tcl_me_remo/` — the service (Python 3.11+, asyncio, standard library only).
   - `service.py` — every decision: lifecycle events, TV on/off/input sequences. Talks to the
     transports only through `interfaces.py`, so it is fully tested with fakes.
-  - `bluez/` — the Bluetooth transport (BlueZ over D-Bus, plus a raw HCI delivery path).
+  - `bluez/` — the Bluetooth transport (BlueZ over D-Bus, plus a raw HCI delivery path and
+    a kernel management socket for ending the link at once before suspend).
   - `atv/` — the Wi-Fi assist.
   - `lifecycle.py`, `daemon.py`, `system.py` — logind locks, wiring, systemd helpers.
   - `config.py`, `keys.py`, `hid.py`, `macro.py`, `tvdata.py` — settings and tables.
