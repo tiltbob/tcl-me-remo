@@ -41,6 +41,13 @@ IDLE_SECONDS = 30.0
 # An over-long request is read to its end and thrown away, so that the answer ("too large")
 # reaches a client that is still busy sending; beyond this much the connection is closed.
 MAX_DISCARD = 8 * MAX_LINE
+#: Most opening brackets and braces a request may contain.  It bounds the nesting before the
+#: parser sees the line: how deep json.loads goes before it gives up depends on the Python
+#: version and on the stack the process happens to have (3.14 parses tens of thousands of
+#: levels on some machines and none of them on others), and whatever parses can be echoed
+#: back in the reply.  Real requests have a dozen; the count includes brackets inside text,
+#: of which a macro of the greatest allowed length can have about a thousand.
+MAX_BRACKETS = 2048
 
 log = logging.getLogger(__name__)
 
@@ -290,6 +297,8 @@ class IpcServer:
 
     async def _dispatch(self, line: bytes) -> bytes:
         req_id: Any = None
+        if line.count(b"[") + line.count(b"{") > MAX_BRACKETS:
+            return _reply_err(None, "bad_request", "the request is nested too deeply")
         try:
             request = json.loads(line, parse_constant=_no_constant)
             if not isinstance(request, dict):

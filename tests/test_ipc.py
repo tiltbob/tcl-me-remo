@@ -168,6 +168,15 @@ async def test_every_request_gets_one_reply_however_it_is_nested(server, caplog)
             await writer.drain()
             reply = json.loads(await asyncio.wait_for(reader.readline(), 10))
             assert reply["ok"] is False and reply["error"]["code"] == "bad_request", reply
+            assert reply["error"]["message"] == "the request is nested too deeply"
+        # Below the service's own bound the parser decides, and how deep it goes differs
+        # between Python versions (3.14 parses what 3.13 refuses).  Either way: one reply.
+        middling = b'{"id": ' + b"[" * 1500 + b"]" * 1500 + b', "method": "echo"}\n'
+        assert middling.count(b"[") + middling.count(b"{") < ipc.MAX_BRACKETS
+        writer.write(middling)
+        await writer.drain()
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 10))
+        assert reply["ok"] is True or reply["error"]["code"] == "bad_request", reply
         # ... and the connection is still good for the next request
         writer.write(b'{"id": 4, "method": "echo", "params": {"k": 1}}\n')
         await writer.drain()
