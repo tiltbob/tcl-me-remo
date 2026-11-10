@@ -7,7 +7,9 @@ from pathlib import Path
 
 
 def config_path() -> Path:
-    return Path(os.environ.get("TCL_ME_REMO_CONFIG", "/etc/tcl-me-remo/config.json"))
+    # Not under /etc: SteamOS wipes everything there except a fixed keep list on OS updates,
+    # while /var is carried over.
+    return Path(os.environ.get("TCL_ME_REMO_CONFIG", "/var/lib/tcl-me-remo/config.json"))
 
 
 def state_dir() -> Path:

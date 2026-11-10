@@ -51,9 +51,9 @@ EVENTS = UP_EVENTS + DOWN_EVENTS
 DEFAULT_DOWN_BUDGET = 3.5
 # Budget for a manually requested "TV off".
 MANUAL_OFF_BUDGET = 20.0
-# Pause after the last key of a down action so the notification leaves the radio before the
-# adapter is suspended.
-FLUSH_SECONDS = 0.25
+# Pause after the last key of a down action: the kernel drops every Bluetooth link as part
+# of suspend, so the key-up report must be on the air before the suspend lock is released.
+FLUSH_SECONDS = 0.4
 # A change of more than this in (CLOCK_BOOTTIME - CLOCK_MONOTONIC) means the machine slept.
 SLEEP_JUMP_SECONDS = 1.0
 DISCONNECT_SECONDS = 0.5
