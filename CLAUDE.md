@@ -33,6 +33,7 @@ touching the CLI or the plugin.
 python3 -m pytest -q --timeout 60    # needs dbus-daemon; no Bluetooth hardware needed
 ruff check .
 pnpm install && pnpm run typecheck && pnpm run build    # the plugin frontend
+#   dist/index.js is committed (SteamOS has no Node.js); rebuild and commit it with src/ changes
 pnpm run preview                     # renders every screen with mocked Decky modules, runs UI checks
 python3 scripts/build_zip.py         # out/tcl-me-remo.zip (the name must not change)
 ./install.sh                         # install this checkout as the running service (sudo)

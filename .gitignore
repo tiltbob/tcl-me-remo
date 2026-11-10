@@ -4,7 +4,10 @@ __pycache__/
 .ruff_cache/
 .venv/
 node_modules/
-/dist/
+# The built panel (dist/index.js) IS committed: SteamOS has no Node.js, and with it in the
+# repository a checkout can be packaged with Python alone.  CI fails if it is out of date.
+/dist/*
+!/dist/index.js
 /out/
 *.zip
 .DS_Store

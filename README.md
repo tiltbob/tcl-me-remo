@@ -53,9 +53,16 @@ Bluetooth both sides already have.
 
 The plugin installs and starts the background service by itself.
 
-If there is no release yet, every CI run on GitHub builds the same file: open the latest
-run under *Actions*, download the `tcl-me-remo-plugin` artifact and unzip it once to get
-`tcl-me-remo.zip`. Or build it yourself (see [Development](#development)).
+If there is no release yet, make the file yourself. It takes only Python, which SteamOS
+has (the built panel is part of the repository):
+
+```sh
+git clone https://github.com/tiltbob/tcl-me-remo
+cd tcl-me-remo
+python3 scripts/build_zip.py      # writes out/tcl-me-remo.zip
+```
+
+Then pick `out/tcl-me-remo.zip` in Decky's file browser.
 
 The plugin is not in Decky's plugin store, and will not be: the store does not take plugins
 written mostly with AI assistance, which this one was.
@@ -175,7 +182,8 @@ Uninstall the plugin in Decky; a few minutes later the service removes itself. W
 ```sh
 python3 -m pytest -q --timeout 60     # the service; needs dbus-daemon, no Bluetooth
 ruff check .
-pnpm install && pnpm run build        # the Decky panel
+pnpm install && pnpm run build        # the Decky panel; commit the resulting dist/index.js
+pnpm run preview                      # UI checks and screenshots in a browser, no Deck needed
 python3 scripts/build_zip.py          # out/tcl-me-remo.zip
 ```
 

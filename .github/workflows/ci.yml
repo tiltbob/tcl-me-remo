@@ -68,6 +68,10 @@ jobs:
         run: pnpm run typecheck
       - name: Build
         run: pnpm run build
+      - name: The committed panel bundle is current
+        # dist/index.js is committed so that a checkout can be packaged without Node.js.
+        # If this fails: run "pnpm run build" and commit dist/index.js.
+        run: git diff --exit-code -- dist/index.js
       - name: UI checks in a browser preview
         # Renders the real components against mocked Decky modules and a fake backend and
         # clicks through them.  Playwright is not a project dependency; the script loads it
@@ -79,6 +83,9 @@ jobs:
       - name: Package
         run: python3 scripts/build_zip.py
       - uses: actions/upload-artifact@v4
+        # A convenience only: everything that verifies the plugin has run by now.  Uploading
+        # can fail for reasons outside the code (the account's artifact storage quota).
+        continue-on-error: true
         with:
           name: tcl-me-remo-plugin
           path: out/tcl-me-remo.zip
