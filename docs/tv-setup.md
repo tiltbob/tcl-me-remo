@@ -70,6 +70,44 @@ tcl-me-remo on           # ...and back on
 Then let the TV sit in standby for an hour and try `tcl-me-remo on` again. Some sets change
 standby state a while after they are switched off.
 
+## Wi-Fi assist (optional)
+
+The Wi-Fi assist is a second way to reach the TV: over your home network, with the protocol
+the Google TV phone app uses as a remote. It is off until you pair it, and Bluetooth stays
+the main route. It is good for two things: asking the TV for an HDMI input directly instead
+of walking through the source list with a macro, and as a fallback for power when the TV
+does not answer over Bluetooth.
+
+1. The TV and the machine must be on the same network. Give the TV a fixed address (a DHCP
+   reservation in your router): the service keeps using the address you pair with.
+2. Find the TV: `tcl-me-remo wifi discover`, or *Search the network* on the Wi-Fi page of
+   the settings. If nothing is found, look the address up on the TV under Settings >
+   Network & Internet.
+3. Pair: `tcl-me-remo wifi pair 192.168.1.50` (your TV's address). The TV shows a code of
+   six characters; type it in. The TV has to be on for this.
+4. To switch inputs this way, set `input.method` to `wifi` and choose the set of links that
+   matches your TV (`wifi.link_preset`):
+
+   | Preset | For |
+   |---|---|
+   | `tcl-mediatek` | reported for C805, C849, C855, C7K, 98P74; the likely match for QM6K, QM7, QM8 and Q7 |
+   | `tcl-realtek` | reported for C825 and C645; the likely match for Q5 and Q6 |
+   | `tcl-realtek-alt` | reported for C635 |
+   | `custom` | your own link in `wifi.app_link`, with `{port}` for the port number |
+
+   Then try it while the TV shows some other input: `tcl-me-remo input --via wifi`. These
+   links come from owners' reports of other models, not from tests on your TV: if the first
+   preset does nothing, try the next.
+
+Pairing stores a key for this machine in `/var/lib/tcl-me-remo/atv` and remembers the TV's
+certificate; later connections are refused unless the TV presents the same one, so after a
+factory reset of the TV you pair again. `tcl-me-remo wifi unpair` deletes the key and the
+record, which is enough to stop the pairing being used. (This project knows of no screen in
+the TV's settings that lists paired network remotes.)
+
+Over Wi-Fi the TV can only be reached while its network is up, which in standby again
+depends on *Screenless service* / the network standby mode.
+
 ## If the TV does not wake
 
 - Re-check Screenless service / Standby Mode. This is the cause in most cases.
