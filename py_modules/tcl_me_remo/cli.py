@@ -78,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
     wp.add_argument("--code", help="the code shown on the TV (otherwise you are asked)")
     wsub.add_parser("unpair", help="forget the Wi-Fi pairing")
 
+    p = sub.add_parser("doctor", help="check the set-up and print a report for troubleshooting")
+    p.add_argument("--json", action="store_true", help="print the full report as JSON")
+
     p = sub.add_parser("logs", help="show recent service log lines")
     p.add_argument("-n", "--lines", type=int, default=50)
     return parser
@@ -283,6 +286,10 @@ def run(
         from . import daemon  # imported late: the client commands need no D-Bus machinery
 
         return daemon.main()
+    if args.command == "doctor":
+        from . import doctor  # works with the service stopped, so it is not a control-socket client
+
+        return doctor.main(as_json=args.json, out=out)
     if args.command == "keys":
         for row in keys.catalog():
             print(f"{row['name']:<13} {row['label']:<22} {row['android']}", file=out)
