@@ -18,7 +18,11 @@ Facts this module relies on (BlueZ 5.79-5.87 ``src/advertising.c``):
   an Android TV offer the device in "pair remote or accessory".
 * bluetoothd calls ``Release()`` when it drops the advertisement on its own.
 
-Advertising is strictly on demand: a TV in standby must not be poked while nobody asked.
+When and for how long we advertise is decided in remote.py.
+
+The wake beacon is a second, separate advertisement: ``Type = "broadcast"`` (not connectable)
+carrying nothing but a manufacturer-data field.  Some TVs arm a filter for such a field in
+their Bluetooth controller before suspending and wake when it is heard.  Experimental.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .. import dbus
-from ..dbus import DBusError, MessageBus, PropertyAccess, ServiceInterface, dbus_property, method
+from ..dbus import DBusError, MessageBus, PropertyAccess, ServiceInterface, Variant, dbus_property, method
 from .gatt import UUID_HID_SERVICE, uuid16
 
 log = logging.getLogger(__name__)
@@ -37,6 +41,7 @@ BLUEZ = "org.bluez"
 ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
 ADVERT_PATH = "/org/tclmeremo/advert"
 ADVERT_BASIC_PATH = "/org/tclmeremo/advert_basic"
+BEACON_PATH = "/org/tclmeremo/beacon"
 
 APPEARANCE_KEYBOARD = 0x03C1
 #: Advertising intervals in ms: quick while somebody waits for the TV, relaxed in the background.
@@ -51,7 +56,7 @@ CALL_TIMEOUT = 5.0
 def fit_name(name: str, limit: int = MAX_NAME_BYTES) -> str:
     """Cut ``name`` to at most ``limit`` UTF-8 bytes without splitting a character."""
     encoded = name.encode("utf-8")[:limit]
-    return encoded.decode("utf-8", errors="ignore")
+    return encoded.decode("utf-8", errors="ignore").rstrip()
 
 
 @dataclass(frozen=True)
@@ -239,3 +244,95 @@ class Advertiser:
         path, self.active_path, self.settings = self.active_path, "", None
         await self._unregister(self.adapter_path, path)
         log.info("advertising stopped")
+
+
+class BeaconAdvertisement(ServiceInterface):
+    def __init__(self, on_release: Callable[[], None]):
+        super().__init__("org.bluez.LEAdvertisement1")
+        self.company = 0
+        self.data = b""
+        self._on_release = on_release
+
+    @dbus_property(PropertyAccess.READ)
+    def Type(self) -> "s":
+        return "broadcast"
+
+    @dbus_property(PropertyAccess.READ)
+    def ManufacturerData(self) -> "a{qv}":
+        return {self.company: Variant("ay", self.data)}
+
+    @method()
+    def Release(self):
+        self._on_release()
+
+
+class Beacon:
+    """Registers and unregisters the wake beacon."""
+
+    def __init__(self, bus: MessageBus):
+        self._bus = bus
+        self._object = BeaconAdvertisement(self.forget)
+        self._exported = False
+        self._adapter_path = ""
+        self.active = False
+
+    def export(self) -> None:
+        if not self._exported:
+            self._bus.export(BEACON_PATH, self._object)
+            self._exported = True
+
+    def unexport(self) -> None:
+        if self._exported:
+            self._bus.unexport(BEACON_PATH, self._object)
+            self._exported = False
+
+    def forget(self) -> None:
+        self.active = False
+
+    async def start(self, adapter_path: str, company: int, data: bytes) -> None:
+        """Broadcast ``data`` as manufacturer data of ``company``.  Raises if bluetoothd refuses."""
+        if self.active and (adapter_path, company, data) == (self._adapter_path, self._object.company, self._object.data):
+            return
+        await self.stop()
+        self.export()
+        self._object.company, self._object.data = company, bytes(data)
+        self._adapter_path = adapter_path
+        try:
+            await dbus.call(
+                self._bus, BLUEZ, adapter_path, ADVERTISING_MANAGER, "RegisterAdvertisement", "oa{sv}",
+                [BEACON_PATH, {}], timeout=CALL_TIMEOUT,
+            )  # fmt: skip
+        except DBusError as exc:
+            if exc.type != "org.bluez.Error.AlreadyExists":
+                raise
+        except BaseException:
+            self._unregister_blind()
+            raise
+        self.active = True
+        log.info("broadcasting the wake beacon (company 0x%04X, %d bytes)", company, len(data))
+
+    def _unregister_blind(self) -> None:
+        try:
+            self._bus.send(
+                dbus.Message(
+                    destination=BLUEZ, path=self._adapter_path, interface=ADVERTISING_MANAGER,
+                    member="UnregisterAdvertisement", signature="o", body=[BEACON_PATH],
+                    flags=dbus.MessageFlag.NO_REPLY_EXPECTED,
+                )
+            )  # fmt: skip
+        except Exception as exc:  # noqa: BLE001 - the bus is gone, and so is the beacon
+            log.debug("could not send UnregisterAdvertisement: %s", exc)
+
+    async def stop(self) -> None:
+        """Take the beacon off air.  Never raises."""
+        if not self.active:
+            return
+        self.active = False
+        try:
+            await dbus.call(
+                self._bus, BLUEZ, self._adapter_path, ADVERTISING_MANAGER, "UnregisterAdvertisement", "o",
+                [BEACON_PATH], timeout=CALL_TIMEOUT,
+            )  # fmt: skip
+        except (DBusError, TimeoutError, OSError) as exc:
+            log.debug("UnregisterAdvertisement(%s): %s", BEACON_PATH, exc)
+        log.info("wake beacon stopped")

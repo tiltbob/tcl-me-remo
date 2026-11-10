@@ -9,9 +9,13 @@ The facts that shape it (BlueZ 5.79+ and Android sources, see the research notes
 * **One registration for life.**  The GATT application is registered once per bluetoothd /
   adapter lifetime and never touched for configuration changes, because registering again
   throws away every subscription and moves nothing forward.
-* **Advertising on demand.**  A bonded Android TV connects by itself as soon as it sees our
-  connectable advertisement.  We advertise only while somebody waits for the TV, in pairing
-  mode, or (opt-in) after the TV dropped the link.
+* **Calling the TV.**  A bonded Android TV connects by itself as soon as it sees our
+  connectable advertisement.  We advertise while somebody waits for the TV (ensure_ready),
+  in pairing mode, and - with ``reconnect_on_drop`` - in the background whenever the bonded
+  TV is not connected, so that the link is already up when a key must go out in the few
+  seconds before suspend.  Never otherwise: with that option off a TV in standby is not
+  poked unless there is something to send, and a link we closed on purpose (disconnect(),
+  idle time-out) stays closed until the next ensure_ready.
 * **Readiness cannot be observed.**  bluetoothd tells us the link is up (``Device1.Connected``)
   but neither that it is encrypted nor that the TV's HID host finished setting up, so a
   settle delay stands in for both.
@@ -39,13 +43,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Coroutine
 
-from .. import dbus, hid, keys
+from .. import dbus, hid, keys, tvdata
 from ..config import BluetoothConfig
 from ..dbus import DBusError, MessageBus, Variant
 from ..interfaces import BleState, PairedCallback, TransportError
 from . import rawhci
 from .adapter import ADAPTER, AGENT_MANAGER, BLUEZ, BLUEZ_ROOT, DEVICE, GATT_MANAGER, BluezWatcher
-from .advert import Advertiser, AdvertSettings
+from .advert import Advertiser, AdvertSettings, Beacon
 from .agent import AGENT_CAPABILITY, AGENT_PATH, PairingAgent
 from .gatt import APP_ROOT, SERVICE_HANDLE, GattCharacteristic, HidApplication
 from .rawhci import RawError, RawLink
@@ -138,7 +142,8 @@ class _PairingWindow:
     notified: bool = False                # a StartNotify arrived inside the window
     winner: str = ""
     aborted: str = ""
-    closed: bool = False
+    closed: bool = False                  # no longer accepting anybody; clean-up may still be running
+    cleanup: asyncio.Future[None] | None = None
 
 
 @dataclass
@@ -169,6 +174,7 @@ class BleRemote:
         self._app: HidApplication | None = None
         self._watcher = BluezWatcher(bus, on_change=self._evaluate, on_owner_change=self._owner_changed)
         self._advertiser = Advertiser(bus, on_released=self._advert_released)
+        self._beacon = Beacon(bus)
         self._agent = PairingAgent(self._agent_decision, on_release=self._agent_released)
         self._wakeup = _Wakeup()
 
@@ -187,6 +193,7 @@ class BleRemote:
         self._subscribed_at: float | None = None
         self._paired_this_registration = False
         self._closing_at: float | None = None  # we asked bluetoothd to drop the link
+        self._parked = False                  # we closed the link on purpose: no background calling
         self._ready = False
         self._delivery = ""
         self._error = ""
@@ -226,6 +233,7 @@ class BleRemote:
         self._app.set_callbacks(self._on_touch, self._on_notify)
         self._app.export(self._bus)
         self._advertiser.export()
+        self._beacon.export()
         self._bus.export(AGENT_PATH, self._agent)
         self._changed_at = time.monotonic()
         await self._watcher.start()
@@ -265,6 +273,7 @@ class BleRemote:
         if window is not None:
             await quietly("closing the pairing window", self._close_pairing(window))
         await quietly("stopping the advertisement", self._advertiser.stop())
+        await quietly("stopping the wake beacon", self._beacon.stop())
         if self._agent_registered:
             await quietly("unregistering the agent", self._unregister_agent())
         if self._registered and self._adapter_path:
@@ -280,6 +289,7 @@ class BleRemote:
         for what, undo in (
             ("agent", lambda: self._bus.unexport(AGENT_PATH, self._agent)),
             ("advertisement", self._advertiser.unexport),
+            ("wake beacon", self._beacon.unexport),
             ("HID service", lambda: self._app.unexport(self._bus) if self._app is not None else None),
         ):
             try:
@@ -298,7 +308,7 @@ class BleRemote:
         adapter = self._adapter_path
         props = self._watcher.interface(adapter, ADAPTER) if adapter else None
         window = self._pairing
-        pairing = window is not None and not window.closed and not window.aborted
+        pairing = window is not None and not window.aborted
         return BleState(
             available=bool(adapter),
             adapter=adapter.rsplit("/", 1)[-1] if adapter else "",
@@ -334,7 +344,14 @@ class BleRemote:
                 self._ready, self._delivery = False, ""
                 self._raw.detach()
 
-    async def ensure_ready(self, timeout: float) -> bool:
+    async def ensure_ready(self, timeout: float, *, wake: bool = False) -> bool:
+        """See :meth:`tcl_me_remo.interfaces.Remote.ensure_ready`.
+
+        ``wake=True`` says the caller is trying to turn the TV *on*: if a wake beacon is
+        configured it is broadcast while we wait for the TV to connect.  It must not be set
+        for anything else - waking a suspended TV in order to tell it to sleep would leave
+        it on.
+        """
         if self._ready:
             return True
         deadline = time.monotonic() + max(0.0, timeout)
@@ -356,7 +373,7 @@ class BleRemote:
                 if outcome is True and self._ready:
                     return True
             try:
-                result: bool | TransportError = await self._run_ensure(deadline)
+                result: bool | TransportError = await self._run_ensure(deadline, wake)
             except TransportError as exc:
                 result = exc
             except (DBusError, TimeoutError, OSError) as exc:
@@ -402,6 +419,7 @@ class BleRemote:
 
     async def start_pairing(self, timeout: float) -> None:
         self._abort += 1  # a running ensure_ready gives way
+        self._parked = False
         self._wakeup.fire()
         await self._cancel_task("_reconnect_task")
         async with self._op_lock:
@@ -451,6 +469,7 @@ class BleRemote:
 
     async def disconnect(self) -> None:
         self._abort += 1
+        self._parked = True
         self._wakeup.fire()
         await self._cancel_task("_reconnect_task")
         await self._advertiser.stop()
@@ -530,11 +549,9 @@ class BleRemote:
         if connected_path and not self._connected:
             self._link_up(connected_path)
 
-        window = self._pairing
-        if window is not None:
-            if window.prev_pairable is not None and not props.get("Pairable", True):
-                log.debug("pairing: the adapter stopped being pairable; the pairing loop will fix it")
+        if self._pairing is not None:
             self._pairing_progress()
+        self._call_in_background()
         self._wakeup.fire()
 
     def _adapter_lost(self) -> None:
@@ -548,6 +565,7 @@ class BleRemote:
         self._links = 0
         self._subscribed_at = None
         self._advertiser.forget()
+        self._beacon.forget()
         self._raw.reset()
         if self._app is not None:
             # bluetoothd destroyed the adapter's GATT database and with it every subscription.
@@ -579,15 +597,6 @@ class BleRemote:
         task, self._idle_task = self._idle_task, None
         if task is not None and not task.done() and task is not asyncio.current_task():
             task.cancel()
-        if (
-            not expected
-            and not adapter_gone
-            and not self._stopped
-            and self._cfg.reconnect_on_drop
-            and self._ensure_active == 0
-            and self._pairing is None
-        ):
-            self._start_reconnect()
 
     # ================================================================== GATT registration
 
@@ -660,6 +669,7 @@ class BleRemote:
         if self._error.startswith("could not register") or self._error == "the Bluetooth adapter is gone":
             self._error = ""
         self._log_handles()
+        self._call_in_background()
         self._wakeup.fire()
 
     def _log_handles(self) -> None:
@@ -700,22 +710,29 @@ class BleRemote:
             self._advert_not_before = time.monotonic() + ADVERT_RETRY
             raise
 
-    def _start_reconnect(self) -> None:
+    def _should_call(self) -> bool:
+        """Whether the bonded TV should be called although nobody is waiting for it."""
+        return bool(
+            self._cfg.reconnect_on_drop
+            and not self._parked
+            and not self._stopped
+            and self._registered
+            and self._powered
+            and self._tv_path
+            and not self._connected
+            and self._pairing is None
+        )
+
+    def _call_in_background(self) -> None:
+        if self._ensure_active or not self._should_call():
+            return
         if self._reconnect_task is None or self._reconnect_task.done():
-            log.info("the TV dropped the link; advertising so that it can come back")
+            log.info("calling the TV in the background until it connects")
             self._reconnect_task = asyncio.ensure_future(self._reconnect_in_background())
 
     async def _reconnect_in_background(self) -> None:
         try:
-            while (
-                not self._connected
-                and not self._stopped
-                and self._cfg.reconnect_on_drop
-                and self._registered
-                and self._powered
-                and self._tv_path
-                and self._pairing is None
-            ):
+            while self._should_call():
                 try:
                     await self._advertise(discoverable=False, fast=False)
                 except (DBusError, TimeoutError, OSError) as exc:
@@ -726,6 +743,19 @@ class BleRemote:
         finally:
             if self._pairing is None and self._ensure_active == 0:
                 await self._finish(self._advertiser.stop())
+
+    async def _start_beacon(self) -> None:
+        """Broadcast the configured wake beacon next to the connectable advertisement.
+
+        Experimental and strictly optional: a failure is logged and otherwise ignored.
+        """
+        beacon = tvdata.wake_beacon(self._cfg.wake_beacon, self._cfg.wake_beacon_data, self._cfg.tv_address)
+        if beacon is None or not self._adapter_path:
+            return
+        try:
+            await self._beacon.start(self._adapter_path, *beacon)
+        except (DBusError, TimeoutError, OSError) as exc:
+            log.warning("could not broadcast the wake beacon: %s", _describe(exc))
 
     # ================================================================== readiness
 
@@ -748,6 +778,8 @@ class BleRemote:
                 transient=self._reconciling(),
             )
         if self._pairing is not None:
+            if self._pairing.closed:
+                return _Problem("not_paired", "pairing mode is closing", transient=True)
             return _Problem("not_paired", "pairing mode is open; finish or cancel pairing first")
         if not self._cfg.tv_address:
             return _Problem("not_paired", "no TV is paired yet")
@@ -820,7 +852,7 @@ class BleRemote:
         while not self._powered and self._adapter_path and time.monotonic() < until:
             await self._wakeup.wait(until - time.monotonic())
 
-    async def _run_ensure(self, deadline: float) -> bool:
+    async def _run_ensure(self, deadline: float, wake: bool = False) -> bool:
         """The readiness sequence.  Re-evaluates everything after every wait.
 
         Returns False when the deadline passes or somebody (disconnect, pairing, stop) called
@@ -828,8 +860,9 @@ class BleRemote:
         """
         assert self._app is not None
         generation = self._abort
+        self._parked = False
         await self._cancel_task("_reconnect_task")
-        tried_power = False
+        tried_power = beacon_tried = False
         self._ensure_active += 1
         try:
             while True:
@@ -862,11 +895,15 @@ class BleRemote:
                         self._error = "the TV did not connect over Bluetooth"
                         return False
                     await self._advertise(discoverable=False, fast=True)
+                    if wake and not beacon_tried:
+                        beacon_tried = True
+                        await self._start_beacon()
                     await self._wakeup.wait(remaining)
                     continue
 
-                if self._advertiser.active:
+                if self._advertiser.active or self._beacon.active:
                     await self._advertiser.stop()
+                    await self._beacon.stop()
                     continue
 
                 since = now - self._connected_at
@@ -909,8 +946,13 @@ class BleRemote:
                 await self._wakeup.wait(min(wait, remaining))
         finally:
             self._ensure_active -= 1
+            if self._beacon.active:
+                await self._finish(self._beacon.stop())
             if self._advertiser.active and self._pairing is None:
                 await self._finish(self._advertiser.stop())
+            # Whoever called us off parked the link or opened pairing; otherwise the
+            # background policy takes over from here.
+            self._call_in_background()
 
     async def _request_disconnect(self, until: float) -> None:
         """Ask bluetoothd to drop the TV link and wait (until ``until``) for it to happen."""
@@ -974,6 +1016,7 @@ class BleRemote:
             due = self._last_activity + idle - time.monotonic()
             if due <= 0 and not self._send_lock.locked():
                 log.info("no key for %gs: dropping the TV link", idle)
+                self._parked = True  # the point is to free the radio, not to reconnect at once
                 await self._drop_link_quietly()
                 return
             await asyncio.sleep(max(due, 0.05))
@@ -1124,7 +1167,7 @@ class BleRemote:
                 await self._set_pairable(adapter, True)
             await self._advertise(discoverable=True, fast=True)
         except BaseException:
-            await self._finish(self._close_pairing(window))
+            await self._close_pairing(window)
             raise
         self._error = ""
         log.info("pairing mode open for %gs as %r", timeout, self._cfg.device_name)
@@ -1152,7 +1195,7 @@ class BleRemote:
                     log.debug("pairing: could not re-assert pairing conditions: %s", _describe(exc))
                 await self._wakeup.wait(min(remaining, PAIRING_TICK))
         finally:
-            await self._finish(self._close_pairing(window))
+            await self._close_pairing(window)
 
     async def _hold_pairing_conditions(self, window: _PairingWindow) -> None:
         """Other software (or a timeout) may take the default agent or pairability away."""
@@ -1207,21 +1250,33 @@ class BleRemote:
         self._evaluate()
 
     async def _close_pairing(self, window: _PairingWindow) -> None:
-        """End the pairing window and put everything back.  Idempotent, never raises."""
-        if window.closed:
-            return
-        window.closed = True
-        if self._pairing is window:
-            self._pairing = None
-        await self._advertiser.stop()
-        if self._agent_registered:
-            await self._unregister_agent()  # the previous default agent takes over again
-        if window.prev_pairable is not None and window.adapter_path == self._adapter_path:
-            try:
-                await self._set_pairable(window.adapter_path, window.prev_pairable)
-            except (DBusError, TimeoutError, OSError) as exc:
-                log.debug("could not restore Pairable: %s", _describe(exc))
-        self._wakeup.fire()
+        """End the pairing window and put everything back.  Idempotent, never raises.
+
+        The clean-up runs in a task of its own so that it completes whoever asked for it and
+        whatever happens to them; every caller waits for that same task.
+        """
+        if window.cleanup is None:
+            window.closed = True
+            window.cleanup = asyncio.ensure_future(self._restore_after_pairing(window))
+            self._tasks.add(window.cleanup)
+            window.cleanup.add_done_callback(self._tasks.discard)
+        await asyncio.shield(window.cleanup)
+
+    async def _restore_after_pairing(self, window: _PairingWindow) -> None:
+        try:
+            await self._advertiser.stop()
+            if self._agent_registered:
+                await self._unregister_agent()  # the previous default agent takes over again
+            if window.prev_pairable is not None and window.adapter_path == self._adapter_path:
+                try:
+                    await self._set_pairable(window.adapter_path, window.prev_pairable)
+                except (DBusError, TimeoutError, OSError) as exc:
+                    log.debug("could not restore Pairable: %s", _describe(exc))
+        finally:
+            if self._pairing is window:
+                self._pairing = None
+            self._call_in_background()
+            self._wakeup.fire()
 
     # ================================================================== bonds
 
