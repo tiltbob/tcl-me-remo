@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from typing import Any, Callable
@@ -19,6 +20,10 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_UNAVAILABLE = 3
+
+# The longest --budget the service takes (service.MAX_EVENT_BUDGET; not imported, to keep
+# the client commands free of the service's modules).
+MAX_BUDGET = 120.0
 
 Caller = Callable[..., Any]
 
@@ -68,7 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("event", help="tell the service about a lifecycle event (used by systemd hooks)")
     p.add_argument("name", choices=["boot", "resume", "suspend", "shutdown", "reboot"])
     p.add_argument("--simulate", action="store_true", help="run the actions without affecting event bookkeeping")
-    p.add_argument("--budget", type=float, metavar="SECONDS", help="time limit for suspend/shutdown actions")
+    p.add_argument(
+        "--budget",
+        type=float,
+        metavar="SECONDS",
+        help=f"time limit for suspend/shutdown actions (more than 0, at most {MAX_BUDGET:g})",
+    )
     p.add_argument("--no-wait", action="store_true", help="return at once instead of waiting for the actions")
 
     p = sub.add_parser("wifi", help="set up the optional Wi-Fi assist")
@@ -84,6 +94,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("logs", help="show recent service log lines")
     p.add_argument("-n", "--lines", type=int, default=50)
+
+    p = sub.add_parser("uninstall", help="remove the service from this machine (asks sudo)")
+    p.add_argument("--purge", action="store_true", help="also delete the settings and the Bluetooth pairing")
     return parser
 
 
@@ -162,7 +175,13 @@ def _print_status(status: dict[str, Any], out: Any) -> None:
     elif not bt.get("paired"):
         link = "no TV paired (run: tcl-me-remo pair)"
     elif bt.get("ready"):
-        link = "connected"
+        # "delivery: bluez" is the ordinary path; "delivery: raw" is direct delivery, used for a
+        # TV that did not renew its subscription after a reboot (docs/how-it-works.md).
+        delivery = bt.get("delivery")
+        link = f"connected, ready (delivery: {delivery})" if delivery else "connected, ready"
+    elif bt.get("connected") and bt.get("subscribed"):
+        # The resting state after a boot or wake: the link is up, nothing was sent on it yet.
+        link = "connected (no key sent on this link yet)"
     elif bt.get("connected"):
         link = "connected, waiting for the TV to subscribe"
     elif bt.get("advertising"):
@@ -219,18 +238,68 @@ def _cmd_pair(args: argparse.Namespace, call: Caller, out: Any) -> int:
     return EXIT_FAILED
 
 
+# Text settings whose form the schema's "text, up to N characters" would not tell.
+_TEXT_FORMATS = {
+    "power.on_key": "a key name or raw usage (see: tcl-me-remo keys)",
+    "power.off_key": "a key name or raw usage (see: tcl-me-remo keys)",
+    "input.macro": "a key macro, up to 1024 characters (docs/macros.md)",
+    "bluetooth.adapter": "auto, or an adapter name such as hci0",
+    "bluetooth.device_name": "text, up to 26 bytes",
+    "bluetooth.tv_address": "a Bluetooth address, or empty (set by pairing)",
+    "bluetooth.wake_beacon_data": "3 to 29 bytes as hex, or empty",
+    "wifi.host": "an IP address or host name, or empty",
+}
+
+
+def _allowed(name: str, info: dict[str, Any]) -> str:
+    """What the setting ``name`` may be set to, from the schema the service sent ("" if unknown)."""
+    leaf: Any = info.get("schema")
+    for part in name.split("."):
+        leaf = leaf.get(part) if isinstance(leaf, dict) else None
+    if not isinstance(leaf, dict):
+        return ""
+    choices = leaf.get("choices")
+    # Two settings name an entry of a list that get_config sends along.
+    listed = {"input.preset": "presets", "wifi.link_preset": "link_presets"}.get(name)
+    if listed and isinstance(info.get(listed), list):
+        choices = ["custom", *(str(entry.get("name")) for entry in info[listed] if isinstance(entry, dict))]
+    if choices:
+        return "one of: " + ", ".join(str(choice) for choice in choices)
+    if name in _TEXT_FORMATS:
+        return _TEXT_FORMATS[name]
+    kind, low, high = leaf.get("type"), leaf.get("min"), leaf.get("max")
+    if kind == "bool":
+        return "true or false"
+    if kind in ("int", "float"):
+        what = "whole number" if kind == "int" else "number"
+        if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+            return f"{what}, {low:g} to {high:g}"
+        return what
+    if kind == "str":
+        return f"text, up to {leaf['maxlen']} characters" if leaf.get("maxlen") else "text"
+    return ""
+
+
+def _print_settings(rows: list[tuple[str, Any]], info: dict[str, Any], out: Any) -> None:
+    """One line per setting: ``name = value``, then what it may be set to."""
+    lines = [(f"{name} = {json.dumps(value)}", _allowed(name, info)) for name, value in rows]
+    width = min(48, max((len(text) for text, _ in lines), default=0))
+    for text, allowed in lines:
+        print(f"{text:<{width}}  # {allowed}" if allowed else text, file=out)
+
+
 def _cmd_config(args: argparse.Namespace, call: Caller, out: Any) -> int:
     if args.name is None:
-        for name, value in _flatten(call("get_config")["config"]):
-            print(f"{name} = {json.dumps(value)}", file=out)
+        info = call("get_config")
+        _print_settings(_flatten(info["config"]), info, out)
         return EXIT_OK
     if args.value is None:
-        value = _lookup(call("get_config")["config"], args.name)
+        info = call("get_config")
+        value = _lookup(info["config"], args.name)
         if isinstance(value, dict):
-            for name, leaf in _flatten(value, args.name + "."):
-                print(f"{name} = {json.dumps(leaf)}", file=out)
+            _print_settings(_flatten(value, args.name + "."), info, out)
         else:
-            print(json.dumps(value), file=out)
+            print(json.dumps(value), file=out)  # the bare value, for scripts
         return EXIT_OK
     current = _lookup(call("get_config")["config"], args.name)
     # Text settings take the argument verbatim, so a TV called "1234" or a macro "5s" is fine.
@@ -251,7 +320,13 @@ def _cmd_wifi(args: argparse.Namespace, call: Caller, out: Any, ask: Callable[[s
         return EXIT_OK
     if args.wifi_command == "pair":
         call("wifi_pair_start", {"host": args.host}, timeout=20.0)
-        code = args.code or ask("Code shown on the TV: ")
+        try:
+            code = args.code or ask("Code shown on the TV: ")
+        except (EOFError, KeyboardInterrupt):
+            # Nobody there to type it (no terminal), or Ctrl+C: do not leave the TV waiting.
+            call("wifi_pair_cancel")
+            print("\nNo code entered: pairing cancelled.", file=out)
+            return EXIT_FAILED
         try:
             call("wifi_pair_finish", {"code": code.strip()}, timeout=20.0)
         except RpcError:
@@ -291,11 +366,20 @@ def run(
         from . import doctor  # works with the service stopped, so it is not a control-socket client
 
         return doctor.main(as_json=args.json, out=out)
+    if args.command == "uninstall":
+        from . import installer  # the installed copy removes itself; works with the service stopped
+
+        return installer.uninstall_from_command_line(args.purge, out, err)
     if args.command == "keys":
         for row in keys.catalog():
             print(f"{row['name']:<13} {row['label']:<22} {row['android']}", file=out)
         print("\nRaw usages also work: K:52 (keyboard page), C:0223 (consumer page), S:82 (system control).", file=out)
         return EXIT_OK
+    if args.command == "event" and args.budget is not None:
+        # Here, not left to the service: the budget also sets how long this command waits.
+        if not (math.isfinite(args.budget) and 0 < args.budget <= MAX_BUDGET):
+            print(f"tcl-me-remo: --budget must be more than 0 and at most {MAX_BUDGET:g} seconds", file=err)
+            return EXIT_USAGE
 
     try:
         if args.command == "status":
@@ -356,10 +440,22 @@ def run(
             return EXIT_OK
     except ServiceUnavailable as exc:
         print(f"tcl-me-remo: {exc.message}", file=err)
-        print("Is the service running?  Check: systemctl status tcl-me-remo", file=err)
+        if getattr(exc, "denied", False):
+            print(
+                "The service is for root and the members of the group 'wheel'.  Run this with sudo, "
+                "or as a user in that group.",
+                file=err,
+            )
+        else:
+            print("Is the service running?  Check: systemctl status tcl-me-remo", file=err)
         return EXIT_UNAVAILABLE
     except RpcError as exc:
         print(f"tcl-me-remo: {exc.message}", file=err)
+        return EXIT_FAILED
+    except (KeyError, TypeError, AttributeError) as exc:
+        # The service answered, but not with what this command expects of it (a service and a
+        # command of different versions, most likely).
+        print(f"tcl-me-remo: unexpected answer from the service ({type(exc).__name__}: {exc})", file=err)
         return EXIT_FAILED
     parser.print_help(out)
     return EXIT_USAGE

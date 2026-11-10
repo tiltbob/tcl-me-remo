@@ -9,6 +9,8 @@ import socket
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from . import aio
+
 log = logging.getLogger(__name__)
 
 # systemd targets whose pending start job tells a reboot from a power-off.
@@ -24,12 +26,16 @@ def clean_env() -> dict[str, str]:
     Processes started from a PyInstaller-frozen host (Decky Loader) inherit an
     LD_LIBRARY_PATH that points at the host's bundled libraries, which breaks system
     binaries.  Drop it (restoring the original value if the host saved one).
+
+    The notification socket systemd gave this service is not passed on either: a tool that
+    finds NOTIFY_SOCKET reports on our behalf (systemctl sends its own EXIT_STATUS there).
     """
     env = dict(os.environ)
     original = env.pop("LD_LIBRARY_PATH_ORIG", None)
     env.pop("LD_LIBRARY_PATH", None)
     if original:
         env["LD_LIBRARY_PATH"] = original
+    env.pop("NOTIFY_SOCKET", None)
     return env
 
 
@@ -47,7 +53,7 @@ async def run_command(argv: list[str], timeout: float) -> tuple[int, str]:
         log.debug("could not run %s: %s", argv[0], exc)
         return -1, ""
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        stdout, _ = await aio.wait_for(proc.communicate(), timeout)
     except TimeoutError:
         proc.kill()
         await proc.wait()

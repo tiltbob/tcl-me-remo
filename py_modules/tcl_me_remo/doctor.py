@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from . import __version__, display, paths, system
-from .bluez import rawhci
+from .bluez import kernel as bt_kernel
 from .ipc import RpcError, call_sync
 
 Runner = Callable[[list[str], float], Awaitable[tuple[int, str]]]
@@ -113,19 +113,25 @@ def direct_delivery_check(kernel: str, setting: str | None) -> dict[str, str]:
     """One line on direct delivery: the kernel, ``bluetooth.raw_notify``, and what the two come to.
 
     Direct delivery reaches a TV that did not subscribe again after a reboot (Android 11 to
-    13).  Before Linux 6.17 it disturbs the kernel's Bluetooth packet accounting, so ``auto``
-    leaves it alone there; see docs/how-it-works.md, "After a reboot".  ``setting`` is None
-    when the service could not be asked.
+    13).  Before Linux 6.17 it can disturb the kernel's Bluetooth packet accounting, so
+    ``auto`` leaves it alone there; see docs/how-it-works.md, "After a reboot".  ("Can": some
+    older kernels carry the fix as a backport, which their version does not show.)
+    ``setting`` is None when the service could not be asked.
+
+    The rule comes from ``bluez/kernel.py``, a module without dependencies: this report must
+    not need the Bluetooth transport, or the D-Bus library under it, to be importable.
     """
-    version = rawhci.kernel_version(kernel)
-    free = rawhci.direct_delivery_is_free(kernel)
-    fixed = ".".join(str(part) for part in rawhci.FIXED_KERNEL)
+    version = bt_kernel.kernel_version(kernel)
+    free = bt_kernel.direct_delivery_is_free(kernel)
+    fixed = ".".join(str(part) for part in bt_kernel.FIXED_KERNEL)
     if version is None:
         where = f"kernel {kernel!r} (version not recognised, treated as older than {fixed})"
+    elif version >= bt_kernel.FIXED_KERNEL and not free:
+        where = f"kernel {kernel} (an early release candidate, treated as older than {fixed})"
     else:
         where = f"kernel {kernel}"
     disturbs = (
-        f"before Linux {fixed} it disturbs the kernel's Bluetooth packet accounting, which the service repairs "
+        f"before Linux {fixed} it can disturb the kernel's Bluetooth packet accounting, which the service repairs "
         "after each link (unverified); if controllers or headsets stall, set it to 'auto'"
     )
     needs_pairing = "a TV that does not subscribe again after a reboot (Android 11 to 13) has to be paired again"
@@ -283,6 +289,12 @@ async def collect(
         elif bt.get("ready"):
             via = "direct delivery" if bt.get("delivery") == "raw" else "BlueZ"
             checks.append(_check("TV link", OK, f"{tv} is connected ({via})"))
+        elif bt.get("connected") and bt.get("error"):
+            checks.append(_check("TV link", WARN, f"{tv} is connected but not ready for keys: {bt['error']}"))
+        elif bt.get("connected"):
+            # The resting state after a boot or a wake: the TV was called and answered, and
+            # nothing has been sent yet.  How keys will travel is decided with the first one.
+            checks.append(_check("TV link", OK, f"{tv} is connected (no key sent on this link yet)"))
         else:
             reason = bt.get("error") or "the link comes up when it is needed"
             checks.append(_check("TV link", WARN, f"{tv} is not connected: {reason}"))
@@ -306,7 +318,7 @@ async def collect(
     report["direct_delivery"] = {
         "kernel": kernel,
         "raw_notify": raw_notify,
-        "side_effect_free": rawhci.direct_delivery_is_free(kernel),
+        "side_effect_free": bt_kernel.direct_delivery_is_free(kernel),
     }
     checks.append(direct_delivery_check(kernel, raw_notify))
 

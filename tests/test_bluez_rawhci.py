@@ -7,7 +7,7 @@ import struct
 import pytest
 
 from tcl_me_remo import hid, keys
-from tcl_me_remo.bluez import rawhci
+from tcl_me_remo.bluez import kernel, rawhci
 from tcl_me_remo.bluez.rawhci import HciConnection, RawError, RawLink
 
 TV = "AA:BB:CC:DD:EE:FF"
@@ -185,6 +185,21 @@ def test_dev_id_and_kernel_version_helpers():
         ("", None, False),
         ("v6.17", None, False),
         ("6", None, False),
+        # The clamp went into mainline between 6.17-rc3 and 6.17-rc4: the first three release
+        # candidates say "6.17" and still miscount, and there nothing would repair it.
+        ("6.17.0-rc1", (6, 17), False),
+        ("6.17.0-rc2-1-mainline", (6, 17), False),                      # Arch's linux-mainline
+        ("6.17.0-rc3", (6, 17), False),
+        ("6.17.0-0.rc3.20250828git07d9df80082b.31.fc43.x86_64", (6, 17), False),  # Fedora rawhide
+        ("6.17-rc3-amd64", (6, 17), False),                             # Debian experimental
+        ("6.17.0-rc4", (6, 17), True),
+        ("6.17.0-rc7-00123-gdeadbeef", (6, 17), True),
+        ("6.17.0-rc10", (6, 17), True),                                 # a number, not the digit 1
+        ("6.17.0-arch1-1", (6, 17), True),                              # "arch1" is no release candidate
+        ("6.17.3-rc1", (6, 17), True),                                  # a candidate of a later stable release
+        ("6.18.0-rc1", (6, 18), True),
+        ("7.0.0-rc2", (7, 0), True),
+        ("6.16.0-rc7", (6, 16), False),
     ],
 )
 def test_direct_delivery_is_free_only_on_kernels_known_to_clamp(release, version, free):
@@ -195,10 +210,35 @@ def test_direct_delivery_is_free_only_on_kernels_known_to_clamp(release, version
 
 
 def test_kernel_helpers_default_to_the_running_kernel(monkeypatch):
-    monkeypatch.setattr(rawhci.platform, "release", lambda: "6.18.44-fc-v338")
+    monkeypatch.setattr(kernel.platform, "release", lambda: "6.18.44-fc-v338")
     assert rawhci.kernel_version() == (6, 18) and rawhci.direct_delivery_is_free()
-    monkeypatch.setattr(rawhci.platform, "release", lambda: "6.11.11-valve19")
+    monkeypatch.setattr(kernel.platform, "release", lambda: "6.11.11-valve19")
     assert not rawhci.direct_delivery_is_free() and rawhci.kernel_needs_credit_repair()
+    monkeypatch.setattr(kernel.platform, "release", lambda: "6.17.0-rc2")
+    assert rawhci.kernel_version() == (6, 17) and not rawhci.direct_delivery_is_free()
+
+
+def test_the_kernel_rule_has_one_home():
+    """rawhci hands out kernel.py's functions, so the transport and the doctor cannot disagree."""
+    assert rawhci.direct_delivery_is_free is kernel.direct_delivery_is_free
+    assert rawhci.kernel_needs_credit_repair is kernel.kernel_needs_credit_repair
+    assert rawhci.kernel_version is kernel.kernel_version
+    assert rawhci.FIXED_KERNEL == kernel.FIXED_KERNEL == (6, 17) and kernel.FIXED_KERNEL_RC == 4
+
+
+async def test_a_remote_on_an_early_release_candidate_gets_the_old_kernel_s_treatment():
+    """6.17-rc1 to rc3: not used under "auto", and repaired when the user asks for it."""
+    from tcl_me_remo.bluez.remote import BleRemote
+    from tcl_me_remo.config import BluetoothConfig
+
+    class Bus:  # nothing is started: only what the constructor derives from the kernel is looked at
+        def export(self, *args): ...
+
+    early = BleRemote(Bus(), BluetoothConfig(), kernel_release="6.17.0-rc3")
+    assert early._direct_delivery() == "off" and early._raw.repairs
+    assert "6.17.0-rc3" in early._not_subscribed() and "'on'" in early._not_subscribed()
+    late = BleRemote(Bus(), BluetoothConfig(), kernel_release="6.17.0-rc4")
+    assert late._direct_delivery() == "needed" and not late._raw.repairs
 
 
 # --------------------------------------------------------------------------- RawLink with a fake backend

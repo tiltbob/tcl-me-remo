@@ -15,7 +15,8 @@ touching the CLI or the plugin.
   - `service.py` — every decision: lifecycle events, TV on/off/input sequences. Talks to the
     transports only through `interfaces.py`, so it is fully tested with fakes.
   - `bluez/` — the Bluetooth transport (BlueZ over D-Bus, plus a raw HCI delivery path and
-    a kernel management socket for ending the link at once before suspend).
+    a kernel management socket for ending the link at once before suspend). `kernel.py`
+    there is dependency-free on purpose: the doctor imports it.
   - `atv/` — the Wi-Fi assist.
   - `lifecycle.py`, `daemon.py`, `system.py` — logind locks, wiring, systemd helpers.
   - `config.py`, `keys.py`, `hid.py`, `macro.py`, `tvdata.py` — settings and tables.
@@ -47,7 +48,8 @@ tcl-me-remo doctor                   # read-only health report
   them for a bonded remote and Android before 14 never re-reads them. Changing a byte breaks
   every existing pairing without any error. New keys must fit the declared usage ranges.
 - **Do not restart the service or re-register the GATT application without need.** Either one
-  makes BlueZ forget the TV's subscription. Settings changes are applied live.
+  makes BlueZ forget the TV's subscription. Settings changes are applied live (the two exceptions,
+  `bluetooth.adapter` and `bluetooth.gatt_security`, say so in their help text).
 - **Standard library only**, plus the vendored D-Bus library. SteamOS has no pip and a
   read-only root. The plugin backend runs in Decky's own Python, so `ipc.py`, `paths.py`
   and `installer.py` must not import anything heavier.
@@ -75,6 +77,9 @@ On this machine:
 - Do not run `steamos-readonly disable`, do not install packages with pacman, and do not
   change anything under `/etc` by hand. Everything this project needs goes through
   `./install.sh`.
+- SteamOS has no pytest. `scripts/steamos-dev-setup.sh` makes `.venv/` in the checkout with
+  the test tools; run the tests with `.venv/bin/python -m pytest -q --timeout 60` before
+  installing a change. If there is no `.venv`, say so instead of installing untested code.
 - Keep test key presses short and never send `POWER` twice in a row.
 - When something does not work, capture evidence before changing code: `tcl-me-remo doctor`,
   `tcl-me-remo logs -n 200`, and a `btmon` trace of the attempt.

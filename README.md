@@ -83,6 +83,14 @@ Either way the service ends up in `/opt/tcl-me-remo`, its settings in `/var/lib/
 and the `tcl-me-remo` command is linked into `~/.local/bin`. These places survive SteamOS
 updates.
 
+On SteamOS `~/.local/bin` is not necessarily on your `PATH`. If the shell answers
+`command not found`, type the full name, `~/.local/bin/tcl-me-remo` (or
+`/opt/tcl-me-remo/bin/tcl-me-remo`), or add the directory once and open a new terminal:
+
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
 ## Set up
 
 1. **Prepare the TV** ([details](docs/tv-setup.md)). In Settings > System > Power & Energy
@@ -124,6 +132,7 @@ tcl-me-remo config input.hdmi_port 2
 tcl-me-remo wifi discover | pair <ip> | unpair
 tcl-me-remo doctor                 check the set-up; attach this to bug reports
 tcl-me-remo logs -n 100
+tcl-me-remo uninstall [--purge]    remove the service (asks sudo)
 ```
 
 ## Settings worth knowing
@@ -138,6 +147,7 @@ tcl-me-remo logs -n 100
 | `display.edid_match` | empty | Act only while a display with this name is connected (for example `TCL`) |
 | `input.method` | `none` | `macro`, `wifi` or `none` |
 | `input.hdmi_port` | 1 | The HDMI port the machine is on |
+| `input.wifi_fallback_to_macro` | off | With `input.method` `wifi`: play the key macro when the Wi-Fi request fails |
 | `bluetooth.reconnect_on_drop` | on | Keep calling the TV while it is not connected |
 | `bluetooth.raw_notify` | `auto` | Direct key delivery for TVs that do not re-subscribe after a reboot: `auto` (Linux 6.17 and later only), `on`, `off` |
 | `power.on_key`, `power.off_key` | `WAKE`, `SLEEP` | The keys used for power |
@@ -152,7 +162,9 @@ hooks, and says what is wrong in plain words.
 - **The TV does not turn on.** Almost always the TV's standby mode: see
   [setting up the TV](docs/tv-setup.md#if-the-tv-does-not-wake).
 - **The TV turns on by itself.** Turn off *Keep calling the TV*
-  (`bluetooth.reconnect_on_drop`).
+  (`bluetooth.reconnect_on_drop`). With it on, the machine calls the TV whenever the two are
+  not connected, also after a wake on which it does not turn the TV on; whether a TCL set
+  switches its screen on from being called has not been observed.
 - **Keys stopped working after a reboot.** `tcl-me-remo status` shows how keys are being
   delivered, and `tcl-me-remo doctor` says whether direct delivery, the way around a TV that
   does not re-subscribe after a reboot, is in use. On Linux kernels before 6.17 it is not
@@ -161,16 +173,46 @@ hooks, and says what is wrong in plain words.
   restores things.
 - **The machine does not show up on the TV when pairing.** Pairing mode closes after two
   minutes; open it again. Remove any earlier pairing between the TV and this machine first.
+- **Settings are back to their defaults and the TV shows as unpaired.** `tcl-me-remo status`
+  then has a `config:` line: the settings file could not be read (a slip while editing it
+  by hand, usually) and was kept as `/var/lib/tcl-me-remo/config.json.broken`. Mend it,
+  move it back to `config.json` and restart the service
+  (`sudo systemctl restart tcl-me-remo`).
 - **A Bluetooth LE controller no longer reconnects.** Set
-  `bluetooth.idle_disconnect_seconds` to `30`.
+  `bluetooth.idle_disconnect_seconds` to `30`. The link to the TV is then closed whenever
+  no key was sent for that long and made again when needed, so turning the TV off at
+  suspend depends on the TV answering within a few seconds.
 
 `tcl-me-remo logs` shows what the service did, step by step, for every action.
 
 ## Remove
 
-Uninstall the plugin in Decky; a few minutes later the service removes itself. Without Decky:
-`./install.sh uninstall` (add `--purge` to delete settings as well). On the TV, remove
-*SteamOS Remote* under Remotes & Accessories.
+From a terminal, however the service was installed:
+
+```sh
+tcl-me-remo uninstall            # stops and removes the service; settings and the pairing stay
+tcl-me-remo uninstall --purge    # also deletes the settings and the Bluetooth pairing
+```
+
+It asks `sudo` (on SteamOS, set a password first with `passwd`). If the shell does not find
+the command, it is `/opt/tcl-me-remo/bin/tcl-me-remo`. `./install.sh uninstall` in a
+checkout does the same. With `--purge` the machine forgets the TV; on the TV, remove this
+machine under Remotes & Accessories as well (it is listed as *SteamOS Remote*, or possibly
+under the machine's own Bluetooth name), or the two cannot be paired again.
+
+With Decky, uninstalling the plugin is enough in the usual case. Decky runs the same step
+when it only updates a plugin, so the service is not removed at that moment: about three
+minutes later it is checked whether the plugin is really gone, and only then is the service
+removed (settings and the pairing stay). If the machine is restarted or switched off before
+that, the check is made a few minutes after the service next starts. The check removes
+nothing when it cannot see Decky's plugins folder. That, and these two cases, are what the
+command above is for:
+
+- **Decky Loader itself was removed.** Its uninstaller does not tell the plugins, so the
+  service stays, and keeps turning the TV on and off, until you run `tcl-me-remo uninstall`.
+- **The plugin is still installed.** It puts the service back whenever it loads, so
+  uninstall it in Decky too. To delete the settings and the pairing from the panel instead,
+  use *Remove service* with *Also delete settings*, then uninstall the plugin.
 
 ## More
 

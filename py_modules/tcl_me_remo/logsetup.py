@@ -8,6 +8,9 @@ import time
 from collections import deque
 
 RING_SIZE = 1000
+# Longest line the ring keeps.  The ring is sent to clients (the "logs" request), so what it
+# holds is bounded in both directions whatever ends up in a log message.
+RING_LINE_CHARS = 500
 
 
 class RingHandler(logging.Handler):
@@ -20,7 +23,10 @@ class RingHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
-            self._lines.append(f"{stamp} {record.levelname:<7} {record.getMessage()}")
+            line = f"{stamp} {record.levelname:<7} {record.getMessage()}"
+            if len(line) > RING_LINE_CHARS:
+                line = line[: RING_LINE_CHARS - 3] + "..."
+            self._lines.append(line)
         except Exception:  # noqa: BLE001 - logging must never raise
             self.handleError(record)
 

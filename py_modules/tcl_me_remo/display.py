@@ -8,6 +8,7 @@ in Game Mode, Desktop Mode and before any session has started.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -22,6 +23,11 @@ INTERNAL_PREFIXES = ("eDP", "LVDS", "DSI")
 IGNORED_PREFIXES = ("Virtual", "Writeback")
 
 _CONNECTOR_RE = re.compile(r"^(card\d+)-(.+)$")
+
+log = logging.getLogger(__name__)
+# The reason last logged for an unreadable sysfs ("" = it was readable): the state is read
+# every time somebody asks for the status, and the log should say it once per change.
+_logged_unreadable = ""
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,10 @@ class Connector:
 @dataclass(frozen=True)
 class DisplayState:
     connectors: tuple[Connector, ...]
+    # Why the connectors could not be read, if sysfs is there but did not let us ("" = it
+    # was read, or the machine has no /sys/class/drm at all).  What ``connectors`` holds is
+    # then incomplete and must not be taken for the truth.
+    unreadable: str = ""
 
     @property
     def has_internal(self) -> bool:
@@ -58,6 +68,7 @@ class DisplayState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "has_internal": self.has_internal,
+            "unreadable": self.unreadable,
             "connectors": [dict(asdict(c), connected=c.connected, label=c.label) for c in self.connectors],
         }
 
@@ -85,14 +96,38 @@ def parse_edid(edid: bytes) -> tuple[str, str]:
     return maker, model
 
 
+def _note_readable(problem: str) -> None:
+    global _logged_unreadable
+    if problem == _logged_unreadable:
+        return
+    if problem:
+        log.warning("cannot read the display connectors (%s): the display check stays closed meanwhile", problem)
+    else:
+        log.info("the display connectors can be read again")
+    _logged_unreadable = problem
+
+
 def read_display_state(sys_root: Path | str = "/sys") -> DisplayState:
-    """Enumerate DRM connectors.  Never raises: an unreadable sysfs yields no connectors."""
+    """Enumerate DRM connectors.  Never raises.
+
+    A machine without ``/sys/class/drm`` has no connectors, and that is an answer.  A sysfs
+    that is there but cannot be read (the process is out of file descriptors, permission
+    denied, an I/O error) is not: the state then says so in ``unreadable``, and
+    :func:`evaluate` does not conclude from the missing connectors that the machine has no
+    screen of its own.
+    """
     base = Path(sys_root) / "class" / "drm"
     found: list[Connector] = []
     try:
         entries = sorted(base.iterdir(), key=lambda p: p.name)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        _note_readable("")
         return DisplayState(connectors=())
+    except OSError as exc:
+        problem = f"{base}: {exc.strerror or exc}"
+        _note_readable(problem)
+        return DisplayState(connectors=(), unreadable=problem)
+    problem = ""
     for entry in entries:
         match = _CONNECTOR_RE.match(entry.name)
         if not match:
@@ -102,7 +137,12 @@ def read_display_state(sys_root: Path | str = "/sys") -> DisplayState:
             continue
         try:
             status = (entry / "status").read_text(encoding="ascii", errors="replace").strip()
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # not a connector after all, or one that went away while we looked
+        except OSError as exc:
+            # This connector exists and we do not know what it is doing: leaving it out
+            # would turn a handheld into "a machine without a built-in screen".
+            problem = problem or f"{entry / 'status'}: {exc.strerror or exc}"
             continue
         maker = model = ""
         if status == "connected":
@@ -120,7 +160,8 @@ def read_display_state(sys_root: Path | str = "/sys") -> DisplayState:
                 model=model,
             )
         )
-    return DisplayState(connectors=tuple(found))
+    _note_readable(problem)
+    return DisplayState(connectors=tuple(found), unreadable=problem)
 
 
 def evaluate(cfg: DisplayConfig, state: DisplayState) -> Gate:
@@ -129,6 +170,9 @@ def evaluate(cfg: DisplayConfig, state: DisplayState) -> Gate:
     needle = cfg.edid_match.strip().lower()
     if mode == "no":
         return Gate(True, "display check is off")
+    if state.unreadable:
+        # Not knowing is not "no built-in screen": stay closed until the state can be read.
+        return Gate(False, f"the display connectors could not be read ({state.unreadable})")
 
     externals = state.external_connected
     if mode == "auto" and not state.has_internal and not needle:

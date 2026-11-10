@@ -6,18 +6,26 @@ Steam restarts; this file only
   * installs / repairs / updates that service when the plugin loads, and
   * forwards the panel's requests to the service's control socket.
 
-It uses nothing beyond asyncio and json and runs the installer with the system Python, so it
-does not depend on which standard-library modules Decky's bundled interpreter happens to ship.
+It uses nothing beyond asyncio, json, os and time, and runs the installer with the system
+Python, so it does not depend on which standard-library modules Decky's bundled interpreter
+happens to ship.
 """
 
 import asyncio
 import json
 import os
+import time
 
 import decky
 
 PLUGIN_DIR = decky.DECKY_PLUGIN_DIR
+# Where Decky keeps its plugins.  This one's own folder is named by whatever zip it came from.
+PLUGINS_DIR = os.path.dirname(os.path.normpath(PLUGIN_DIR))
 SOCKET_PATH = "/run/tcl-me-remo/control.sock"
+# The service's state directory, and the note left there when Decky removes this plugin
+# (installer.REMOVED_MARKER; the installer reads it).
+STATE_DIR = "/var/lib/tcl-me-remo"
+REMOVED_MARKER = "plugin-removed.json"
 SYSTEM_PYTHON = "/usr/bin/python3"
 MAX_REPLY = 1 << 20
 
@@ -44,8 +52,16 @@ TIMEOUTS = {
     "wifi_pair_finish": 30.0,
 }
 DEFAULT_TIMEOUT = 15.0
-# Seconds after an uninstall hook before checking whether the plugin is really gone.
+# Seconds after an uninstall hook before checking whether the plugin is really gone
+# (installer.ORPHAN_CHECK_DELAY).
 ORPHAN_CHECK_DELAY = 180
+# How that check runs under systemd-run (installer.ORPHAN_CHECK_OPTIONS).
+ORPHAN_CHECK_OPTIONS = (
+    "--collect",
+    "--quiet",
+    "--property=RuntimeMaxSec=600",
+    "--description=tcl-me-remo: remove the service if the plugin is gone",
+)
 # Where the installer puts the service's code (first choice, then its fallback).
 INSTALLED_MODULES = ("/opt/tcl-me-remo/py_modules", "/var/lib/tcl-me-remo/app/py_modules")
 
@@ -119,11 +135,42 @@ async def _socket_call(method, params, timeout):
 
 
 def _installed_modules():
-    """The py_modules directory of the installed service (not the plugin's own copy)."""
+    """The py_modules directory of the installed service (not the plugin's own copy), or None."""
     for path in INSTALLED_MODULES:
         if os.path.isdir(os.path.join(path, "tcl_me_remo")):
             return path
-    return INSTALLED_MODULES[0]
+    return None
+
+
+def _note_removal(plugins_dir):
+    """Record that Decky removed this plugin, where the service's installer will find it.
+
+    A plain file write, so it fits the few seconds Decky allows.  Written to the disk before
+    it gets its name: the machine may be switched off right after an uninstall, and a note
+    that comes back empty would be worth nothing.  Returns False if the write failed.
+    """
+    note = {"plugins_dir": plugins_dir, "time": int(time.time())}
+    path = os.path.join(STATE_DIR, REMOVED_MARKER)
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(note) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(path + ".tmp", path)
+    except OSError as exc:
+        decky.logger.warning("could not note the removal in %s: %s", path, exc)
+        return False
+    try:
+        directory = os.open(STATE_DIR, os.O_RDONLY)
+    except OSError:
+        return True
+    try:
+        os.fsync(directory)  # the new name, too
+    except OSError:
+        pass
+    finally:
+        os.close(directory)
+    return True
 
 
 def _failure(code, message):
@@ -149,22 +196,38 @@ class Plugin:
 
     async def _uninstall(self):
         # Decky calls this for updates as well as removals, and kills us 5 seconds after asking
-        # us to stop.  So nothing is removed here: a timer checks later whether the plugin is
-        # really gone and only then removes the service.  Settings and the TV pairing are kept
-        # either way.
+        # us to stop.  So nothing is removed here.  A note is left for the installed service,
+        # and a timer has its installer check later whether a plugin of ours is still there;
+        # only if not is the service removed.  A reboot discards the timer but not the note:
+        # the service looks for it a few minutes after every start.  The next install (this
+        # plugin loading again after an update) removes the note.  Settings and the TV
+        # pairing are kept either way.
         modules = _installed_modules()
+        if modules is None:
+            return  # no service of ours is installed: nothing to clean up later
+        check = ["uninstall-if-orphaned"]
+        noted = _note_removal(PLUGINS_DIR)
+        if not noted:
+            # Without the note (a full /var, say) the timer is the only check there will be,
+            # and it has to be told where to look.  With one, the note decides, so that an
+            # install in the meantime cancels the check by removing it.
+            check += ["--plugins-dir", PLUGINS_DIR]
         argv = [
             "systemd-run",
             f"--on-active={ORPHAN_CHECK_DELAY}",
-            "--collect",
-            "--quiet",
-            "--description=tcl-me-remo: remove the service if the plugin is gone",
+            *ORPHAN_CHECK_OPTIONS,
             SYSTEM_PYTHON, "-I", "-c", INSTALLER_SNIPPET, modules,
-            "uninstall-if-orphaned", PLUGIN_DIR,
+            *check,
         ]  # fmt: skip
         code, _out, err = await _run(argv, 3.0)
         if code != 0:
-            decky.logger.warning("could not schedule the clean-up check: %s", err.strip())
+            decky.logger.warning(
+                "could not schedule the clean-up check (%s): %s",
+                "the service makes it after its next start"
+                if noted
+                else "if this plugin is not installed again, remove the service with: tcl-me-remo uninstall",
+                err.strip(),
+            )
 
     async def _ensure_service(self):
         """Install, update or repair the service.  Callers arriving meanwhile share the result."""

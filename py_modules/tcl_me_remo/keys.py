@@ -153,6 +153,54 @@ def resolve(spec: str) -> Key:
     )
 
 
+# Usages that reach Android as KEYCODE_POWER, which switches the TV on when it is off and off
+# when it is on: Generic Desktop "System Power Down" (0x81), Consumer "Power" (0x30) and
+# Keyboard "Power" (0x66) all become Linux KEY_POWER; Consumer 0x19E ("AL Terminal Lock /
+# Screensaver", Linux KEY_COFFEE) is POWER in Android's generic key layout up to Android 15.
+_POWER_TOGGLES = frozenset(
+    {(PAGE_SYSTEM, 0x81), (PAGE_CONSUMER, 0x0030), (PAGE_KEYBOARD, 0x66), (PAGE_CONSUMER, 0x019E)}
+)
+_POWER_ON = frozenset({(PAGE_SYSTEM, 0x83)})
+# Consumer "Sleep" (0x32, the key named SLEEP) and "Sleep Mode" (0x34) both become Linux
+# KEY_SLEEP, which is Android's KEYCODE_SLEEP.
+_POWER_OFF = frozenset({(PAGE_CONSUMER, 0x0032), (PAGE_CONSUMER, 0x0034)})
+# System Sleep: KEYCODE_SLEEP up to Android 15, LOCK from Android 16.
+_POWER_UNCLEAR = frozenset({(PAGE_SYSTEM, 0x82)})
+
+
+def is_power_toggle(spec: str | Key) -> bool:
+    """True if the key is a power *toggle*, however it is spelled (``POWER``, ``S:81``, ``C:0030`` ...).
+
+    Decided from the HID page and usage, not from the name: a raw spec is the same key press.
+    An unknown spec is not a toggle (it is no key at all).
+    """
+    try:
+        key = spec if isinstance(spec, Key) else resolve(spec)
+    except UnknownKey:
+        return False
+    return (key.page, key.usage) in _POWER_TOGGLES
+
+
+def power_effect(spec: str | Key) -> str:
+    """What the key does to the TV's power: ``"on"``, ``"off"``, ``"unknown"``, or ``""`` for none.
+
+    ``"unknown"`` is a key whose effect depends on the state the TV is in or on its Android
+    version: the toggles, and System Sleep (see above).
+    """
+    try:
+        key = spec if isinstance(spec, Key) else resolve(spec)
+    except UnknownKey:
+        return ""
+    usage = (key.page, key.usage)
+    if usage in _POWER_ON:
+        return "on"
+    if usage in _POWER_OFF:
+        return "off"
+    if usage in _POWER_TOGGLES or usage in _POWER_UNCLEAR:
+        return "unknown"
+    return ""
+
+
 def catalog() -> list[dict[str, str]]:
     """All named keys, for UIs and ``tcl-me-remo keys``."""
     return [

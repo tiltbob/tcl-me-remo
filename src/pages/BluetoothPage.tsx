@@ -248,7 +248,7 @@ export const BluetoothPage: FC = () => {
           state={state}
           path="bluetooth.adapter"
           label="Bluetooth adapter"
-          description="Leave on Automatic unless the machine has more than one adapter."
+          description="Leave on Automatic unless the machine has more than one adapter. A change takes effect when the service restarts (Diagnostics)."
           choices={adapters}
         />
         <SettingChoice

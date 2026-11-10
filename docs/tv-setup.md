@@ -6,7 +6,7 @@ with ordinary remote keys:
 
 | State | How the TV gets there | Reachable? |
 |---|---|---|
-| Screen off, system running | Power button, with **Screenless service** (or the equivalent standby mode) on | Yes: the TV reconnects and obeys the wake key |
+| Screen off, system running | Power button, with **Screenless service** (or the equivalent standby mode) on | Expected, from Android's source: the TV reconnects and obeys the wake key |
 | Suspended (quick start) | Power button, with Quick start on but Screenless service off | Only by the stock remote, the TV's own button or HDMI-CEC (see [wake beacon](#if-the-tv-does-not-wake)) |
 | Fully off | Quick start off, or "Shut down" chosen from the long-press power menu | No |
 
@@ -57,8 +57,9 @@ If the machine does not show up in the TV's list:
   instance), remove that pairing on the TV first.
 - Move the machine closer for the pairing step.
 
-To start over, choose **Forget TV** in the panel *and* remove *SteamOS Remote* under
-Remotes & Accessories on the TV. Both sides have to forget before pairing again. Cancelling
+To start over, choose **Forget TV** in the panel *and* remove this machine under Remotes &
+Accessories on the TV (it is listed as *SteamOS Remote*, or possibly under the machine's own
+Bluetooth name). Both sides have to forget before pairing again. Cancelling
 a pairing that got halfway can take a couple of seconds while the half-made bond is removed.
 
 ## Check that it works
@@ -89,8 +90,8 @@ does not answer over Bluetooth.
    Network & Internet.
 3. Pair: `tcl-me-remo wifi pair 192.168.1.50` (your TV's address). The TV shows a code of
    six characters; type it in. The TV has to be on for this.
-4. To switch inputs this way, set `input.method` to `wifi` and choose the set of links that
-   matches your TV (`wifi.link_preset`):
+4. To switch inputs this way, choose the set of links that matches your TV
+   (`wifi.link_preset`) and, once it is shown to work, set `input.method` to `wifi`:
 
    | Preset | For |
    |---|---|
@@ -99,9 +100,15 @@ does not answer over Bluetooth.
    | `tcl-realtek-alt` | reported for C635 |
    | `custom` | your own link in `wifi.app_link`, with `{port}` for the port number |
 
-   Then try it while the TV shows some other input: `tcl-me-remo input --via wifi`. These
-   links come from owners' reports of other models, not from tests on your TV: if the first
-   preset does nothing, try the next.
+   Try it first, while the TV shows some other input: `tcl-me-remo input --via wifi`, and
+   watch the TV: the service can only tell that the TV accepted the request, not that the
+   input changed. These links come from owners' reports of other models, not from tests on
+   your TV: if the first preset does nothing, try the next. Set `input.method` only once
+   one works.
+
+   When the TV's network is not up in time after a wake, the request fails. The service
+   falls back to the Bluetooth key macro only if you turn on `input.wifi_fallback_to_macro`;
+   watch that macro work first ([macros](macros.md)), because it presses keys blindly.
 
 Pairing stores a key for this machine in `/var/lib/tcl-me-remo/atv` and remembers the TV's
 certificate; later connections are refused unless the TV presents the same one, so after a
@@ -115,8 +122,9 @@ depends on *Screenless service* / the network standby mode.
 ## If the TV does not wake
 
 - Re-check Screenless service / Standby Mode. This is the cause in most cases.
-- Models with a MediaTek chipset (Q7, QM6K, QM7, QM8 and others) listen, while suspended, for
-  a special Bluetooth advertisement that their own remote sends, not for a connection.
+- MediaTek's reference design, which sets with a MediaTek chipset (Q7, QM6K, QM7, QM8 and
+  others) are built on, wakes a suspended TV on a special Bluetooth advertisement from its
+  own remote, not on a connection. Whether TCL's sets and remotes use it is not known.
   tcl-me-remo has an experimental, off-by-default **wake beacon** setting that broadcasts
   MediaTek's default pattern, and a custom mode for a pattern captured from your own remote.
   See [how it works](how-it-works.md#wake-beacon).

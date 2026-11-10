@@ -61,7 +61,13 @@ Which link
     ``HCIGETCONNLIST``) is consulted first: should it list the TV's link under another
     address, that address is used instead.  Such an address is the one the TV used on the
     air and not its identity, hence a private address, and private addresses are random
-    addresses by definition (Core specification, Vol 6, Part B, 1.3.2).
+    addresses by definition (Core specification, Vol 6, Part B, 1.3.2).  From what the
+    sources show this case does not arise for a link bluetoothd reports as the TV's (its
+    address comes from the same ``hci_conn.dst``), so it is taken only when nothing else can
+    be meant: no entry at all under the TV's address - the list includes links that are
+    already closing, and such an entry means the TV's link is accounted for - and exactly one
+    link from a peer that connected to us, up, under a resolvable private address.  Anything
+    else is left to ``Device1.Disconnect()``; see :func:`disconnect_target`.
 
 Layout: packet building and parsing are pure functions; :class:`MgmtSocketBackend` is the only
 code that touches the operating system, and tests replace it.
@@ -76,7 +82,7 @@ import struct
 from typing import Callable, Protocol
 
 from . import rawhci
-from .rawhci import HciConnection, RawBackend, RawError
+from .rawhci import HciConnection, RawBackend
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +174,18 @@ def describe_status(status: int) -> str:
     return _STATUS_TEXT.get(status, f"the kernel answered with status 0x{status:02X}")
 
 
+def is_resolvable_private(address: str) -> bool:
+    """Whether ``address``, taken as a random address, is a resolvable private one.
+
+    The two most significant bits say which kind a random address is: 01 resolvable private,
+    00 non-resolvable private, 11 static (Core specification, Vol 6, Part B, 1.3.2).
+    """
+    try:
+        return parse_bdaddr(address)[5] & 0xC0 == 0x40
+    except ValueError:
+        return False
+
+
 def disconnect_target(
     tv_address: str, bluez_type: str, connections: list[HciConnection] | None
 ) -> tuple[str, int]:
@@ -175,18 +193,48 @@ def disconnect_target(
 
     ``connections`` is the kernel's connection list, or None if it could not be read; then
     bluetoothd's pair is all there is, which is also what bluetoothd itself would send.
-    Raises :class:`MgmtError` rather than pick a link that might belong to something else.
+    Raises :class:`MgmtError` rather than name a link that might belong to something else:
+    ending the wrong link cannot be taken back, and the caller has a slower way that cannot
+    go wrong.
+
+    The list holds links in every state, those on their way down included
+    (``hci_get_conn_list`` copies each entry of the connection hash).  That is used here: a
+    link listed under the TV's own address is the TV's whatever its state, and then no other
+    link is ever considered.
     """
     wanted = tv_address.strip().upper()
-    if connections is not None:
-        try:
-            link = rawhci.find_tv_link(connections, wanted)
-        except RawError as exc:
-            raise MgmtError(str(exc)) from None
-        if link.address.upper() != wanted:
-            # Listed under the address the TV used on the air: a private, hence random, one.
-            return link.address.upper(), BDADDR_LE_RANDOM
-    return wanted, le_address_type(bluez_type)
+    if connections is None:
+        return wanted, le_address_type(bluez_type)
+    links = [conn for conn in connections if conn.is_le]
+    own = [conn for conn in links if conn.address.upper() == wanted]
+    if own:
+        if not any(conn.is_up for conn in own):
+            # A Disconnect is under way already (bluetoothd's own, two seconds after a
+            # Device1.Disconnect); a second one would only be refused, or worse.
+            raise MgmtError("the kernel is already closing the TV's link")
+        return wanted, le_address_type(bluez_type)
+    # Not listed under its identity address.  The TV is then the peer that connected *to us*
+    # under the address it used on the air, a resolvable private one - but only if there is
+    # no doubt about which peer that is: exactly one incoming LE link, in whatever state,
+    # and that one up.
+    incoming = [conn for conn in links if not conn.outgoing]
+    if not incoming:
+        raise MgmtError("the controller reports no Bluetooth LE link from the TV")
+    if len(incoming) > 1:
+        raise MgmtError(
+            f"{len(incoming)} devices are connected to this machine over Bluetooth LE and none is listed as the TV"
+        )
+    link = incoming[0]
+    if not link.is_up:
+        raise MgmtError("the only Bluetooth LE link to this machine is closing already and is not listed as the TV")
+    if not is_resolvable_private(link.address):
+        raise MgmtError(
+            f"the only Bluetooth LE link to this machine is from {link.address.upper()}, which is neither the TV's "
+            "address nor a private address it could be using"
+        )
+    log.info("mgmt: no link is listed under %s; naming the only incoming LE link (%s)", wanted, link.address.upper())
+    # A private address is a random address by definition.
+    return link.address.upper(), BDADDR_LE_RANDOM
 
 
 # --------------------------------------------------------------------------- OS access

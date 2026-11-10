@@ -1,4 +1,9 @@
 import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -174,7 +179,12 @@ async def test_specific_faults(tmp_path):
         ("6.16.12-200.fc42.x86_64", "auto", "ok", "or set raw_notify to 'on'"),
         ("6.11.11-valve19", "off", "ok", "never used"),
         # The user asked for it on a kernel it disturbs: say what to watch for.
-        ("6.11.11-valve19", "on", "warn", "used when the TV needs it; before Linux 6.17 it disturbs"),
+        ("6.11.11-valve19", "on", "warn", "used when the TV needs it; before Linux 6.17 it can disturb"),
+        # The first release candidates of 6.17 did not have the fix yet.
+        ("6.17.0-rc3", "auto", "ok", "an early release candidate, treated as older than 6.17"),
+        ("6.17.0-rc3", "auto", "ok", "not used on this kernel"),
+        ("6.17.0-rc3", "on", "warn", "the service repairs after each link (unverified)"),
+        ("6.17.0-rc4", "auto", "ok", "used when the TV needs it (no side effects from Linux 6.17 on)"),
         ("6.11.11-valve19", "always", "warn", "if controllers or headsets stall, set it to 'auto'"),
         # A release that cannot be read counts as old.
         ("garbage", "auto", "ok", "not used on this kernel"),
@@ -237,3 +247,59 @@ def test_parsers(tmp_path):
     assert doctor.read_os_release(tmp_path) == {}
     assert doctor.read_main_conf(tmp_path / "nope.conf") == {}
     assert doctor.read_adapters(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "bluetooth, status, detail",
+    [
+        # After a boot or a wake on which nothing was sent: up and unused is not a problem.
+        ({"connected": True, "ready": False}, "ok", "Living Room TV is connected (no key sent on this link yet)"),
+        (
+            {"connected": True, "ready": False, "error": "the TV is connected but will not receive keys: ..."},
+            "warn",
+            "Living Room TV is connected but not ready for keys: the TV is connected but will not receive keys: ...",
+        ),
+        (
+            {"connected": False, "ready": False},
+            "warn",
+            "Living Room TV is not connected: the link comes up when it is needed",
+        ),
+        (
+            {"connected": False, "ready": False, "error": "the TV did not connect over Bluetooth"},
+            "warn",
+            "Living Room TV is not connected: the TV did not connect over Bluetooth",
+        ),
+    ],
+)
+async def test_tv_link_line_tells_an_unused_link_from_a_missing_one(tmp_path, bluetooth, status, detail):
+    state = {**STATUS, "bluetooth": {**STATUS["bluetooth"], "delivery": "", **bluetooth}}
+    report = await doctor.collect(make_runner(), call=service(status=state), root=make_root(tmp_path))
+    assert by_name(report)["TV link"] == {"name": "TV link", "status": status, "detail": detail}
+
+
+def test_the_doctor_does_not_need_the_bluetooth_transport_to_start():
+    """It is the tool for a half-broken installation: it must import, and state the direct
+    delivery situation, where the transport or the vendored D-Bus library cannot be loaded."""
+    script = textwrap.dedent(
+        """
+        import importlib.abc, sys
+
+        class Broken(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if "dbus_fast" in name or name in ("tcl_me_remo.dbus", "tcl_me_remo.bluez.remote"):
+                    raise ImportError(f"simulated: {name} is unusable")
+                return None
+
+        sys.meta_path.insert(0, Broken())
+        from tcl_me_remo import doctor
+
+        line = doctor.direct_delivery_check("6.11.11-valve19-1-neptune-611", "auto")
+        assert line["status"] == "ok" and "not used on this kernel" in line["detail"], line
+        loaded = sorted(name for name in sys.modules if "dbus" in name or name.startswith("tcl_me_remo.bluez."))
+        assert loaded == ["tcl_me_remo.bluez.kernel"], loaded
+        print("fine")
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(doctor.__file__).resolve().parents[1])}
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60, env=env)
+    assert result.returncode == 0 and result.stdout.strip() == "fine", result.stderr

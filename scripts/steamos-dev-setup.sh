@@ -12,8 +12,22 @@
 #   2. makes sure ~/.local/bin is on your PATH
 #   3. clones this repository to ~/tcl-me-remo if you are not already in a checkout
 #   4. with --adb: downloads Google's Android platform-tools so the TV can be inspected
-#   5. tells you how to start the session
+#   5. checks whether sudo can work (it only looks; installing the service needs sudo once)
+#   6. makes a private Python environment in the checkout (.venv) with the test tools, so
+#      that a change made on this machine can be tested before it is installed
+#   7. tells you how to start the session
 set -euo pipefail
+
+usage() {
+    # The comment block at the top of this file.  Piped into bash there is no file to read.
+    local self="${BASH_SOURCE[0]:-}"
+    if [[ -n "$self" && -f "$self" && -r "$self" ]]; then
+        awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$self"
+    else
+        echo "usage: steamos-dev-setup.sh [--adb] [--yes] [--branch NAME]"
+        echo "Prepares a SteamOS machine for hardware testing with Claude Code; see the top of the script."
+    fi
+}
 
 REPO_URL="https://github.com/tiltbob/tcl-me-remo"
 BRANCH=""
@@ -25,7 +39,7 @@ while [[ $# -gt 0 ]]; do
         --adb) WANT_ADB=1 ;;
         --yes|-y) ASSUME_YES=1 ;;
         --branch) BRANCH="${2:?--branch needs a name}"; shift ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -119,6 +133,21 @@ elif [[ "$(passwd -S 2>/dev/null | awk '{print $2}')" == "NP" ]]; then
     note "Installing the service needs sudo once."
 else
     note "sudo will ask for your password when the service is installed."
+fi
+
+# ---------------------------------------------------------------- 6. test tools
+say "6. test tools"
+# SteamOS has no pip and no pytest; a virtual environment inside the checkout touches
+# nothing on the system (.venv/ is ignored by git).  It needs the network once.
+if [[ -x "$CHECKOUT/.venv/bin/python" ]] && "$CHECKOUT/.venv/bin/python" -c "import pytest, pytest_asyncio, pytest_timeout" 2>/dev/null; then
+    note "already there: $CHECKOUT/.venv"
+elif python3 -m venv "$CHECKOUT/.venv" 2>/dev/null \
+    && "$CHECKOUT/.venv/bin/python" -m pip install --quiet pytest pytest-asyncio pytest-timeout; then
+    note "made $CHECKOUT/.venv  (run the tests with: .venv/bin/python -m pytest -q --timeout 60)"
+else
+    note "could not make a test environment (no network, or this Python has no venv/pip)."
+    note "Changes made on this machine then cannot be tested here: commit them to a branch and"
+    note "let them be tested elsewhere before installing them."
 fi
 
 # ---------------------------------------------------------------- next steps

@@ -23,13 +23,15 @@ tcl-me-remo macro "F3 1.5s LEFT*8 RIGHT*{port} OK"
 ```
 
 Between keys the machine pauses for `bluetooth.key_gap_ms` (350 ms by default) so the TV's
-menus can keep up. A macro may have at most 64 steps and run for two minutes.
+menus can keep up. A macro may be at most 1024 characters long, have at most 64 steps and
+run for two minutes; a macro over a limit is refused when it is saved, not when it is due.
 
 ## Switching inputs with a macro
 
 Android TVs have no key for "go to HDMI 2" that a generic remote can send, so a macro has to
-walk through the TV's source list. TCL's list does not wrap around at the ends, which makes
-a reliable recipe possible:
+walk through the TV's source list. TCL's list is reported not to wrap around at the ends
+(one owner, on a 2023 model; check yours, because on a list that wraps the recipe lands
+somewhere arbitrary). If it does not wrap, a reliable recipe is possible:
 
 1. open the list;
 2. press Left (or Up) more times than the list has entries, so the cursor is at the first
@@ -76,8 +78,8 @@ on before it starts the macro. A TV that has just woken ignores keys for a few s
 
 | Name | Sent as | TV sees |
 |---|---|---|
-| `WAKE` | System Wake Up | wake (does nothing if already on) |
-| `SLEEP` | Consumer Sleep | sleep (does nothing if already off) |
+| `WAKE` | System Wake Up | wake (on stock Android: does nothing if already on) |
+| `SLEEP` | Consumer Sleep | sleep (on stock Android: does nothing if already off) |
 | `POWER` | System Power Down | power toggle; avoid in anything automatic |
 | `UP` `DOWN` `LEFT` `RIGHT` `OK` | Consumer menu keys | D-pad and select |
 | `BACK` `HOME` `MENU` | Consumer | Back, Home, Menu |

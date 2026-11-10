@@ -36,7 +36,11 @@ class BleState:
     """Snapshot of the Bluetooth remote, shown verbatim in the UI.
 
     ``subscribed`` is about the paired TV only: it is False whenever no TV is paired, even if
-    BlueZ still holds the subscription of a TV that has been forgotten since.
+    BlueZ still holds the subscription of a TV that has been forgotten since.  A TV has three
+    subscriptions, one per key report, and writes them one after another; ``subscribed`` is
+    True from the first.  Whether every key has a way to the TV is not read from it: ``ready``
+    with ``delivery`` "bluez" normally means all three are there (the exception is a TV that
+    stopped after some, with direct delivery not allowed: see :meth:`Remote.send_key`).
 
     ``error`` is one human-readable sentence, "" when there is nothing to say.  It carries,
     in this order of precedence: the last problem that stopped the TV from being reached
@@ -47,7 +51,9 @@ class BleState:
     is also discoverable over classic Bluetooth), and after it closed without a TV, how it
     ended (timed out, interrupted because Bluetooth went away, the TV's address was not
     reported).  A window the user cancelled, and one that paired a TV, leave nothing.  All of
-    it is cleared when the TV becomes ready for keys and when pairing mode is opened.
+    it is cleared when the TV becomes ready for keys and when pairing mode is opened.  A
+    request that is refused only because pairing mode is open is not a problem in this sense
+    and leaves no trace here: the warning about the open window stays visible.
     """
 
     available: bool = False        # BlueZ is reachable and an adapter exists
@@ -104,6 +110,18 @@ class Remote(Protocol):
         """Press the key, keep it down ``hold`` seconds, release it.
 
         Raises :class:`TransportError` (``not_connected``) if the link is not ready.
+
+        Returning means the key was handed to something that delivers it.  It is never handed
+        to BlueZ for a report the TV has not subscribed to (BlueZ would drop it silently): on
+        a link that is ready although the TV subscribed to some of its three key reports only
+        and direct delivery is not allowed, a key in one of the others raises
+        ``not_subscribed`` and nothing is sent, while the link stays ready for the rest.
+
+        A link that stops being ready while the key is down ends the key early: the key is
+        released first wherever a release can still reach the TV, and when ``hold`` is over
+        the call raises ``not_connected`` (the link dropped or was closed, or key delivery
+        was changed in the settings) or ``not_subscribed`` (the TV ended a subscription; the
+        link is still up).
         """
 
     async def start_pairing(self, timeout: float) -> None:
@@ -131,8 +149,11 @@ class Remote(Protocol):
         (BlueZ's own delay).  ``fast=True`` is for the moments before the machine sleeps or
         powers off: the link is ended at once and with the reason code a remote control gives
         (0x13, "remote user terminated connection") - if the machine went down with the link
-        up, the kernel would end it with "power off" (0x15), after which several Android
-        versions do not connect to a remote again by themselves.  The request to end the link
+        up, the kernel would end it with "power off" (0x15).  Going by Android's source, the
+        HID host of Android 13 and 14 arms its connection to a remote again after 0x13 and
+        not after 0x15 (though another layer of those versions may reconnect regardless),
+        Android 11 and 12 after neither, Android 16 after either; whether a TV behaves
+        differently for the two has not been observed.  The request to end the link
         is made within a fraction of a second (a report sent just before is given that time
         to go out) and is not taken back if the caller stops waiting; the call returns when
         the link is down or shortly after the request was made, whichever comes first.  Where
@@ -144,9 +165,10 @@ class Remote(Protocol):
 
         Called by the service at every boot and resume, before it decides whether anything
         is sent to the TV.  Synchronous, cheap, never raises.  It only lifts what
-        :meth:`disconnect` imposed: nothing happens unless ``reconnect_on_drop`` is on and a
-        TV is bonded, and a link that is configured to be dropped when idle
-        (``idle_disconnect_seconds``) stays down until there is something to send.
+        :meth:`disconnect` (or the idle time-out) imposed: nothing happens unless
+        ``reconnect_on_drop`` is on and a TV is bonded.  The TV is then called whether or not
+        anything will be sent to it.  With ``idle_disconnect_seconds`` set, the link this
+        brings up is dropped again after that time without a key, like any other link.
         """
 
 

@@ -2,8 +2,8 @@
 # Install (or update) the tcl-me-remo service from this checkout.
 #
 #   ./install.sh              install or update, then start the service
-#   ./install.sh uninstall    stop and remove the service (settings are kept)
-#   ./install.sh uninstall --purge
+#   ./install.sh uninstall    stop and remove the service (settings and the pairing are kept)
+#   ./install.sh uninstall --purge    ... and delete the settings and the Bluetooth pairing
 #   ./install.sh status
 #
 # The Decky plugin does the same thing on its own; this script is for using the service
@@ -25,9 +25,17 @@ if [[ "$command" != "status" && "$(id -u)" -ne 0 ]]; then
         echo "tcl-me-remo: run this as root" >&2
         exit 1
     fi
+    if [[ "$command" == "install" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        # Checked here because sudo replaces PATH: the installer itself cannot see the user's.
+        echo "Note: the tcl-me-remo command is linked into ~/.local/bin, which is not on your PATH."
+        echo "      Type ~/.local/bin/tcl-me-remo, or add the directory once and open a new terminal:"
+        echo "        echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+    fi
     echo "Root is needed to install a system service; asking sudo."
     echo "(On SteamOS, set a password first with: passwd)"
-    exec sudo -- "$0" "$command" "$@"
+    # Not "$0": started as "bash install.sh" that is a bare name, which sudo would look up
+    # in its own PATH.  And through bash, so that a lost execute bit does not matter.
+    exec sudo -- bash "$here/install.sh" "$command" "$@"
 fi
 
 args=("$command" "$@")

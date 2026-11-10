@@ -9,7 +9,7 @@ A macro is a list of tokens separated by spaces and/or commas:
 
 Example - open the TV's input list, go to the top, pick the third entry:
 
-    SETTINGS 1.5s UP*6 DOWN*2 OK
+    F3 1.5s UP*6 DOWN*2 OK
 
 ``{port}`` and ``{port-1}`` style placeholders are substituted with the configured HDMI port
 before parsing (see :func:`render`), so a preset can say ``DOWN*{port}``.
@@ -24,6 +24,10 @@ from typing import Awaitable, Callable
 
 from . import keys
 
+# Longest macro text that is looked at at all.  It is the limit of the ``input.macro`` setting
+# (config.py), applied to every other source of macro text as well: text arrives over the
+# control socket, and parsing runs in the service's only event loop.
+MAX_TEXT = 1024
 MAX_STEPS = 64
 MAX_REPEAT = 30
 MAX_HOLD = 10.0
@@ -31,7 +35,10 @@ MAX_WAIT = 30.0
 MAX_TOTAL_SECONDS = 120.0
 
 _WAIT_RE = re.compile(r"^(\d+(?:\.\d+)?)(MS|S)$")
-_PLACEHOLDER_RE = re.compile(r"\{\s*port\s*(?:([+-])\s*(\d+))?\s*\}", re.IGNORECASE)
+_PLACEHOLDER_RE = re.compile(r"\{\s*port\s*(?:([+-])\s*([0-9]+))?\s*\}", re.IGNORECASE)
+# A piece of the user's text quoted in an error message is cut to this many characters: the
+# message is stored (action history, log) and sent to every client that asks for the status.
+QUOTE_CHARS = 40
 
 
 class MacroError(ValueError):
@@ -76,22 +83,36 @@ def render(template: str, hdmi_port: int) -> str:
     def sub(match: re.Match[str]) -> str:
         value = hdmi_port
         if match.group(1):
-            delta = int(match.group(2))
+            digits = match.group(2)
+            # More digits than any port arithmetic needs: "a lot" (int() refuses very long
+            # digit strings, and the result is clamped or rejected as a repeat count anyway).
+            delta = int(digits) if len(digits) <= 6 else 10**6
             value = value + delta if match.group(1) == "+" else value - delta
         return str(max(0, value))
 
     return _PLACEHOLDER_RE.sub(sub, template)
 
 
+def quote(text: str, limit: int = QUOTE_CHARS) -> str:
+    """``repr(text)`` for an error message, cut short if the text is long."""
+    return repr(text) if len(text) <= limit else repr(text[:limit] + "...")
+
+
 def _number(text: str, what: str, token: str) -> float:
     try:
         return float(text)
     except ValueError:
-        raise MacroError(f"bad {what} in {token!r}") from None
+        raise MacroError(f"bad {what} in {quote(token)}") from None
 
 
 def parse(text: str) -> list[Step]:
-    """Parse macro text into steps.  Raises :class:`MacroError` with a readable reason."""
+    """Parse macro text into steps.  Raises :class:`MacroError` with a readable reason.
+
+    Text longer than MAX_TEXT is refused unread, which also bounds the work done here: at
+    most MAX_TEXT / 2 tokens are ever looked at.
+    """
+    if len(text) > MAX_TEXT:
+        raise MacroError(f"the macro is {len(text)} characters long; the limit is {MAX_TEXT}")
     steps: list[Step] = []
     for token in re.split(r"[\s,;]+", text.strip()):
         if not token:
@@ -101,7 +122,7 @@ def parse(text: str) -> list[Step]:
         if wait:
             seconds = float(wait.group(1)) / (1000.0 if wait.group(2) == "MS" else 1.0)
             if seconds > MAX_WAIT:
-                raise MacroError(f"wait {token!r} is longer than {MAX_WAIT:g}s")
+                raise MacroError(f"wait {quote(token)} is longer than {MAX_WAIT:g}s")
             if seconds > 0:
                 steps.append(Step(wait=seconds))
             continue
@@ -109,23 +130,27 @@ def parse(text: str) -> list[Step]:
         body, repeat, hold = upper, 1, 0.0
         if "*" in body:
             body, _, count = body.rpartition("*")
-            if not count.isdigit() or body == "":
-                raise MacroError(f"bad repeat count in {token!r} (write e.g. DOWN*3)")
-            repeat = int(count)
+            # isdigit() alone also accepts characters int() does not take, such as "\u00b2".
+            if not (count.isascii() and count.isdigit()) or body == "":
+                raise MacroError(f"bad repeat count in {quote(token)} (write e.g. DOWN*3)")
+            # Not int() on a long digit string: it refuses very long ones with a ValueError.
+            repeat = int(count) if len(count) <= 6 else MAX_REPEAT + 1
             if repeat > MAX_REPEAT:
-                raise MacroError(f"repeat count in {token!r} is more than {MAX_REPEAT}")
+                raise MacroError(f"repeat count in {quote(token)} is more than {MAX_REPEAT}")
         if "~" in body:
             body, _, seconds_text = body.partition("~")
             hold = _number(seconds_text, "hold time", token)
             if not 0 < hold <= MAX_HOLD:
-                raise MacroError(f"hold time in {token!r} must be between 0 and {MAX_HOLD:g} seconds")
+                raise MacroError(f"hold time in {quote(token)} must be between 0 and {MAX_HOLD:g} seconds")
         if repeat == 0:
             continue  # e.g. DOWN*{port-1} on port 1: a no-op, not an error
         try:
+            if len(body) > QUOTE_CHARS:
+                raise keys.UnknownKey(f"unknown key {quote(body)}")  # no key is that long; keep the message short
             key = keys.resolve(body)
         except keys.UnknownKey as exc:
             if re.match(r"^\d", body):
-                raise MacroError(f"{token!r} is not a key or a wait (waits need a unit: 2s, 300ms)") from None
+                raise MacroError(f"{quote(token)} is not a key or a wait (waits need a unit: 2s, 300ms)") from None
             raise MacroError(str(exc)) from None
         steps.append(Step(key=key.spec, repeat=repeat, hold=hold))
 

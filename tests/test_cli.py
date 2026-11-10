@@ -85,6 +85,25 @@ async def test_status_plain_and_json(running):
     assert json.loads(out)["bluetooth"]["adapter"] == "hci0"
 
 
+def test_status_says_whether_the_link_is_ready_and_how_keys_are_delivered():
+    def bluetooth_line(**state):
+        out = io.StringIO()
+        link = {"available": True, "powered": True, "paired": True, "adapter": "hci0", "tv_name": "TV", **state}
+        cli._print_status({"version": "x", "enabled": True, "bluetooth": link}, out)
+        return next(line for line in out.getvalue().splitlines() if line.startswith("bluetooth:"))
+
+    # The documents tell people to look for exactly these words.
+    ready = bluetooth_line(connected=True, subscribed=False, ready=True, delivery="raw")
+    assert "connected, ready (delivery: raw)" in ready
+    ready = bluetooth_line(connected=True, subscribed=True, ready=True, delivery="bluez")
+    assert "connected, ready (delivery: bluez)" in ready
+    # After a boot or wake the link is up and the TV has subscribed, but nothing was sent yet.
+    resting = bluetooth_line(connected=True, subscribed=True, ready=False)
+    assert "no key sent on this link yet" in resting and "waiting" not in resting
+    assert "waiting for the TV to subscribe" in bluetooth_line(connected=True, subscribed=False, ready=False)
+    assert "calling the TV" in bluetooth_line(connected=False, advertising=True)
+
+
 async def test_config_show_get_set(running):
     code, out, _ = await running("config")
     assert code == 0 and "input.hdmi_port = 1" in out and 'power.on_key = "WAKE"' in out
@@ -165,3 +184,179 @@ def test_service_unavailable_exit_code(tmp_path, monkeypatch):
     out, err = io.StringIO(), io.StringIO()
     assert cli.run(["status"], out=out, err=err) == 3
     assert "Is the service running?" in err.getvalue()
+
+
+def test_uninstall_runs_the_installed_installer(monkeypatch):
+    from tcl_me_remo import installer
+
+    spawned, exit_code = [], 0
+
+    def spawn(argv):
+        spawned.append(argv)
+        return exit_code
+
+    monkeypatch.setattr(installer, "_spawn", spawn)
+    monkeypatch.setattr(installer.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    # as a normal user: through sudo, with a word about the password SteamOS does not have
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 1000)
+    out, err = io.StringIO(), io.StringIO()
+    assert cli.run(["uninstall", "--purge"], out=out, err=err) == 0
+    assert spawned[-1][:2] == ["sudo", "--"] and spawned[-1][-2:] == ["uninstall", "--purge"]
+    assert spawned[-1][2:] == installer.self_command("uninstall", "--purge")  # this copy's own installer
+    assert "passwd" in out.getvalue() and "Decky" in out.getvalue()
+
+    # as root: directly; settings are kept unless asked otherwise; a failure is passed on
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 0)
+    exit_code = 1
+    assert cli.run(["uninstall"], out=io.StringIO(), err=io.StringIO()) == 1
+    assert spawned[-1] == installer.self_command("uninstall")
+
+    # sudo gave up (no password set, or a wrong one): say what to do about it
+    monkeypatch.setattr(installer.os, "geteuid", lambda: 1000)
+    err = io.StringIO()
+    assert cli.run(["uninstall"], out=io.StringIO(), err=err) == 1 and "passwd" in err.getvalue()
+
+    # no sudo: say so instead of failing obscurely
+    monkeypatch.setattr(installer.shutil, "which", lambda name: None)
+    err = io.StringIO()
+    assert cli.run(["uninstall"], out=io.StringIO(), err=err) == 1 and "run this as root" in err.getvalue()
+    assert len(spawned) == 3
+
+
+# --------------------------------------------------------------------------- odd input, clear answers
+
+
+@pytest.mark.parametrize("budget", ["nan", "inf", "-inf", "1e999", "0", "-1", "121"])
+async def test_a_budget_that_is_no_sensible_number_is_a_usage_error(running, budget):
+    """Not a traceback (``settimeout(nan)``), and not left to the service: exit code 2."""
+    for extra in ((), ("--simulate",), ("--no-wait",)):
+        code, out, err = await running("event", "suspend", *extra, f"--budget={budget}")
+        assert code == 2 and out == "" and "--budget" in err and "120" in err
+    assert running.remote.keys == [] and running.service.phase.value == "running"
+
+
+async def test_the_largest_budget_there_is_can_be_given(running):
+    from tcl_me_remo import service
+
+    assert cli.MAX_BUDGET == service.MAX_EVENT_BUDGET  # the command and the service agree on the range
+    code, out, _ = await running("event", "suspend", "--simulate", "--budget", "120")
+    assert code == 0 and "TV off" in out
+
+
+async def test_wifi_pair_without_anyone_to_type_the_code_cancels_the_pairing(running):
+    def nobody(prompt):
+        raise EOFError  # what input() does without a terminal
+
+    code, out, err = await running("wifi", "pair", "192.168.1.50", ask=nobody)
+    assert code == 1 and "cancelled" in out and err == ""
+    assert running.wifi.pairing_host == "" and not running.wifi.paired  # the TV is not left waiting
+
+    def interrupted(prompt):
+        raise KeyboardInterrupt
+
+    code, out, _ = await running("wifi", "pair", "192.168.1.50", ask=interrupted)
+    assert code == 1 and running.wifi.pairing_host == ""
+
+
+async def test_config_lists_what_each_setting_may_be(running):
+    code, out, _ = await running("config")
+    assert code == 0
+    lines = {line.split(" = ")[0]: line for line in out.splitlines()}
+    assert lines["input.hdmi_port"].startswith("input.hdmi_port = 1 ") and lines["input.hdmi_port"].endswith("1 to 4")
+    assert lines["input.method"].endswith("# one of: macro, wifi, none")
+    assert lines["bluetooth.raw_notify"].endswith("# one of: auto, on, off, always")
+    assert lines["enabled"].endswith("# true or false")
+    assert lines["display.wait_seconds"].endswith("# number, 0 to 60")
+    assert lines["bluetooth.key_gap_ms"].endswith("# whole number, 20 to 5000")
+    assert lines["bluetooth.device_name"].endswith("# text, up to 26 bytes")
+    assert lines["display.edid_match"].endswith("# text, up to 64 characters")
+    assert "1024 characters" in lines["input.macro"] and "tcl-me-remo keys" in lines["power.on_key"]
+    assert "hci0" in lines["bluetooth.adapter"]
+    assert lines["input.preset"].endswith("# one of: custom, tcl-row, tcl-row-home, tcl-row-first, tcl-column")
+    assert "one of: custom, tcl-mediatek" in lines["wifi.link_preset"]
+    assert all(" # " in line for line in lines.values())  # every setting says something
+    assert max(map(len, out.splitlines())) < 130  # and it still reads as a list
+    # the same for one section; a single setting stays a bare value, for scripts
+    code, out, _ = await running("config", "input")
+    assert "input.hdmi_port = 1" in out and "1 to 4" in out and "events." not in out
+    code, out, _ = await running("config", "input.hdmi_port")
+    assert out == "1\n"
+
+
+async def test_config_without_a_schema_still_lists_the_settings():
+    def call(method, params=None, *, timeout=30.0):
+        return {"config": {"enabled": True, "input": {"hdmi_port": 2}}}  # an older service
+
+    out = io.StringIO()
+    assert cli.run(["config"], call=call, out=out, err=io.StringIO()) == 0
+    assert out.getvalue() == "enabled = true\ninput.hdmi_port = 2\n"
+
+
+async def test_junk_in_a_request_does_not_stop_status_and_logs_from_working(running):
+    """It used to: the bogus key went into the history at full length, and every status
+    reply after that was larger than a client reads."""
+    for _ in range(3):
+        code, out, _ = await running("macro", "X" * 1000)
+        assert code == 1 and out.startswith("failed: ") and len(out) < 200
+    code, out, err = await running("macro", "X" * 200_000)
+    assert code == 1 and "limit" in err and len(err) < 200
+    code, _, err = await running("key", "K" * 200_000)
+    assert code == 1 and len(err) < 200
+    code, out, _ = await running("status")
+    assert code == 0 and "last:" in out and len(out) < 2000
+    code, out, _ = await running("status", "--json")
+    assert code == 0 and len(json.loads(out)["history"]) == 3  # what was refused unread left no record
+    code, _, _ = await running("logs")
+    assert code == 0
+
+
+async def test_too_many_clients_is_an_error_with_a_message(tmp_path, running):
+    running.server._max_clients = 0  # as if every place were taken
+    code, out, err = await running("status")
+    assert code == 1 and "too many clients" in err and "Traceback" not in err
+
+
+def test_not_being_allowed_gets_its_own_hint(tmp_path, monkeypatch):
+    def call(method, params=None, *, timeout=30.0):
+        raise ipc.ServiceUnavailable("not allowed to use the tcl-me-remo service: Permission denied", denied=True)
+
+    out, err = io.StringIO(), io.StringIO()
+    assert cli.run(["status"], call=call, out=out, err=err) == 3
+    assert "sudo" in err.getvalue() and "wheel" in err.getvalue()
+    assert "Is the service running" not in err.getvalue()  # it is; that advice would send people the wrong way
+
+
+def test_a_service_that_does_not_take_the_connection_is_exit_code_3(tmp_path, monkeypatch):
+    import socket
+
+    path = tmp_path / "stuck.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(0)
+    waiting = []
+    try:
+        for _ in range(64):  # fill the queue of a listener that never accepts
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client.setblocking(False)
+            try:
+                client.connect(str(path))
+            except BlockingIOError:
+                client.close()
+                break
+            waiting.append(client)
+        monkeypatch.setenv("TCL_ME_REMO_SOCKET", str(path))
+        out, err = io.StringIO(), io.StringIO()
+        # What the sleep hook runs.  It used to end in a traceback.
+        assert cli.run(["event", "suspend", "--budget", "0.5"], out=out, err=err) in (1, 3)
+        assert "tcl-me-remo:" in err.getvalue() and "Traceback" not in err.getvalue()
+    finally:
+        for sock in (listener, *waiting):
+            sock.close()
+
+
+def test_an_answer_of_the_wrong_shape_is_a_message_not_a_traceback():
+    for argv, reply in ((["connect"], None), (["status"], []), (["logs"], {}), (["key", "OK"], "ok"), (["config"], 3)):
+        err = io.StringIO()
+        code = cli.run(argv, call=lambda *a, reply=reply, **k: reply, out=io.StringIO(), err=err)
+        assert code == 1 and "unexpected answer" in err.getvalue(), argv

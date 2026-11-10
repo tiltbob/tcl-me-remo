@@ -73,6 +73,40 @@ async def test_sleep_lock_is_held_during_the_handler_and_released_after(setup):
     assert fake.held("shutdown") == 1
 
 
+async def test_sleep_signals_are_delivered_in_the_order_they_arrived(setup):
+    """A machine that wakes and is sent back to sleep at once: reporting the resume starts
+    with a round trip to logind, and the suspend that follows must not overtake it."""
+    fake, logind, events, _gate, _bus = setup
+    await logind.start()
+    fake.prepare_for_sleep(True)
+    await eventually(lambda: fake.held("sleep") == 0)
+    fake.prepare_for_sleep(False)
+    fake.prepare_for_sleep(True)
+    await eventually(lambda: len(events) == 3)
+    assert [event[:2] for event in events] == [("sleep", True), ("sleep", False), ("sleep", True)]
+    assert events[2][2] == 1  # and the second suspend is delayed for us like the first
+    await eventually(lambda: fake.held("sleep") == 0)
+
+
+async def test_a_resume_reported_during_the_suspend_handler_waits_and_leaves_the_lock_held(setup):
+    """logind stops waiting after its delay; the machine can sleep and wake with our handler
+    still running.  The resume is delivered when the handler is through, and the lock that
+    handler releases at its end is taken again: the next suspend has to wait for us too."""
+    fake, logind, events, gate, _bus = setup
+    await logind.start()
+    gate.clear()
+    fake.prepare_for_sleep(True)
+    await eventually(lambda: len(events) == 1)
+    fake.prepare_for_sleep(False)
+    await asyncio.sleep(0.3)
+    assert len(events) == 1
+    gate.set()
+    await eventually(lambda: len(events) == 2)
+    assert events[1][:2] == ("sleep", False)
+    await asyncio.sleep(0.5)  # longer than the fake logind keeps its own end of a lock open
+    assert fake.held("sleep") == 1
+
+
 async def test_shutdown_with_and_without_metadata(setup):
     fake, logind, events, _gate, _bus = setup
     await logind.start()

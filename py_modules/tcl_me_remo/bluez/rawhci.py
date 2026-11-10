@@ -61,18 +61,26 @@ What it costs - read this before relying on it
       over-credits it.  The debt outlives this process: remote.py records it on disk when the
       first packet is injected and settles it at the next start if the service stopped while
       the link was still up.
-    * Linux >= 6.17 clamps both places.  Nothing leaks, but the kernel logs a warning
-      ("hcon ... sent 0 < count 1") for every injected packet.
+    * Linux >= 6.17 (from 6.17-rc4) clamps both places.  Nothing leaks, but the kernel logs
+      a warning ("hcon ... sent 0 < count 1") for every injected packet.
+    * The first of the two clamps was backported: stable kernels from 6.16.5, 6.12.45,
+      6.6.104, 6.1.150 and 5.15.191 on keep the counter at zero and log the same warning, so
+      nothing is lost there either.  "Linux < 6.17" above therefore means mainline, and the
+      stable releases before those.  A vendor kernel's version does not say which it is
+      (upstream 6.11.11, which SteamOS 3.7 builds on, is unpatched), so the rule that decides
+      (kernel.py) goes by 6.17 alone and the repair runs on everything older; on a patched
+      kernel it resets a count that was never wrong.
+
+    * A kernel L2CAP frame that the controller is still receiving in fragments could be
+      interrupted by an injected packet.  Reports are sent on an idle link, well after
+      connection set-up, and LE controllers with data length extension do not fragment at
+      all, so this is unlikely; it would cost the TV one ATT response.
 
     The repair is derived from source like everything else here, and what it has to prevent
     (a stalled transmit queue for the user's game controllers) is worse than what this path
     cures.  remote.py therefore uses the path of its own accord only where no repair is
     needed (``bluetooth.raw_notify = auto``, :func:`direct_delivery_is_free`); on older
     kernels the user has to ask for it (``on``).
-    * A kernel L2CAP frame that the controller is still receiving in fragments could be
-      interrupted by an injected packet.  Reports are sent on an idle link, well after
-      connection set-up, and LE controllers with data length extension do not fragment at
-      all, so this is unlikely; it would cost the TV one ATT response.
 
 What it assumes
     * The value handles are the ones the TV cached when it paired (the GATT table is frozen
@@ -95,12 +103,20 @@ import errno
 import fcntl
 import logging
 import os
-import platform
 import re
 import socket
 import struct
 from dataclasses import dataclass
 from typing import Callable, Protocol
+
+# The kernel rule lives in kernel.py (the doctor needs it without the rest of this package);
+# the names stay available here, where the facts behind them are written down.
+from .kernel import (  # noqa: F401 - re-exported
+    FIXED_KERNEL,
+    direct_delivery_is_free,
+    kernel_needs_credit_repair,
+    kernel_version,
+)
 
 log = logging.getLogger(__name__)
 
@@ -123,6 +139,8 @@ LE_LINK = 0x80
 #: hci_conn.state values of a usable link (include/net/bluetooth/bluetooth.h)
 BT_CONNECTED = 1
 BT_CONFIG = 7
+#: ... and of one whose HCI Disconnect has been sent and not yet completed.
+BT_DISCONN = 8
 
 L2CAP_CID_ATT = 0x0004
 ATT_OP_HANDLE_VALUE_NOTIFICATION = 0x1B
@@ -138,8 +156,6 @@ READ_BUFFER_SIZE_COMMAND = bytes([HCI_COMMAND_PKT, 0x05, 0x10, 0x00])
 #: How long the controller's answer to LE Read Buffer Size is waited for, and how often it is looked for.
 REPLY_WAIT = 0.5
 REPLY_POLL = 0.02
-#: First kernel release that clamps the per-connection and adapter-wide packet counters.
-FIXED_KERNEL = (6, 17)
 
 MAX_CONNECTIONS = 32
 # struct hci_conn_list_req { __u16 dev_id; __u16 conn_num; struct hci_conn_info conn_info[]; }
@@ -298,31 +314,6 @@ def dev_id_from_adapter(adapter: str) -> int:
     if not match:
         raise RawError(f"cannot tell the controller number from {adapter!r}")
     return int(match.group(1))
-
-
-def kernel_version(release: str | None = None) -> tuple[int, int] | None:
-    """``"6.11.11-valve19-1-neptune-611"`` -> ``(6, 11)``; None if the text does not start like a version."""
-    match = re.match(r"(\d+)\.(\d+)", release if release is not None else platform.release())
-    return (int(match.group(1)), int(match.group(2))) if match else None
-
-
-def direct_delivery_is_free(release: str | None = None) -> bool:
-    """Whether injected packets leave the kernel's packet accounting alone (module docstring).
-
-    True from Linux 6.17 on, which clamps the counters.  A release that cannot be read counts
-    as old: the decision this feeds ("use direct delivery without being asked") must err on
-    the side of the user's other Bluetooth devices.
-    """
-    version = kernel_version(release)
-    return version is not None and version >= FIXED_KERNEL
-
-
-def kernel_needs_credit_repair(release: str | None = None) -> bool:
-    """True for kernels that leak transmit credits after injected packets (see module docs).
-
-    An unreadable release counts as old here too: the repair is harmless on a fixed kernel.
-    """
-    return not direct_delivery_is_free(release)
 
 
 # --------------------------------------------------------------------------- OS access

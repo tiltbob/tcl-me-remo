@@ -171,6 +171,31 @@ async def test_tv_without_a_name_gets_an_empty_name_not_its_address(h):
     assert h.paired == [(TV, "")]
 
 
+@pytest.mark.parametrize("field", ["Name", "Alias"])
+async def test_the_name_a_tv_gives_itself_cannot_forge_a_log_line(h, caplog, field):
+    """It is whatever the device that bonds in the window says: cleaned before anybody gets it."""
+    caplog.set_level(logging.INFO)
+    remote = await h.remote()
+    forged = "TV\nERROR tcl_me_remo.daemon: lost the connection\r\n\x1b[2Jto the system D-Bus\t\x7f " + "x" * 300
+    tv = h.bluez.add_device(TV, name=forged if field == "Name" else "")
+    tv.props["Alias"] = forged  # bluetoothd's Alias is the remote name unless the user set another
+    await h.pair(remote, tv)
+
+    clean = ("TV ERROR tcl_me_remo.daemon: lost the connection [2Jto the system D-Bus " + "x" * 300)[:64]
+    assert h.paired == [(TV, clean)]  # what the service stores in the settings and logs itself
+    assert remote.state.tv_name == clean and remote._cfg.tv_name == clean
+    assert f"paired with {clean} ({TV})" in caplog.messages
+    assert not [message for message in caplog.messages if not message.isprintable()]
+
+
+def test_clean_name_keeps_ordinary_names_as_they_are():
+    for name in ("Living Room TV", "Smart TV Pro 65”", "テレビ", "Wohnzimmer – TCL", ""):
+        assert remote_module._clean_name(name) == name
+    assert remote_module._clean_name("  TCL \t 55C745 \n") == "TCL 55C745"
+    assert remote_module._clean_name("\n\r\x00") == ""
+    assert len(remote_module._clean_name("x" * 63 + " " + "y" * 10)) == 63  # cut, then no trailing blank
+
+
 async def test_on_paired_failure_does_not_break_pairing(h, caplog):
     remote = await h.remote()
 
@@ -587,6 +612,33 @@ async def test_pairing_warns_while_the_adapter_itself_is_discoverable(h, caplog)
     assert "discoverable over classic Bluetooth" in remote.state.error
     await remote.cancel_pairing()
     assert not remote.state.pairing and remote.state.error == ""
+
+
+async def test_a_request_refused_because_pairing_is_open_does_not_become_the_state_s_error(h):
+    """Something else wants the TV while the window is open (a wake action, a key from a
+    shell).  It is told why not - and that is all: the refusal must neither show up in the
+    pairing dialog, nor hide the warning that matters there, nor outlive the window."""
+    remote = await h.remote()
+    await remote.start_pairing(30)
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(0.2)
+    assert err.value.code == "not_paired" and "pairing mode is open" in err.value.message
+    assert remote.state.pairing and remote.state.error == ""
+
+    # With the warning about classic visibility up, it stays what the dialog shows.
+    h.bluez.adapter.props["Discoverable"] = True
+    h.bluez.emit_properties(HCI0, ADAPTER, {"Discoverable": True})
+    await eventually(lambda: "discoverable over classic Bluetooth" in remote.state.error)
+    with pytest.raises(TransportError):
+        await remote.ensure_ready(0.2, wake=True)
+    assert remote.state.error.startswith("this machine is also discoverable over classic Bluetooth")
+
+    await remote.cancel_pairing()
+    assert not remote.state.pairing and remote.state.error == ""
+    # Outside a window the same call's problem is the state's error, as ever.
+    with pytest.raises(TransportError) as err:
+        await remote.ensure_ready(0.2)
+    assert err.value.code == "not_paired" and remote.state.error == "no TV is paired yet"
 
 
 # --------------------------------------------------------------------------- what bluetoothd keeps of a removed TV

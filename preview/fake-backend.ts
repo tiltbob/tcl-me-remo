@@ -11,6 +11,8 @@
 //   &pair=3                 seconds until pairing completes ("never" to let it time out)
 //   &classic=1              another Bluetooth pairing screen is open: pairing mode warns about it
 //   &statusDelay=1500       milliseconds a status request takes
+//   &configProblem=value    the settings file had a value that could not be used
+//   &configProblem=kept     the settings file could not be read at all and was moved aside
 
 import type {
   ActionRecord,
@@ -230,6 +232,8 @@ export class FakeBackend {
   private classicVisible = false;
   private pairTimer = 0;
   private configProblems: string[] = [];
+  /** Entries the service keeps until it restarts: saving a setting does not clear them. */
+  private lastingProblems: string[] = [];
   /** True while the pretend start-up install runs (scenario "installing"). */
   private installing = false;
 
@@ -250,6 +254,18 @@ export class FakeBackend {
     const slow = query.get("statusDelay");
     if (slow) this.statusDelay = Number(slow);
     this.classicVisible = query.get("classic") === "1";
+    const problem = query.get("configProblem");
+    if (problem === "value") this.configProblems = ["input.hdmi_port: must be at most 4 (default used)"];
+    if (problem === "kept") {
+      // The service's own wording (config.load_for_service and config.set_aside).
+      this.lastingProblems = [
+        "/var/lib/tcl-me-remo/config.json is not valid JSON (Expecting property name enclosed in double quotes: " +
+          "line 9 column 21 (char 152)); using defaults. The file was kept as /var/lib/tcl-me-remo/config.json.broken; " +
+          "settings are saved to a new config.json from now on. To get the old settings back, mend that file, move it " +
+          "back to config.json and restart the service.",
+      ];
+      this.configProblems = [...this.lastingProblems];
+    }
     this.enter(query.get("scenario") ?? "default");
   }
 
@@ -632,7 +648,7 @@ export class FakeBackend {
         return { ...this.bundle, config: clone(this.config) };
       case "set_config":
         this.config = applyPatch(this.config as unknown as Json, params.patch, this.bundle.schema as Json, "", this.bundle.keys) as unknown as Config;
-        this.configProblems = [];
+        this.configProblems = [...this.lastingProblems];
         return { config: clone(this.config) };
       case "tv_on":
         return this.action("tv_on", "manual", false, (steps) =>

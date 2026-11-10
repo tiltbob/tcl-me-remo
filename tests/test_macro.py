@@ -102,3 +102,50 @@ def test_presets_are_valid_for_all_ports():
     for preset in macro.PRESETS.values():
         for port in (1, 2, 3, 4):
             macro.parse(macro.render(preset.template, port))
+
+
+# --------------------------------------------------------------------------- text from outside
+
+
+def test_the_example_in_the_module_docstring_is_a_valid_macro():
+    lines = macro.__doc__.splitlines()
+    example = lines[next(i for i, line in enumerate(lines) if line.startswith("Example")) + 2].strip()
+    assert example and macro.parse(example)
+    assert macro.validate(example) == example
+
+
+def test_text_over_the_limit_is_refused_unread():
+    # A megabyte of tokens that are no steps used to be parsed to the end and found "valid".
+    for token in ("OK*0 ", "0s ", "C:0041~1*0 "):
+        with pytest.raises(macro.MacroError, match="limit"):
+            macro.parse(token * 100_000)
+        with pytest.raises(macro.MacroError, match="limit"):
+            macro.validate(token * 100_000)
+    assert macro.parse("OK*0 " * (macro.MAX_TEXT // 5)) == []  # what fits is still looked at
+    assert macro.parse("0s " * (macro.MAX_TEXT // 3)) == []
+    assert len(macro.parse("OK  " * 64 + " " * 700)) == 64
+
+
+def test_error_messages_quote_long_tokens_cut_short():
+    for text in ("X" * 900, "X" * 900 + "*3", "9" * 900, "OK~" + "1" * 900, "OK*" + "9" * 900, "9" * 900 + "s"):
+        with pytest.raises(macro.MacroError) as err:
+            macro.parse(text)
+        assert len(str(err.value)) < 200, str(err.value)
+    assert macro.quote("HOME") == "'HOME'" and len(macro.quote("H" * 500)) < 50
+
+
+@pytest.mark.parametrize("text", ["DOWN*²", "DOWN*٣", "OK*①", "OK~²"])
+def test_digits_that_are_not_ascii_are_an_error_of_the_macro(text):
+    # str.isdigit() says yes to some characters that int() does not take.
+    with pytest.raises(macro.MacroError):
+        macro.parse(text)
+
+
+def test_huge_numbers_never_escape_as_another_exception():
+    # int() refuses digit strings over 4300 characters with a ValueError of its own.
+    assert macro.render("DOWN*{port+" + "9" * 5000 + "}", 2) == "DOWN*1000002"
+    assert macro.render("DOWN*{port-" + "9" * 5000 + "}", 2) == "DOWN*0"
+    with pytest.raises(macro.MacroError):
+        macro.parse(macro.render("DOWN*{port+" + "9" * 900 + "}", 2))
+    with pytest.raises(macro.MacroError):
+        macro.parse("OK*" + "1" * 900)

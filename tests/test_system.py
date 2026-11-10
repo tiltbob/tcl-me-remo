@@ -61,6 +61,14 @@ def test_clean_env_drops_frozen_host_library_path(monkeypatch):
     assert os.environ["LD_LIBRARY_PATH"] == "/tmp/_MEIabc"  # the process environment is untouched
 
 
+def test_clean_env_keeps_the_notification_socket_to_ourselves(monkeypatch):
+    # systemctl, run to find out why we are stopping, would otherwise send its own
+    # "EXIT_STATUS=..." to systemd under this service's name.
+    monkeypatch.setenv("NOTIFY_SOCKET", "/run/systemd/notify")
+    assert "NOTIFY_SOCKET" not in system.clean_env()
+    assert os.environ["NOTIFY_SOCKET"] == "/run/systemd/notify"  # our own copy is untouched
+
+
 def test_sd_notify(tmp_path, monkeypatch):
     monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
     assert system.sd_notify("READY=1") is False

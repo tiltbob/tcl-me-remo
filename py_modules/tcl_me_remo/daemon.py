@@ -21,9 +21,9 @@ import signal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import __version__, config, logsetup, paths, system
+from . import __version__, config, installer, logsetup, paths, system
 from .interfaces import Remote, WifiAssist
-from .ipc import IpcServer
+from .ipc import IpcServer, socket_answers
 from .lifecycle import Logind
 from .service import DEFAULT_DOWN_BUDGET, Service
 
@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 # A first start later than this after power-on is an install or a manual start, not a boot.
 BOOT_WINDOW_SECONDS = 600.0
 WATCHDOG_INTERVAL = 2.0
+# Seconds for "TV off" when systemd stops the service because the machine is going down.
+# The unit has TimeoutStopSec=20 (installer.py): this, the final disconnect and the rest of
+# the clean-up fit into it with room to spare.
+STOP_BUDGET = 8.0
 
 RemoteFactory = Callable[[Any, config.Config], Awaitable[Remote]]
 WifiFactory = Callable[[config.Config], WifiAssist | None]
@@ -42,6 +46,28 @@ def system_uptime() -> float:
         return float(Path("/proc/uptime").read_text().split()[0])
     except (OSError, ValueError, IndexError):
         return 0.0
+
+
+class NoAnswer(RuntimeError):
+    """systemd was asked whether the system is going down, and did not say."""
+
+
+async def shutdown_kind(run: system.Runner | None = None) -> str | None:
+    """``system.shutdown_kind``, except that silence is not an answer.
+
+    A ``systemctl is-system-running`` that could not be run, or was given up on after its
+    time-out, comes back as ``(-1, "")``, which ``system.shutdown_kind`` cannot tell from
+    "not stopping".  Here it raises ``NoAnswer``.  At stop time that makes no difference
+    (``Daemon._going_down``); to the watchdog it does.
+    """
+
+    async def asking(argv: list[str], timeout: float) -> tuple[int, str]:
+        code, output = await (run or system.run_command)(argv, timeout)
+        if code == -1 and not output.strip() and "is-system-running" in argv:
+            raise NoAnswer("systemctl is-system-running gave no answer")
+        return code, output
+
+    return await system.shutdown_kind(asking)
 
 
 async def _default_remote(bus: Any, cfg: config.Config) -> Remote:
@@ -68,14 +94,18 @@ class Daemon:
         make_remote: RemoteFactory = _default_remote,
         make_wifi: WifiFactory = _default_wifi,
         uptime: Callable[[], float] = system_uptime,
-        shutdown_kind: Callable[[], Awaitable[str | None]] = system.shutdown_kind,
+        shutdown_kind: Callable[[], Awaitable[str | None]] = shutdown_kind,
         watchdog_interval: float = WATCHDOG_INTERVAL,
+        run_command: system.Runner = system.run_command,
+        orphan_check_delay: float = installer.ORPHAN_CHECK_DELAY,
     ):
         self._make_remote = make_remote
         self._make_wifi = make_wifi
         self._uptime = uptime
         self._shutdown_kind = shutdown_kind
         self._watchdog_interval = watchdog_interval
+        self._run_command = run_command
+        self._orphan_check_delay = orphan_check_delay
         self._stop = asyncio.Event()
         self._bus_lost = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -92,10 +122,32 @@ class Daemon:
         task.add_done_callback(self._tasks.discard)
 
     async def run(self) -> int:
+        if socket_answers(paths.socket_path()):
+            # Somebody ran "tcl-me-remo daemon" by hand while the service is up.  Stop before
+            # anything is touched: a second instance would take the control socket away from
+            # the first (and its file with it on the way out), and register a second remote.
+            logsetup.setup()
+            log.error("a tcl-me-remo service is already running (%s answers): not starting", paths.socket_path())
+            return 1
         cfg_path = paths.config_path()
-        cfg, problems = config.load(cfg_path)
+        load_failure: Exception | None = None
+        try:
+            cfg, problems, lasting = config.load_for_service(cfg_path)
+        except Exception as exc:  # noqa: BLE001 - it promises not to raise; the service comes up regardless
+            # Without this the service would exit, be restarted and exit again, with no
+            # control socket through which the setting could ever be put right.
+            load_failure = exc
+            cfg = config.default_config()
+            note = f"the settings could not be loaded ({type(exc).__name__}: {exc}); using defaults."
+            try:
+                note = f"{note} {config.set_aside(cfg_path)}"
+            except Exception:  # noqa: BLE001
+                pass
+            problems = lasting = [note[:800]]
         ring = logsetup.setup(cfg.log_level)
         log.info("tcl-me-remo %s starting", __version__)
+        if load_failure is not None:
+            log.error("loading the settings failed", exc_info=load_failure)
         for problem in problems:
             log.warning("config: %s", problem)
 
@@ -120,6 +172,8 @@ class Daemon:
                 on_config_changed=lambda new_cfg: logsetup.set_level(new_cfg.log_level),
                 recent_logs=ring.tail,
                 config_problems=problems,
+                lasting_config_problems=lasting,
+                power_state_path=paths.state_dir() / "power.json",
             )
             self.service = service
             remote.on_paired = service.on_paired
@@ -147,6 +201,7 @@ class Daemon:
             elif first_start:
                 log.info("first start is long after power-on: not treating it as a boot")
             self._spawn(self._watchdog())
+            self._spawn(self._orphan_check())
 
             system.sd_notify("READY=1")
             self.ready.set()
@@ -195,7 +250,12 @@ class Daemon:
             # Awaited: logind keeps the machine awake until this returns.
             await self.service.handle_event("suspend", budget=self._budget())
         else:
+            # Not awaited: turning the TV on can take a minute, and the next suspend must
+            # not wait for it.  But let the service take note of the resume before this
+            # returns (one turn of the loop does it), so that a suspend reported right
+            # behind it finds the bookkeeping in the order things happened.
             self._spawn(self.service.handle_event("resume"))
+            await asyncio.sleep(0)
 
     async def _on_shutdown(self, going_down: bool, kind: str) -> None:
         assert self.service is not None
@@ -219,7 +279,10 @@ class Daemon:
             log.info("service stop requested (the system is not shutting down)")
             return
         log.info("the system is going down (%s)", kind)
-        await self.service.handle_event(kind, budget=self._budget())
+        # Usually logind's route has dealt with this shutdown already and this is a
+        # duplicate.  If it is the first word of it, or that attempt may be made again (see
+        # Service._second_attempt_due), systemd's stop time-out is what limits us here.
+        await self.service.handle_event(kind, budget=STOP_BUDGET)
 
     async def _watch_bus(self, bus: Any) -> None:
         try:
@@ -227,11 +290,13 @@ class Daemon:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - the library reports the reason by raising
-            log.error("lost the connection to the system D-Bus: %s", exc)
+            # The usual reason is an EOFError without text: the bus went away.
+            reason = str(exc) or ("the bus closed it" if isinstance(exc, EOFError) else type(exc).__name__)
+            log.error("lost the connection to the system D-Bus (%s): stopping, to be started afresh", reason)
         else:
             if self._stop.is_set():
                 return
-            log.error("the system D-Bus closed the connection")
+            log.error("the system D-Bus closed the connection: stopping, to be started afresh")
         self._bus_lost = True
         self._stop.set()
 
@@ -242,6 +307,45 @@ class Daemon:
             if self.service.slept_since_last_event():
                 log.info("clock jump detected: the machine was suspended")
                 self._spawn(self.service.handle_event("resume"))
+            elif self.service.down_event_is_stale():
+                # A suspend or shutdown that was handled long ago, and here we still are.  The
+                # machine either stayed up, or it is on its way down and slow about it (a stop
+                # job ahead of ours that hangs).  Calling the down event off in the second
+                # case would send the off key again when the stop signal comes, and an off
+                # key that is a toggle turns the TV back on.  So ask what is asked at stop
+                # time, and only now: not on every tick.
+                try:
+                    going_down = await self._shutdown_kind() is not None
+                except Exception as exc:  # noqa: BLE001 - whatever went wrong, there is no answer
+                    # Unlike in _going_down, no answer is not "not shutting down" here.  The
+                    # down event is called off only on systemd's word that the system is not
+                    # stopping; until then it stands, and the question is put again a full
+                    # period later.  The price: with a systemd that never answers, a machine
+                    # that did stay up keeps taking the next suspend for a duplicate, until a
+                    # resume.  The other way round one missed answer during a slow shutdown
+                    # was enough for the second off key.
+                    log.info("systemd did not say whether the system is going down (%s): asking again later", exc)
+                    going_down = True
+                if going_down:
+                    self.service.down_event_stands()
+                else:
+                    self.service.check_still_up()
+
+    async def _orphan_check(self) -> None:
+        """Some minutes after start-up: was the Decky plugin removed while nobody checked?
+
+        The plugin's uninstall hook leaves a note and sets a timer for the check, and a
+        reboot discards the timer.  If the note is (still) there, the installer is started
+        outside this service to decide; see ``installer.uninstall_if_orphaned``.
+        """
+        await asyncio.sleep(self._orphan_check_delay)
+        argv = installer.orphan_check_command(paths.state_dir())
+        if argv is None:
+            return
+        log.info("the Decky plugin left a note that it was removed; checking whether it is gone for good")
+        code, _ = await self._run_command(argv, 15.0)
+        if code != 0:
+            log.warning("could not start that check (systemd-run failed); it is made again after the next start")
 
 
 def main() -> int:
