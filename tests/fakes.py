@@ -25,6 +25,7 @@ class FakeRemote:
             tv_name="Living Room TV" if paired else "",
         )
         self.connect_after = connect_after
+        self.on_paired = None
         self.fail_code: str | None = None
         self.keys: list[tuple[str, float]] = []
         self.ensure_calls: list[float] = []

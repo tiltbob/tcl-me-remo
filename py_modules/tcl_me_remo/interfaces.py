@@ -62,6 +62,9 @@ PairedCallback = Callable[[str, str], Awaitable[None]]
 class Remote(Protocol):
     """The emulated Bluetooth LE remote control."""
 
+    # Set by the daemon once the service exists; called when pairing mode bonded a TV.
+    on_paired: PairedCallback | None
+
     @property
     def state(self) -> BleState: ...
 

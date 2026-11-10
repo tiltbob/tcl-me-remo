@@ -26,8 +26,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # D-Bus interface definitions annotate methods with D-Bus signature strings ("a{sv}", "ay"),
 # which are not Python forward references.
-"py_modules/tcl_me_remo/bluez/*.py" = ["F722", "F821"]
-"tests/*.py" = ["F722", "F821"]
+# UP037 would "fix" them by removing the quotes, which breaks the interface definition.
+"py_modules/tcl_me_remo/bluez/*.py" = ["F722", "F821", "UP037"]
+"tests/*.py" = ["F722", "F821", "UP037"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["tcl_me_remo"]
