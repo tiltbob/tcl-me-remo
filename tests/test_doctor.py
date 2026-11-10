@@ -126,6 +126,28 @@ async def test_healthy_system(tmp_path):
     assert "Connected displays: HDMI-A-1" in text
 
 
+async def test_the_panels_report_is_the_same_report_in_pieces(tmp_path):
+    report = await doctor.collect(make_runner(), call=lambda method: STATUS, root=make_root(tmp_path))
+    panel = doctor.panel_report(report)
+    json.dumps(panel)
+    assert panel["worst"] == "warn" and panel["checks"] == report["checks"]
+    assert panel["system"][0] == "tcl-me-remo 0.1.0 on SteamOS 3.7.13"
+    assert "Connected displays: HDMI-A-1" in panel["details"]
+    # Nothing the command prints is missing from it, and nothing is added (but the marks).
+    text = doctor.render(report)
+    for line in [*panel["system"], *panel["details"]]:
+        assert line in text.splitlines()
+    for check in panel["checks"]:
+        assert f"{check['name']}: {check['detail']}" in text
+
+
+async def test_an_unpaired_tv_is_answered_with_the_panel_first(tmp_path):
+    status = {**STATUS, "bluetooth": {**STATUS["bluetooth"], "paired": False, "ready": False}}
+    report = await doctor.collect(make_runner(), call=lambda method: status, root=make_root(tmp_path))
+    detail = by_name(report)["TV pairing"]["detail"]
+    assert detail == "no TV is paired yet (Pair TV in the Decky panel, or run: tcl-me-remo pair)"
+
+
 async def test_everything_missing_is_reported_not_raised(tmp_path):
     async def nothing(argv, timeout):
         return -1, ""
@@ -176,7 +198,13 @@ async def test_specific_faults(tmp_path):
         ("6.17.0", "always", "ok", "used for every key (a diagnostic setting)"),
         # Older kernels: "auto" leaves it alone and says how to get it.
         ("6.11.11-valve19", "auto", "ok", "not used on this kernel (only from Linux 6.17 on"),
-        ("6.16.12-200.fc42.x86_64", "auto", "ok", "or set raw_notify to 'on'"),
+        # ... under the name the panel gives the setting: this line is shown there too.
+        (
+            "6.16.12-200.fc42.x86_64",
+            "auto",
+            "ok",
+            "or set Direct delivery (bluetooth.raw_notify; in the panel: Bluetooth page, Advanced) to 'on'",
+        ),
         ("6.11.11-valve19", "off", "ok", "never used"),
         # The user asked for it on a kernel it disturbs: say what to watch for.
         ("6.11.11-valve19", "on", "warn", "used when the TV needs it; before Linux 6.17 it can disturb"),
@@ -185,7 +213,8 @@ async def test_specific_faults(tmp_path):
         ("6.17.0-rc3", "auto", "ok", "not used on this kernel"),
         ("6.17.0-rc3", "on", "warn", "the service repairs after each link (unverified)"),
         ("6.17.0-rc4", "auto", "ok", "used when the TV needs it (no side effects from Linux 6.17 on)"),
-        ("6.11.11-valve19", "always", "warn", "if controllers or headsets stall, set it to 'auto'"),
+        ("6.11.11-valve19", "always", "warn", "if controllers or headsets stall, set Direct delivery (bluetooth."),
+        ("6.11.11-valve19", "always", "warn", "Bluetooth page, Advanced) to 'auto'"),
         # A release that cannot be read counts as old.
         ("garbage", "auto", "ok", "not used on this kernel"),
         ("garbage", "on", "warn", "the service repairs after each link (unverified)"),
@@ -202,8 +231,21 @@ def test_direct_delivery_line_names_kernel_setting_and_meaning(kernel, setting, 
     assert said in detail and "\n" not in detail
     assert kernel in detail  # the version is named, readable or not
     assert f"raw_notify = {setting}" in detail if setting else "raw_notify unknown" in detail
+    # Wherever the line says what to set, it says it in the panel's words, not by the key alone.
+    assert "set raw_notify" not in detail and "set it to" not in detail
     if kernel == "garbage":
         assert "version not recognised, treated as older than 6.17" in detail
+
+def test_the_direct_delivery_line_names_the_setting_as_the_panel_labels_it():
+    import re
+    from pathlib import Path
+
+    detail = doctor.direct_delivery_check("6.11.11-valve19", "auto")["detail"]
+    assert "Direct delivery (bluetooth.raw_notify; in the panel: Bluetooth page, Advanced)" in detail
+    page = (Path(__file__).resolve().parents[1] / "src" / "pages" / "BluetoothPage.tsx").read_text(encoding="utf-8")
+    assert re.search(r'path="bluetooth\.raw_notify"\s+label="Direct delivery"', page)
+    assert 0 < page.index('<Section title="Advanced">') < page.index('path="bluetooth.raw_notify"')
+
 
 
 async def test_report_states_the_direct_delivery_situation(tmp_path):

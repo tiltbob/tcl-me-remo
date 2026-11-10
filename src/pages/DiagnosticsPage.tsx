@@ -6,36 +6,70 @@ import type { FC } from "react";
 import { useEffect, useRef, useState } from "react";
 
 import { KEYS, installService, restartService } from "../actions";
+import * as backend from "../backend";
 import { rpc } from "../backend";
 import { ButtonRow, Note, OutcomeView, Page, RecordView, Section, Value, rowButton } from "../components/common";
 import { RemoveServiceModal } from "../components/modals";
 import type { Choice } from "../components/settings";
 import { SettingChoice, SettingSlider, rangeChoices, settingInfo } from "../components/settings";
 import { store, useTv } from "../store";
-import { colors, duration } from "../text";
+import { UPDATE_ADDRESS, colors, duration } from "../text";
+import type { DoctorCheck, DoctorReport } from "../types";
 
 const LOG_LINES = 100;
 const LOG_CHUNK = 20;
 
+const pre = {
+  margin: 0,
+  fontFamily: "monospace",
+  fontSize: "12px",
+  lineHeight: "1.45",
+  whiteSpace: "pre-wrap",
+  overflowWrap: "anywhere",
+  color: colors.text,
+} as const;
+
+/** Lines of plain text the D-pad can stop on, so that they can be scrolled into view. */
+const TextBlock: FC<{ lines: string[] }> = ({ lines }) => (
+  <Focusable onActivate={() => undefined} style={{ padding: "6px 10px", margin: "2px 0", background: "rgba(0, 0, 0, 0.25)" }}>
+    <pre style={pre}>{lines.join("\n")}</pre>
+  </Focusable>
+);
+
+/**
+ * The log. While the service answers it is the service's own; when it does not, its lines
+ * in the system journal, which the plugin backend can read: a service that fails at every
+ * start says why there and nowhere else.
+ */
 const Logs: FC<{ up: boolean }> = ({ up }) => {
   const [lines, setLines] = useState<string[] | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const mounted = useRef(true);
   const busy = useRef(false);
+  const wanted = useRef(up);
+  wanted.current = up;
 
   const load = () => {
     if (busy.current) return;
     busy.current = true;
     setLoading(true);
-    void rpc<{ lines: string[] }>("logs", { lines: LOG_LINES }).then((reply) => {
+    const source = wanted.current;
+    const request = source ? rpc<{ lines: string[] }>("logs", { lines: LOG_LINES }) : backend.serviceLog(LOG_LINES);
+    void request.then((reply) => {
       busy.current = false;
       if (!mounted.current) return;
       setLoading(false);
+      if (source !== wanted.current) {
+        // The service came up or went away meanwhile: what arrived is the other log.
+        load();
+        return;
+      }
       if (reply.ok) {
         setLines(Array.isArray(reply.result?.lines) ? reply.result.lines.map(String) : []);
         setError("");
       } else {
+        setLines(null);
         setError(reply.error.message);
       }
     });
@@ -43,59 +77,138 @@ const Logs: FC<{ up: boolean }> = ({ up }) => {
 
   useEffect(() => {
     mounted.current = true;
-    if (up) load();
+    setLines(null);
+    setError("");
+    load();
     return () => {
       mounted.current = false;
     };
   }, [up]);
 
   // Newest first, in pieces the D-pad can step through.
-  const newestFirst = up ? (lines ?? []).slice().reverse() : [];
+  const newestFirst = (lines ?? []).slice().reverse();
   const chunks: string[][] = [];
   for (let index = 0; index < newestFirst.length; index += LOG_CHUNK) chunks.push(newestFirst.slice(index, index + LOG_CHUNK));
 
   return (
     <Section title="Log">
       <Field
-        label="Recent log lines"
+        label={up ? "Recent log lines" : "The service's last lines in the system journal"}
         description={
           error ? (
             <span style={{ color: colors.bad }}>The log could not be read: {error}</span>
-          ) : !up ? (
-            "The log is read from the service, which does not answer."
           ) : lines === null ? (
-            "Not loaded."
-          ) : (
+            loading ? "Reading." : "Not loaded."
+          ) : up ? (
             `The last ${lines.length} lines, newest first. The service writes down every step of every action.`
+          ) : (
+            `The service does not answer, so this is what the system kept of it: the last ${lines.length} lines, newest first. If the service fails to start, the reason is here.`
           )
         }
       >
-        <DialogButton style={rowButton} disabled={loading || !up} onClick={() => load()}>
+        <DialogButton style={rowButton} disabled={loading} onClick={() => load()}>
           {loading ? "Loading…" : "Refresh"}
         </DialogButton>
       </Field>
       {chunks.map((chunk, index) => (
-        <Focusable
-          key={index}
-          onActivate={() => undefined}
-          style={{ padding: "6px 10px", margin: "2px 0", background: "rgba(0, 0, 0, 0.25)" }}
-        >
-          <pre
-            style={{
-              margin: 0,
-              fontFamily: "monospace",
-              fontSize: "12px",
-              lineHeight: "1.45",
-              whiteSpace: "pre-wrap",
-              overflowWrap: "anywhere",
-              color: colors.text,
-            }}
-          >
-            {chunk.join("\n")}
-          </pre>
-        </Focusable>
+        <TextBlock key={index} lines={chunk} />
       ))}
-      {up && lines !== null && lines.length === 0 && !error && <Note label="The log is empty" />}
+      {lines !== null && lines.length === 0 && !error && (
+        <Note label={up ? "The log is empty" : "The system journal has no lines from the service"} />
+      )}
+    </Section>
+  );
+};
+
+const CHECK_WORD: Record<DoctorCheck["status"], string> = {
+  ok: "OK",
+  warn: "Warning",
+  fail: "Problem",
+  unknown: "Not known",
+};
+const CHECK_COLOR: Record<DoctorCheck["status"], string> = {
+  ok: colors.ok,
+  warn: colors.warn,
+  fail: colors.bad,
+  unknown: colors.dim,
+};
+
+function checkSummary(report: DoctorReport): string {
+  const count = (status: DoctorCheck["status"]) => report.checks.filter((check) => check.status === status).length;
+  const parts = [
+    count("fail") ? `${count("fail")} ${count("fail") === 1 ? "problem" : "problems"}` : "",
+    count("warn") ? `${count("warn")} ${count("warn") === 1 ? "warning" : "warnings"}` : "",
+    count("unknown") ? `${count("unknown")} not known` : "",
+  ].filter(Boolean);
+  return parts.length ? `${report.checks.length} checks: ${parts.join(", ")}.` : `All ${report.checks.length} checks passed.`;
+}
+
+/**
+ * The doctor's report, which the command line prints for "tcl-me-remo doctor". Asked for
+ * with a button and never by itself: it starts a dozen system tools.
+ */
+const SetupCheck: FC = () => {
+  const [report, setReport] = useState<DoctorReport | null>(null);
+  const [error, setError] = useState("");
+  const [running, setRunning] = useState(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const run = () => {
+    if (running) return;
+    setRunning(true);
+    void backend.doctor().then((reply) => {
+      if (!mounted.current) return;
+      setRunning(false);
+      if (reply.ok) {
+        setReport(reply.result);
+        setError("");
+      } else {
+        setReport(null);
+        setError(reply.error.message);
+      }
+    });
+  };
+
+  return (
+    <Section title="Check the set-up">
+      <Field
+        label="Check Bluetooth, the service, the pairing and the suspend hooks"
+        description={
+          error ? (
+            <span style={{ color: colors.bad }}>The check could not be made: {error}</span>
+          ) : report ? (
+            <span style={{ color: CHECK_COLOR[report.worst] ?? colors.text }}>{checkSummary(report)}</span>
+          ) : (
+            "Says what is wrong in plain words. It only looks; nothing is changed. Works when the service does not. Include a screenshot of the result in a bug report."
+          )
+        }
+      >
+        <DialogButton style={rowButton} disabled={running} onClick={() => run()}>
+          {running ? "Checking…" : report ? "Check again" : "Run check"}
+        </DialogButton>
+      </Field>
+      {report && report.system.length > 0 && <TextBlock lines={report.system} />}
+      {report?.checks.map((check, index) => (
+        <Field
+          key={index}
+          focusable={true}
+          padding="compact"
+          label={
+            <span>
+              <span style={{ color: CHECK_COLOR[check.status] ?? colors.dim }}>{CHECK_WORD[check.status] ?? check.status}</span>
+              {` · ${check.name}`}
+            </span>
+          }
+          description={<span style={{ color: colors.text, overflowWrap: "anywhere" }}>{check.detail}</span>}
+        />
+      ))}
+      {report && report.details.length > 0 && <TextBlock lines={report.details} />}
     </Section>
   );
 };
@@ -197,6 +310,35 @@ export const DiagnosticsPage: FC = () => {
         <OutcomeView state={state} actionKey={KEYS.remove} />
       </Section>
 
+      <Section title="Updates">
+        <Field
+          focusable={true}
+          label={`This plugin is version ${service?.bundled_version || "unknown"}`}
+          description={
+            <div>
+              <div>
+                It does not look for updates, and nothing is updated by itself. To update, install the plugin again
+                from the address it came from: Decky settings &gt; Developer &gt; Install Plugin from URL. Type the
+                address exactly; the same address always gives the newest version.
+              </div>
+              <div style={{ ...pre, fontSize: "13px", margin: "6px 0" }}>{UPDATE_ADDRESS}</div>
+              <div>
+                The address is not on screen while you type it: write it down or have it on a phone before you leave
+                this page. Decky then asks "Install tcl-me-remo"; if it shows any other name, the end of the address
+                is wrong, so cancel and correct it.
+              </div>
+              <div style={{ marginTop: "6px" }}>
+                Settings and the pairing with the TV are kept. The background service is updated when the new plugin
+                loads. An update that changes the service restarts it, which for the TV is like a restart of SteamOS:
+                if keys do not arrive afterwards, the Bluetooth page says why.
+              </div>
+            </div>
+          }
+        />
+      </Section>
+
+      <SetupCheck />
+
       {status && status.config_problems.length > 0 && (
         <Section title="Settings problems">
           {status.config_problems.map((problem, index) => (
@@ -217,8 +359,10 @@ export const DiagnosticsPage: FC = () => {
           {status.config_problems.some((problem) => problem.includes(".broken")) && (
             <Note label="The service is running on default settings">
               Changing a setting does not clear this, and does not bring the old settings back: they are in the
-              file named above. To get them back, mend that file and move it back in Desktop Mode, then restart
-              the service. Or set things up again here; the notice then ends when the service next restarts.
+              file named above. The way on from here: set things up again on these pages, and pair the TV again if
+              it shows as unpaired. This notice then ends when the service next restarts (Restart, at the top of
+              this page). Getting the old settings back instead means mending that file by hand, which takes a
+              terminal in Desktop Mode: see "A settings file that was moved aside" in the README.
             </Note>
           )}
         </Section>

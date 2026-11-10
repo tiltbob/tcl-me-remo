@@ -16,7 +16,9 @@ or more, so one macro can serve any port: `RIGHT*{port}`.
 Example: `F3 1.5s LEFT*8 RIGHT*2 OK` — press F3, wait a second and a half, press Left eight
 times, Right twice, then OK.
 
-Try a macro before saving it:
+Try a macro before saving it: on the **Input** page of the panel's settings, under *Your own
+macro*, type it (or build it with the *Add a step* buttons) and choose *Try it now*. From a
+terminal:
 
 ```sh
 tcl-me-remo macro "F3 1.5s LEFT*8 RIGHT*{port} OK"
@@ -56,15 +58,19 @@ TV, the TV's *Last Input Used* setting and the Wi-Fi assist are the dependable r
 out what your TV needs:
 
 1. Switch the TV to some other input with its own remote.
-2. Find the key that opens the source list: `tcl-me-remo key F3`. If nothing opens, try
-   `tcl-me-remo key TV`.
+2. Find the key that opens the source list: *Source list* on the panel's **Remote** page
+   sends `F3`. If nothing opens, try a macro of the one step `TV` (*Try it now* on the Input
+   page).
 3. Look at the list: is it a row or a column, what comes before HDMI 1, and are there
    entries you never use? Hiding unused inputs in the TV's settings (and setting the others
    to *On* rather than *Auto*) keeps the list from changing length.
-4. Adjust the counts and test with `tcl-me-remo macro "…"` until it lands on your input from
-   any starting point.
-5. Save it: `tcl-me-remo config input.macro "…"`, `tcl-me-remo config input.preset custom`,
-   `tcl-me-remo config input.method macro`.
+4. On the **Input** page, under *Your own macro*, adjust the counts and test with *Try it
+   now* until it lands on your input from any starting point.
+5. *Save* it, and set *Switch the input* on the same page to *Bluetooth macro*.
+
+From a terminal the same is `tcl-me-remo key F3`, `tcl-me-remo macro "…"` to test, and
+`tcl-me-remo config input.macro "…"`, `tcl-me-remo config input.preset custom`,
+`tcl-me-remo config input.method macro` to save.
 
 If no key opens the list from this remote on your TV, use the Wi-Fi assist for input
 switching, or rely on the TV's *Power On Behavior: Last Input Used*.

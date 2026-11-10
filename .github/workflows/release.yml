@@ -1,44 +1,179 @@
 name: Release
 
-# Pushing a tag such as v0.1.0 builds the plugin and publishes it as a release asset named
-# tcl-me-remo.zip.  The name must stay exactly that: Decky compares it with the plugin's
-# name to tell an update from a fresh install.
+# Publishes the plugin as a GitHub release whose one asset is tcl-me-remo.zip, so that
+#
+#   https://github.com/tiltbob/tcl-me-remo/releases/latest/download/tcl-me-remo.zip
+#
+# always serves the newest version.  That address is what people type into Decky's "Install
+# Plugin from URL", for the first install and for every update.  The asset's name must stay
+# exactly the "name" in plugin.json plus ".zip": Decky takes the last part of the address
+# for the plugin's name, and tells an update from a fresh install by it.
+#
+# Nobody has to push a tag.  When the CI workflow has passed for a push to main, this one
+# publishes "v<version in package.json>" if no release of that version exists yet, and
+# creating the release creates the tag at that commit.  A push that leaves the version alone
+# publishes nothing, and neither does one whose CI run failed.  Pushing a tag v<version> by
+# hand still works.  The decisions are in scripts/release_plan.py (tests/test_release_plan.py).
+#
+# The ways in cannot publish twice: every run of this workflow is in one concurrency group,
+# so they run one after the other, and each one asks GitHub whether the release exists
+# before it publishes.  ("queue: max" keeps every waiting run; by default a newer waiting
+# run would replace an older one.)  The tag a release creates starts no further run: what
+# the workflow's own token does triggers no workflows.
 on:
+  # After every run of the CI workflow (.github/workflows/ci.yml, by its name) on a branch
+  # called main.  The condition on the first job lets only a passed run for a push to this
+  # repository's main go on.  If CI failed for a reason outside the code, run its failed
+  # jobs again: this workflow follows when they pass.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   push:
     tags: ["v*"]
+  # A manual run, for a release that failed half-way.  It and a pushed tag do not wait for
+  # CI: somebody decided.
+  workflow_dispatch:
 
-permissions:
-  contents: write
+# Nothing by default; each job names what it needs.
+permissions: {}
+
+concurrency:
+  group: release
+  queue: max
+
+env:
+  # What is published, and as what.  A run that follows CI is given the default branch and
+  # its newest commit by GitHub, whatever CI ran on: the commit CI checked is in the event.
+  PLAN_REF: ${{ github.event_name == 'workflow_run' && 'refs/heads/main' || github.ref }}
 
 jobs:
-  release:
+  check:
+    name: Decide, then check the plugin
+    # Only in this repository: a fork that has workflows on would publish releases of its
+    # own, while the README and the panel in the archive give this repository's address.
+    # And after CI, only for a passed run that a push to this repository's main started.
+    # A pull request from a fork's branch called "main" is a CI run "on main" as well;
+    # this must be decided here, before anything of that commit is checked out and run.
+    if: >-
+      github.repository == 'tiltbob/tcl-me-remo' &&
+      (github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      sha256: ${{ steps.package.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
         with:
-          version: 10
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
+          # The commit CI passed for; empty for a tag or a manual run, which check out
+          # what they were started on.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: The tag must match the version in the code
+      - name: Is there a version to publish?
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          version="$(python3 -c "import json; print(json.load(open('package.json'))['version'])")"
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "tag $GITHUB_REF_NAME does not match package.json version $version" >&2
-            exit 1
-          fi
-      - name: Build
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          git ls-remote --tags origin > "$RUNNER_TEMP/tags.txt"
+          python3 scripts/release_plan.py plan --ref "$PLAN_REF" --commit "$(git rev-parse HEAD)" \
+            --releases "$RUNNER_TEMP/releases.json" --tags "$RUNNER_TEMP/tags.txt"
+      # From here on: the checks of the CI workflow's plugin job that decide what is in the
+      # archive, once more.  (After a push to main, CI has passed for this commit by now, with
+      # the Python tests and the UI checks; a pushed tag and a manual run get only these.)
+      - uses: pnpm/action-setup@v4
+        if: steps.plan.outputs.publish == 'true'
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        if: steps.plan.outputs.publish == 'true'
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Type-check and build the panel
+        if: steps.plan.outputs.publish == 'true'
         run: |
           pnpm install --frozen-lockfile
           pnpm run typecheck
           pnpm run build
+      - name: The committed panel bundle is current
+        if: steps.plan.outputs.publish == 'true'
+        # The archive is made from the committed dist/index.js.  If this fails: run
+        # "pnpm run build" and commit dist/index.js.
+        run: git diff --exit-code -- dist/index.js
+      - name: Package
+        id: package
+        if: steps.plan.outputs.publish == 'true'
+        # The checksum on a line of its own: a command that fails inside "echo $(...)" would
+        # not fail the step, and the publish job would be handed an empty value.
+        run: |
           python3 scripts/build_zip.py
-      - name: Publish
+          sha256="$(python3 scripts/release_plan.py sha256 out/tcl-me-remo.zip)"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish the release
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    # The only job that may write, and it runs nothing but this repository's two Python
+    # scripts and the GitHub CLI: no Node.js packages are installed here.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit CI passed for; empty for a tag or a manual run, which check out
+          # what they were started on.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Package from the committed files, and write the notes
+        env:
+          CHECKED_SHA256: ${{ needs.check.outputs.sha256 }}
+        # Fails unless this archive is, byte for byte, the one the checks above were made on
+        # (also when no checksum arrived from there).
+        run: |
+          python3 scripts/build_zip.py
+          python3 scripts/release_plan.py notes --zip out/tcl-me-remo.zip --repo "$GITHUB_REPOSITORY" \
+            --expect-sha256 "$CHECKED_SHA256" > "$RUNNER_TEMP/notes.md"
+      - name: Is it still unpublished?
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" out/tcl-me-remo.zip --title "$GITHUB_REF_NAME" --generate-notes
+          GH_REPO: ${{ github.repository }}
+        # Asked again with the token that may write: only that one is shown draft releases.
+        run: |
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          git ls-remote --tags origin > "$RUNNER_TEMP/tags.txt"
+          python3 scripts/release_plan.py plan --ref "$PLAN_REF" --commit "$(git rev-parse HEAD)" \
+            --releases "$RUNNER_TEMP/releases.json" --tags "$RUNNER_TEMP/tags.txt"
+      - name: Publish
+        if: steps.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          PRERELEASE: ${{ steps.plan.outputs.prerelease }}
+          LATEST: ${{ steps.plan.outputs.latest }}
+        # Creates the tag at this commit if nobody pushed it.  A bare "404 Not Found" from
+        # this step is GitHub refusing the workflow's token a release whose commit has other
+        # files under .github/workflows/ than the default branch: main has moved on with a
+        # change to a workflow (the run for that push publishes the version), or a tag was
+        # pushed to a commit that is not on main.
+        run: |
+          gh release create "$TAG" out/tcl-me-remo.zip --target "$(git rev-parse HEAD)" --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --generate-notes \
+            --prerelease="$PRERELEASE" --latest="$LATEST"

@@ -143,10 +143,17 @@ export function restartService(): Promise<Outcome> {
     .then(afterServiceChange);
 }
 
+/**
+ * What a removal is followed by. The page then shows "not installed" with an Install button,
+ * which is not the way on for somebody who wants to be rid of it.
+ */
+export const AFTER_REMOVE =
+  "Now uninstall the plugin in Decky (Decky settings > Plugins): otherwise it installs the service again the next time it loads.";
+
 export function removeService(purge: boolean): Promise<Outcome> {
   return store
     .run(KEYS.remove, "Remove service", () => backend.removeService(purge), (result) => ({
-      text: (result?.log ?? []).join("; ") || "The service was removed",
+      text: `${(result?.log ?? []).join("; ") || "The service was removed"}. ${AFTER_REMOVE}`,
     }))
     .then(afterServiceChange);
 }

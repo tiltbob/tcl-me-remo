@@ -3,8 +3,10 @@
 Deliberately thin.  The work is done by a system service that keeps running when Decky or
 Steam restarts; this file only
 
-  * installs / repairs / updates that service when the plugin loads, and
-  * forwards the panel's requests to the service's control socket.
+  * installs / repairs / updates that service when the plugin loads,
+  * forwards the panel's requests to the service's control socket, and
+  * runs for the panel what would otherwise take a terminal: the doctor's report and, when
+    the service does not answer, its lines in the system journal.
 
 It uses nothing beyond asyncio, json, os and time, and runs the installer with the system
 Python, so it does not depend on which standard-library modules Decky's bundled interpreter
@@ -35,6 +37,20 @@ INSTALLER_SNIPPET = (
     "import sys; sys.path.insert(0, sys.argv[1]); "
     "from tcl_me_remo import installer; sys.exit(installer.main(sys.argv[2:]))"
 )
+
+# Runs the doctor from a given py_modules directory; it prints one line of JSON.
+DOCTOR_SNIPPET = (
+    "import sys; sys.path.insert(0, sys.argv[1]); "
+    "from tcl_me_remo import doctor; sys.exit(doctor.main_for_panel())"
+)
+# The doctor asks a dozen system tools, each with a time limit of its own (a minute in all at
+# the very worst).
+DOCTOR_TIMEOUT = 75.0
+SERVICE_UNIT = "tcl-me-remo.service"
+# What service_log() hands to the panel at most (the service's own "logs" request has the
+# same line limit, logsetup.RING_LINE_CHARS).
+JOURNAL_LINES = 100
+JOURNAL_LINE_CHARS = 500
 
 # How long the panel waits for each kind of request.  Actions that talk to the TV can take a
 # while (connect, wait for the TV to start, play a macro).
@@ -199,9 +215,12 @@ class Plugin:
         # us to stop.  So nothing is removed here.  A note is left for the installed service,
         # and a timer has its installer check later whether a plugin of ours is still there;
         # only if not is the service removed.  A reboot discards the timer but not the note:
-        # the service looks for it a few minutes after every start.  The next install (this
-        # plugin loading again after an update) removes the note.  Settings and the TV
-        # pairing are kept either way.
+        # the service looks for it a few minutes after every start, and hourly.  The next
+        # install (this plugin loading again after an update) removes the note.  Settings and
+        # the TV pairing are kept either way.
+        #
+        # Decky does not call this at all while the plugin is disabled.  The service finds
+        # out by itself then, from the plugins folder its install was told about.
         modules = _installed_modules()
         if modules is None:
             return  # no service of ours is installed: nothing to clean up later
@@ -225,7 +244,8 @@ class Plugin:
                 "could not schedule the clean-up check (%s): %s",
                 "the service makes it after its next start"
                 if noted
-                else "if this plugin is not installed again, remove the service with: tcl-me-remo uninstall",
+                else "if this plugin is not installed again, the service stays: install the plugin once more"
+                " and use Remove on its Diagnostics page, or run: tcl-me-remo uninstall",
                 err.strip(),
             )
 
@@ -238,7 +258,13 @@ class Plugin:
     async def _run_install(self):
         try:
             async with self._install_lock:
-                result = await _installer("install", "--user-home", decky.DECKY_USER_HOME)
+                # --plugins-dir: the service then knows that a plugin installed it and where
+                # Decky keeps that plugin, and removes itself when it is no longer there.  (The
+                # uninstall hook below cannot be relied on for that: Decky does not run it in
+                # a plugin the user has disabled.)
+                result = await _installer(
+                    "install", "--user-home", decky.DECKY_USER_HOME, "--plugins-dir", PLUGINS_DIR
+                )
             if "error" in result:
                 self._install_error = str(result["error"])
                 decky.logger.error("service install failed: %s", self._install_error)
@@ -304,7 +330,43 @@ class Plugin:
         return {"ok": True, "result": result}
 
     async def restart_service(self) -> dict:
-        code, out, err = await _run(["systemctl", "restart", "tcl-me-remo.service"], 60.0)
+        code, out, err = await _run(["systemctl", "restart", SERVICE_UNIT], 60.0)
         if code != 0:
             return _failure("restart_failed", (err or out).strip() or "systemctl restart failed")
         return {"ok": True, "result": {}}
+
+    async def doctor(self) -> dict:
+        """The report of "tcl-me-remo doctor" (see DoctorReport in src/types.ts).  Read-only.
+
+        Run from the plugin's own copy with the system Python, so it works when the service
+        is stopped, broken or not installed: that is when it is wanted.
+        """
+        argv = [SYSTEM_PYTHON, "-I", "-c", DOCTOR_SNIPPET, os.path.join(PLUGIN_DIR, "py_modules")]
+        code, out, err = await _run(argv, DOCTOR_TIMEOUT)
+        lines = [line for line in out.splitlines() if line.strip()]
+        try:
+            report = json.loads(lines[-1])
+        except (IndexError, ValueError):
+            report = None
+        if not isinstance(report, dict) or not isinstance(report.get("checks"), list):
+            detail = (err or out).strip().splitlines()
+            return _failure("doctor_failed", detail[-1] if detail else f"the check failed (exit code {code})")
+        return {"ok": True, "result": report}
+
+    async def service_log(self, lines: int = JOURNAL_LINES) -> dict:
+        """The service's newest lines in the system journal, oldest first.  Read-only.
+
+        For when the service does not answer and so cannot hand over its own log: a service
+        that fails at every start says why here and nowhere else.
+        """
+        if not isinstance(lines, int) or isinstance(lines, bool):
+            return _failure("bad_request", "lines must be a number")
+        count = max(1, min(lines, JOURNAL_LINES))
+        argv = ["journalctl", "--unit", SERVICE_UNIT, "--lines", str(count), "--no-pager", "--output", "short-iso"]
+        code, out, err = await _run(argv, 15.0)
+        if code != 0:
+            return _failure("log_failed", (err or out).strip() or "journalctl failed")
+        found = [line[:JOURNAL_LINE_CHARS] for line in out.splitlines() if line.strip()]
+        # With nothing to show journalctl prints "-- No entries --".
+        found = [line for line in found if not line.startswith("-- ")]
+        return {"ok": True, "result": {"lines": found[-count:]}}

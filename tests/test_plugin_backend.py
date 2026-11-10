@@ -15,7 +15,7 @@ import pytest
 from fakes import FakeRemote
 
 from tcl_me_remo import config as C
-from tcl_me_remo import installer, ipc
+from tcl_me_remo import doctor, installer, ipc, logsetup
 from tcl_me_remo.service import Service
 
 REPO = Path(__file__).resolve().parents[1]
@@ -93,7 +93,7 @@ async def test_service_info_runs_the_bundled_installer_with_the_system_python(ba
     assert set(state) >= {"installed", "active", "enabled", "installed_version", "needs_update", "problems"}
 
 
-async def test_install_failure_is_reported_to_the_panel(backend, monkeypatch):
+async def test_install_failure_is_reported_to_the_panel(backend, monkeypatch, tmp_path):
     calls = []
 
     async def fake_installer(*args, timeout=120.0):
@@ -106,7 +106,9 @@ async def test_install_failure_is_reported_to_the_panel(backend, monkeypatch):
     plugin = backend.Plugin()
     await plugin._main()
     await plugin._startup
-    assert calls[0][:2] == ("install", "--user-home")
+    # Besides the user's home: where Decky keeps its plugins, by which the service later
+    # tells whether the plugin that installed it is still there.
+    assert calls[0] == ("install", "--user-home", str(tmp_path / "home" / "deck"), "--plugins-dir", str(REPO.parent))
     reply = await plugin.install_service()
     assert reply["ok"] is False and "Python 3.11" in reply["error"]["message"]
     state = await plugin.service_info()
@@ -259,6 +261,8 @@ def test_backend_and_installer_agree(backend):
     assert fresh.ORPHAN_CHECK_OPTIONS == installer.ORPHAN_CHECK_OPTIONS
     assert fresh.INSTALLER_SNIPPET == installer.INSTALLER_SNIPPET
     assert fresh.SOCKET_PATH == "/run/tcl-me-remo/control.sock"
+    assert fresh.SERVICE_UNIT == installer.SERVICE
+    assert fresh.JOURNAL_LINE_CHARS == logsetup.RING_LINE_CHARS
     assert fresh.INSTALLED_MODULES == tuple(str(path / "py_modules") for path in installer.Layout().install_dirs)
 
 
@@ -282,6 +286,112 @@ async def test_remove_and_restart(backend, monkeypatch):
     assert ("uninstall", "--purge") in seen
     reply = await plugin.restart_service()
     assert reply["ok"] is False and "not found" in reply["error"]["message"]
+
+
+# ---------------------------------------------------------------------------------------------
+# What the panel offers instead of a terminal: the doctor's report, and the journal when the
+# service does not answer.
+
+
+async def test_doctor_runs_the_bundled_doctor_with_the_system_python(backend):
+    # The real thing, as a child process, with no service to ask: the report still comes.
+    reply = await backend.Plugin().doctor()
+    assert reply["ok"] is True, reply
+    report = reply["result"]
+    assert set(report) == {"worst", "system", "checks", "details"}
+    assert report["worst"] in (doctor.FAIL, doctor.WARN, doctor.UNKNOWN, doctor.OK)
+    assert report["system"][0].startswith("tcl-me-remo ")
+    by_name = {check["name"]: check for check in report["checks"]}
+    assert by_name["python"]["status"] == doctor.OK
+    assert by_name["service"]["status"] == doctor.FAIL and "not reachable" in by_name["service"]["detail"]
+    assert all(set(check) == {"name", "status", "detail"} for check in report["checks"])
+    # Run as root by Decky, so the report must not send its reader to sudo.
+    assert not any("sudo" in line for line in report["details"])
+
+
+async def test_doctor_is_run_read_only_from_the_plugins_own_copy(backend, monkeypatch):
+    seen = []
+
+    async def fake_run(argv, timeout):
+        seen.append((argv, timeout))
+        return 0, 'something a tool printed\n{"worst": "ok", "system": [], "checks": [], "details": []}\n', ""
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    reply = await backend.Plugin().doctor()
+    assert reply == {"ok": True, "result": {"worst": "ok", "system": [], "checks": [], "details": []}}
+    argv, timeout = seen[0]
+    assert argv[:3] == [sys.executable, "-I", "-c"] and argv[3] == backend.DOCTOR_SNIPPET
+    assert argv[4] == os.path.join(str(REPO), "py_modules") and len(argv) == 5
+    assert timeout == backend.DOCTOR_TIMEOUT
+    assert "main_for_panel" in backend.DOCTOR_SNIPPET and callable(doctor.main_for_panel)
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        ((1, "", "Traceback ...\nModuleNotFoundError: No module named 'tcl_me_remo'"), "No module named"),
+        ((-1, "", "timed out after 75s"), "timed out after 75s"),
+        ((0, "[1, 2]\n", ""), "[1, 2]"),
+        ((0, '{"no": "checks"}\n', ""), '{"no": "checks"}'),
+        ((3, "", ""), "the check failed (exit code 3)"),
+    ],
+)
+async def test_doctor_failures_are_reported_to_the_panel(backend, monkeypatch, result, message):
+    async def fake_run(argv, timeout):
+        return result
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    reply = await backend.Plugin().doctor()
+    assert reply["ok"] is False and reply["error"]["code"] == "doctor_failed"
+    assert message in reply["error"]["message"]
+
+
+async def test_service_log_reads_the_units_journal(backend, monkeypatch):
+    seen = []
+    journal = "\n".join(
+        [
+            "2026-11-10T19:29:58+0000 steamdeck systemd[1]: Started tcl-me-remo.service.",
+            "2026-11-10T19:29:59+0000 steamdeck tcl-me-remo[812]: " + "x" * 600,
+            "",
+            "2026-11-10T19:30:00+0000 steamdeck systemd[1]: tcl-me-remo.service: Failed with result 'exit-code'.",
+        ]
+    )
+
+    async def fake_run(argv, timeout):
+        seen.append(argv)
+        return 0, journal + "\n", ""
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    plugin = backend.Plugin()
+    reply = await plugin.service_log()
+    assert reply["ok"] is True
+    lines = reply["result"]["lines"]
+    assert len(lines) == 3 and lines[0].endswith("Started tcl-me-remo.service.") and "Failed with result" in lines[2]
+    assert len(lines[1]) == backend.JOURNAL_LINE_CHARS
+    assert seen[0][0] == "journalctl" and "--no-pager" in seen[0]
+    assert seen[0][seen[0].index("--unit") + 1] == "tcl-me-remo.service"
+    assert seen[0][seen[0].index("--lines") + 1] == "100"
+    # The panel cannot ask for more than fits a page, or for anything that is not a count.
+    await plugin.service_log(100000)
+    assert seen[1][seen[1].index("--lines") + 1] == "100"
+    await plugin.service_log(-5)
+    assert seen[2][seen[2].index("--lines") + 1] == "1"
+    assert (await plugin.service_log("5; reboot"))["error"]["code"] == "bad_request"
+    assert (await plugin.service_log(True))["error"]["code"] == "bad_request"
+    assert len(seen) == 3
+
+
+async def test_service_log_without_entries_or_without_journalctl(backend, monkeypatch):
+    answers = [(0, "-- No entries --\n", ""), (-1, "", "[Errno 2] No such file or directory: 'journalctl'")]
+
+    async def fake_run(argv, timeout):
+        return answers.pop(0)
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    plugin = backend.Plugin()
+    assert await plugin.service_log() == {"ok": True, "result": {"lines": []}}
+    reply = await plugin.service_log()
+    assert reply["ok"] is False and reply["error"]["code"] == "log_failed" and "journalctl" in reply["error"]["message"]
 
 
 def test_clean_env_drops_the_loaders_library_path(backend, monkeypatch):

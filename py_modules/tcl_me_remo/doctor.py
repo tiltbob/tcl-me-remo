@@ -130,9 +130,12 @@ def direct_delivery_check(kernel: str, setting: str | None) -> dict[str, str]:
         where = f"kernel {kernel} (an early release candidate, treated as older than {fixed})"
     else:
         where = f"kernel {kernel}"
+    # This line is shown in the Decky panel as well: the setting is named as the panel
+    # labels it (as the service's own error does, bluez/remote.py), with the key beside it.
+    setting_name = "Direct delivery (bluetooth.raw_notify; in the panel: Bluetooth page, Advanced)"
     disturbs = (
         f"before Linux {fixed} it can disturb the kernel's Bluetooth packet accounting, which the service repairs "
-        "after each link (unverified); if controllers or headsets stall, set it to 'auto'"
+        f"after each link (unverified); if controllers or headsets stall, set {setting_name} to 'auto'"
     )
     needs_pairing = "a TV that does not subscribe again after a reboot (Android 11 to 13) has to be paired again"
     status = OK
@@ -146,7 +149,7 @@ def direct_delivery_check(kernel: str, setting: str | None) -> dict[str, str]:
     elif setting == "auto" and not free:
         meaning = (
             f"not used on this kernel (only from Linux {fixed} on, where it has no side effects); {needs_pairing}, "
-            "or set raw_notify to 'on'"
+            f"or set {setting_name} to 'on'"
         )
     elif setting in ("auto", "on"):
         meaning = "used when the TV needs it"
@@ -285,7 +288,9 @@ async def collect(
             checks.append(_check("HID service", OK, "registered with BlueZ"))
         tv = bt.get("tv_name") or bt.get("tv_address")
         if not bt.get("paired"):
-            checks.append(_check("TV pairing", WARN, "no TV is paired yet (run: tcl-me-remo pair)"))
+            checks.append(
+                _check("TV pairing", WARN, "no TV is paired yet (Pair TV in the Decky panel, or run: tcl-me-remo pair)")
+            )
         elif bt.get("ready"):
             via = "direct delivery" if bt.get("delivery") == "raw" else "BlueZ"
             checks.append(_check("TV link", OK, f"{tv} is connected ({via})"))
@@ -338,30 +343,53 @@ async def collect(
     return report
 
 
-def render(report: dict[str, Any]) -> str:
-    """Human-readable form of :func:`collect`'s result."""
+def _system_lines(report: dict[str, Any]) -> list[str]:
+    """What this is running on: the first lines of the report."""
     sysinfo = report["system"]
     bt = report["bluetooth"]
-    lines = [
+    return [
         f"tcl-me-remo {report['tcl_me_remo']} on {sysinfo['os']} {sysinfo['os_version']}".rstrip(),
         f"kernel {sysinfo['kernel']}, Python {sysinfo['python']}, {sysinfo['systemd'] or 'systemd unknown'}",
         f"BlueZ {bt['bluez'] or 'unknown'}"
         + (" (experimental features on)" if bt["experimental"] else "")
         + "".join(f", {a['name']} {a['driver']} {a['id']}".rstrip() for a in bt["adapters"]),
-        "",
     ]
+
+
+def _detail_lines(report: dict[str, Any]) -> list[str]:
+    """What follows the checks: BlueZ settings, paired devices, displays."""
+    bt = report["bluetooth"]
+    lines: list[str] = []
+    if bt["main_conf"]:
+        lines += ["BlueZ main.conf settings in effect:"]
+        lines += [f"  {key} = {value}" for key, value in sorted(bt["main_conf"].items())]
+        lines.append("")
+    if bt["paired_devices"]:
+        lines += ["Paired Bluetooth devices:"] + [f"  {line}" for line in bt["paired_devices"]] + [""]
+    connectors = [c["label"] for c in report["display"]["connectors"] if c["connected"]]
+    lines.append("Connected displays: " + (", ".join(connectors) or "none detected"))
+    return lines
+
+
+def render(report: dict[str, Any]) -> str:
+    """Human-readable form of :func:`collect`'s result."""
+    lines = [*_system_lines(report), ""]
     for check in report["checks"]:
         lines.append(f"{_MARK[check['status']]} {check['name']}: {check['detail']}")
-    if bt["main_conf"]:
-        lines += ["", "BlueZ main.conf settings in effect:"]
-        lines += [f"  {key} = {value}" for key, value in sorted(bt["main_conf"].items())]
-    if bt["paired_devices"]:
-        lines += ["", "Paired Bluetooth devices:"] + [f"  {line}" for line in bt["paired_devices"]]
-    connectors = [c["label"] for c in report["display"]["connectors"] if c["connected"]]
-    lines += ["", "Connected displays: " + (", ".join(connectors) or "none detected")]
-    if not sysinfo["is_root"]:
+    lines += ["", *_detail_lines(report)]
+    if not report["system"]["is_root"]:
         lines += ["", "Tip: run with sudo for a complete report (some Bluetooth details need root)."]
     return "\n".join(lines)
+
+
+def panel_report(report: dict[str, Any]) -> dict[str, Any]:
+    """The same report in the pieces the Decky panel shows (see DoctorReport in src/types.ts)."""
+    return {
+        "worst": worst(report),
+        "system": _system_lines(report),
+        "checks": report["checks"],
+        "details": _detail_lines(report),
+    }
 
 
 def worst(report: dict[str, Any]) -> str:
@@ -377,3 +405,10 @@ def main(as_json: bool = False, out: Any = None) -> int:
     report = asyncio.run(collect())
     print(json.dumps(report, indent=2) if as_json else render(report), file=out)
     return 1 if worst(report) == FAIL else 0
+
+
+def main_for_panel(out: Any = None) -> int:
+    """Print :func:`panel_report` as one line of JSON.  The Decky backend runs this as root."""
+    report = asyncio.run(collect())
+    print(json.dumps(panel_report(report)), file=out if out is not None else sys.stdout)
+    return 0

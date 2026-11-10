@@ -36,6 +36,9 @@ const CLOCK_START = Date.UTC(2026, 10, 10, 19, 30, 0);
 const QAM = { width: 300, height: 760 };
 const SCREEN = { width: 1280, height: 800 };
 const ROUTE = "/tcl-me-remo";
+// What the panel must show for updates: the address in src/text.ts (the README has the same;
+// tests/test_release_plan.py compares the two).
+const UPDATE_ADDRESS = /UPDATE_ADDRESS = "([^"]+)"/.exec(readFileSync(join(dirname(here), "src", "text.ts"), "utf8"))[1];
 
 let passed = 0;
 const failures = [];
@@ -806,6 +809,23 @@ async function main() {
     check("shows what is installed and running", (await sees(page, "Yes, version")) && (await sees(page, "Starts with SteamOS")));
     check("shows the action history", (await sees(page, "TV on: done")) && (await sees(page, "TV off: done")));
     check("shows recent log lines", await sees(page, "service started"));
+    check(
+      "says which version the plugin is and how an update is installed, with the address to type",
+      (await sees(page, "This plugin is version 0.1.0")) &&
+        (await sees(page, "Decky settings > Developer > Install Plugin from URL")) &&
+        (await sees(page, UPDATE_ADDRESS, 1000, true)),
+    );
+    check("and that nothing looks for updates by itself", await sees(page, "It does not look for updates, and nothing is updated by itself."));
+    check(
+      "and that the address has to be carried to Decky's page, with the way to notice a mistyped ending",
+      (await sees(page, "The address is not on screen while you type it: write it down or have it on a phone")) &&
+        (await sees(page, 'Decky then asks "Install tcl-me-remo"; if it shows any other name, the end of the address')),
+    );
+    check(
+      "and that an update can restart the service, and where to look if keys then do not arrive",
+      (await sees(page, "An update that changes the service restarts it")) && (await sees(page, "the Bluetooth page says why")),
+    );
+    check("the log of a running service is its own, not the journal", (await calls(page, "service_log")).length === 0);
     await shot(page, "diagnostics");
     {
       // The same page a little later, in a fresh browser context, must give the same picture.
@@ -834,6 +854,27 @@ async function main() {
       (await page.getByRole("button", { name: "Hide steps", exact: true }).count()) === 1 && (await sees(page, "Bluetooth: playing macro: F3 1.5s LEFT*8 RIGHT*2 OK", 1000)),
     );
     check("no settings problem is shown when there is none", (await page.getByText("Settings problems").count()) === 0);
+
+    // The doctor's report, which otherwise takes "tcl-me-remo doctor" in a terminal.
+    check("the set-up check is not run until it is asked for", (await calls(page, "doctor")).length === 0 && (await button(page, "Run check").isVisible()));
+    await button(page, "Run check").click();
+    check("while it runs the button says so and cannot be pressed twice", await page.getByRole("button", { name: "Checking…" }).isDisabled());
+    check(
+      "Run check shows the doctor's report: every check with its verdict",
+      (await sees(page, "All 12 checks passed.")) && (await sees(page, "OK · TV link")) && (await sees(page, "Living Room TV is connected (BlueZ)")) && (await sees(page, "OK · suspend lock")),
+    );
+    check(
+      "with what it ran on and what is paired, as the command prints them",
+      (await sees(page, "tcl-me-remo 0.1.0 on SteamOS 3.7.13")) && (await sees(page, "Device AA:BB:CC:DD:EE:FF Living Room TV")) && (await sees(page, "Connected displays: HDMI-A-1")),
+    );
+    check(
+      "a setting the report tells the reader to change is named as the panel labels it",
+      (await sees(page, "or set Direct delivery (bluetooth.raw_notify; in the panel: Bluetooth page, Advanced) to 'on'")) &&
+        (await page.getByText("set raw_notify").count()) === 0,
+    );
+    check("it was one request to the backend", (await calls(page, "doctor")).length === 1 && (await button(page, "Check again").isEnabled()));
+    await shot(page, "diagnostics-check", false);
+
     await button(page, "Remove").click();
     check("Remove asks first and offers to delete the settings", (await sees(page, "Remove the background service?")) && (await toggle(page, "Also delete settings and the pairing").count()) === 1 && (await calls(page, "remove_service")).length === 0);
     check(
@@ -848,11 +889,41 @@ async function main() {
       const sent = await calls(page, "remove_service");
       return sent.length === 1 && sent[0].params.purge === true;
     })());
+    check(
+      "the result of the removal says what comes next: uninstalling the plugin in Decky",
+      (await sees(page, "Remove service: done")) &&
+        (await sees(page, "removed settings and state in /var/lib/tcl-me-remo. Now uninstall the plugin in Decky (Decky settings > Plugins): otherwise it installs the service again")),
+    );
     check("without the service the page shows its state, not stale data", (await gone(page, "What happened")) && (await button(page, "Install").isVisible()));
+    check(
+      "without the service the log is read from the system journal, and the page says so",
+      (await sees(page, "The service's last lines in the system journal")) && (await sees(page, "Stopped tcl-me-remo.service")) && (await calls(page, "service_log")).length >= 1,
+    );
+    await button(page, "Check again").click();
+    check(
+      "and the set-up check still works, and names the problem",
+      (await sees(page, "8 checks: 1 problem, 1 not known.")) && (await sees(page, "Problem · service")) && (await sees(page, "not reachable: cannot reach the tcl-me-remo service")),
+    );
     await shot(page, "diagnostics-no-service", false);
     await button(page, "Install service").click();
     check("and the service can be installed again from there", await sees(page, "Yes, version", 8000));
+    check("after which the log is the service's own again", (await sees(page, "Recent log lines")) && (await gone(page, "The service's last lines in the system journal")));
     await page.context().close();
+  }
+  {
+    const page = await settings("diagnostics, a stopped service", "diagnostics", { scenario: "stopped" });
+    check("a stopped service's journal is shown without being asked for", (await sees(page, "The background service is not running")) && (await sees(page, "Stopped tcl-me-remo.service")));
+    await page.context().close();
+
+    const never = await settings("diagnostics, a service that never was", "diagnostics", { scenario: "no-service" });
+    check("a journal without lines from the service is said to be that", await sees(never, "The system journal has no lines from the service"));
+    await never.context().close();
+
+    const failing = await settings("diagnostics, the tools fail", "diagnostics", { scenario: "stopped", fail: "doctor,service_log" });
+    check("a journal that cannot be read is reported, not hidden", await sees(failing, "The log could not be read: [Errno 2] No such file or directory: 'journalctl'"));
+    await button(failing, "Run check").click();
+    check("a set-up check that fails says why and can be tried again", (await sees(failing, "The check could not be made: timed out after 75s")) && (await button(failing, "Run check").isEnabled()));
+    await failing.context().close();
   }
 
   console.log("Settings: Diagnostics, a problem with the settings file");
@@ -870,8 +941,14 @@ async function main() {
     const kept = await settings("diagnostics, the file was moved aside", "diagnostics", { configProblem: "kept" });
     check("a settings file that was moved aside is shown with where it is", (await sees(kept, "Settings problems")) && (await sees(kept, "/var/lib/tcl-me-remo/config.json.broken")));
     check(
-      "the page says that the service runs on defaults and how to get the settings back",
-      (await sees(kept, "The service is running on default settings")) && (await sees(kept, "mend that file and move it back in Desktop Mode, then restart")),
+      "the page says that the service runs on defaults, and the way on that needs no terminal",
+      (await sees(kept, "The service is running on default settings")) && (await sees(kept, "set things up again on these pages, and pair the TV again if")) && (await sees(kept, "ends when the service next restarts (Restart, at the top of")),
+    );
+    check("and that getting the old file back is the one thing that takes a terminal", await sees(kept, "mending that file by hand, which takes a"));
+    check(
+      "and names the README section that has those steps, under the heading the README gives it",
+      (await sees(kept, 'see "A settings file that was moved aside" in the README')) &&
+        /^### A settings file that was moved aside$/m.test(readFileSync(join(dirname(here), "README.md"), "utf8")),
     );
     check("and does not claim that changing a setting clears it", (await kept.getByText("Changing any setting writes a clean settings file.").count()) === 0);
     await shot(kept, "diagnostics-settings-kept", false);

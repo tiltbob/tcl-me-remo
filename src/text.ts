@@ -12,6 +12,14 @@ export const colors = {
   text: "#dcdedf",
 };
 
+/**
+ * Where the plugin is installed from, and updated from: typed into "Install Plugin from URL"
+ * on Decky's Developer page. Without "https://", which Decky adds itself. The last part must
+ * stay "<the name in plugin.json>.zip": Decky tells an update from a fresh install by it
+ * (tests/test_release_plan.py holds the README, the release workflow and this to that).
+ */
+export const UPDATE_ADDRESS = "github.com/tiltbob/tcl-me-remo/releases/latest/download/tcl-me-remo.zip";
+
 export const kindColor: Record<OutcomeKind, string> = {
   ok: colors.ok,
   skipped: colors.warn,

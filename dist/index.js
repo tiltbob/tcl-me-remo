@@ -123,6 +123,8 @@ const callServiceInfo = callable("service_info");
 const callInstallService = callable("install_service");
 const callRemoveService = callable("remove_service");
 const callRestartService = callable("restart_service");
+const callDoctor = callable("doctor");
+const callServiceLog = callable("service_log");
 // Safety nets only. main.py gives up first (its TIMEOUTS table: 240 s at most for the slow
 // methods, 45 s or less for the rest); these fire when the backend itself has gone away.
 const SLOW_METHODS = new Set(["tv_on", "switch_input", "run_macro", "event", "connect"]);
@@ -133,6 +135,8 @@ const STATUS_SECONDS = 20;
 // installs the service in the background when the plugin loads; up to 120 s) and then run
 // their own (up to another 120 s).
 const INSTALLER_SECONDS = 260;
+// The doctor asks a dozen system tools, each with its own time limit; main.py gives it 75 s.
+const DOCTOR_SECONDS = 90;
 function failure(code, message) {
     return { ok: false, error: { code, message } };
 }
@@ -207,6 +211,39 @@ function removeService$1(purge) {
 function restartService$1() {
     return settle("restart_service", 90, callRestartService);
 }
+/** The report of "tcl-me-remo doctor". Read-only; works when the service itself does not. */
+function doctor() {
+    return settle("doctor", DOCTOR_SECONDS, callDoctor, (value) => {
+        const reply = asReply(value);
+        if (!reply.ok)
+            return reply;
+        const result = reply.result;
+        if (!isObject$1(result) || !Array.isArray(result.checks)) {
+            return failure("bad_reply", "the plugin backend sent an unreadable report");
+        }
+        const lines = (list) => (Array.isArray(list) ? list.map(String) : []);
+        return {
+            ok: true,
+            result: {
+                worst: String(result.worst ?? "unknown"),
+                system: lines(result.system),
+                checks: result.checks.filter(isObject$1).map((check) => ({
+                    name: String(check.name ?? ""),
+                    status: String(check.status ?? "unknown"),
+                    detail: String(check.detail ?? ""),
+                })),
+                details: lines(result.details),
+            },
+        };
+    });
+}
+/**
+ * The service's lines in the system journal, oldest first. For when the service does not
+ * answer; while it does, its own "logs" request is the better source.
+ */
+function serviceLog(lines) {
+    return settle("service_log", NORMAL_SECONDS, () => callServiceLog(lines));
+}
 
 // Wording shared by the panel and the settings pages.
 const colors = {
@@ -217,6 +254,13 @@ const colors = {
     dim: "#8b929a",
     text: "#dcdedf",
 };
+/**
+ * Where the plugin is installed from, and updated from: typed into "Install Plugin from URL"
+ * on Decky's Developer page. Without "https://", which Decky adds itself. The last part must
+ * stay "<the name in plugin.json>.zip": Decky tells an update from a fresh install by it
+ * (tests/test_release_plan.py holds the README, the release workflow and this to that).
+ */
+const UPDATE_ADDRESS = "github.com/tiltbob/tcl-me-remo/releases/latest/download/tcl-me-remo.zip";
 const kindColor = {
     ok: colors.ok,
     skipped: colors.warn,
@@ -889,10 +933,15 @@ function restartService() {
         .run(KEYS.restart, "Restart service", restartService$1, () => ({ text: "The service was restarted" }))
         .then(afterServiceChange);
 }
+/**
+ * What a removal is followed by. The page then shows "not installed" with an Install button,
+ * which is not the way on for somebody who wants to be rid of it.
+ */
+const AFTER_REMOVE = "Now uninstall the plugin in Decky (Decky settings > Plugins): otherwise it installs the service again the next time it loads.";
 function removeService(purge) {
     return store
         .run(KEYS.remove, "Remove service", () => removeService$1(purge), (result) => ({
-        text: (result?.log ?? []).join("; ") || "The service was removed",
+        text: `${(result?.log ?? []).join("; ") || "The service was removed"}. ${AFTER_REMOVE}`,
     }))
         .then(afterServiceChange);
 }
@@ -1637,53 +1686,128 @@ const BluetoothPage = () => {
 
 const LOG_LINES = 100;
 const LOG_CHUNK = 20;
+const pre = {
+    margin: 0,
+    fontFamily: "monospace",
+    fontSize: "12px",
+    lineHeight: "1.45",
+    whiteSpace: "pre-wrap",
+    overflowWrap: "anywhere",
+    color: colors.text,
+};
+/** Lines of plain text the D-pad can stop on, so that they can be scrolled into view. */
+const TextBlock = ({ lines }) => (SP_JSX.jsx(DFL.Focusable, { onActivate: () => undefined, style: { padding: "6px 10px", margin: "2px 0", background: "rgba(0, 0, 0, 0.25)" }, children: SP_JSX.jsx("pre", { style: pre, children: lines.join("\n") }) }));
+/**
+ * The log. While the service answers it is the service's own; when it does not, its lines
+ * in the system journal, which the plugin backend can read: a service that fails at every
+ * start says why there and nowhere else.
+ */
 const Logs = ({ up }) => {
     const [lines, setLines] = SP_REACT.useState(null);
     const [error, setError] = SP_REACT.useState("");
     const [loading, setLoading] = SP_REACT.useState(false);
     const mounted = SP_REACT.useRef(true);
     const busy = SP_REACT.useRef(false);
+    const wanted = SP_REACT.useRef(up);
+    wanted.current = up;
     const load = () => {
         if (busy.current)
             return;
         busy.current = true;
         setLoading(true);
-        void rpc("logs", { lines: LOG_LINES }).then((reply) => {
+        const source = wanted.current;
+        const request = source ? rpc("logs", { lines: LOG_LINES }) : serviceLog(LOG_LINES);
+        void request.then((reply) => {
             busy.current = false;
             if (!mounted.current)
                 return;
             setLoading(false);
+            if (source !== wanted.current) {
+                // The service came up or went away meanwhile: what arrived is the other log.
+                load();
+                return;
+            }
             if (reply.ok) {
                 setLines(Array.isArray(reply.result?.lines) ? reply.result.lines.map(String) : []);
                 setError("");
             }
             else {
+                setLines(null);
                 setError(reply.error.message);
             }
         });
     };
     SP_REACT.useEffect(() => {
         mounted.current = true;
-        if (up)
-            load();
+        setLines(null);
+        setError("");
+        load();
         return () => {
             mounted.current = false;
         };
     }, [up]);
     // Newest first, in pieces the D-pad can step through.
-    const newestFirst = up ? (lines ?? []).slice().reverse() : [];
+    const newestFirst = (lines ?? []).slice().reverse();
     const chunks = [];
     for (let index = 0; index < newestFirst.length; index += LOG_CHUNK)
         chunks.push(newestFirst.slice(index, index + LOG_CHUNK));
-    return (SP_JSX.jsxs(Section, { title: "Log", children: [SP_JSX.jsx(DFL.Field, { label: "Recent log lines", description: error ? (SP_JSX.jsxs("span", { style: { color: colors.bad }, children: ["The log could not be read: ", error] })) : !up ? ("The log is read from the service, which does not answer.") : lines === null ? ("Not loaded.") : (`The last ${lines.length} lines, newest first. The service writes down every step of every action.`), children: SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: loading || !up, onClick: () => load(), children: loading ? "Loading…" : "Refresh" }) }), chunks.map((chunk, index) => (SP_JSX.jsx(DFL.Focusable, { onActivate: () => undefined, style: { padding: "6px 10px", margin: "2px 0", background: "rgba(0, 0, 0, 0.25)" }, children: SP_JSX.jsx("pre", { style: {
-                        margin: 0,
-                        fontFamily: "monospace",
-                        fontSize: "12px",
-                        lineHeight: "1.45",
-                        whiteSpace: "pre-wrap",
-                        overflowWrap: "anywhere",
-                        color: colors.text,
-                    }, children: chunk.join("\n") }) }, index))), up && lines !== null && lines.length === 0 && !error && SP_JSX.jsx(Note, { label: "The log is empty" })] }));
+    return (SP_JSX.jsxs(Section, { title: "Log", children: [SP_JSX.jsx(DFL.Field, { label: up ? "Recent log lines" : "The service's last lines in the system journal", description: error ? (SP_JSX.jsxs("span", { style: { color: colors.bad }, children: ["The log could not be read: ", error] })) : lines === null ? (loading ? "Reading." : "Not loaded.") : up ? (`The last ${lines.length} lines, newest first. The service writes down every step of every action.`) : (`The service does not answer, so this is what the system kept of it: the last ${lines.length} lines, newest first. If the service fails to start, the reason is here.`), children: SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: loading, onClick: () => load(), children: loading ? "Loading…" : "Refresh" }) }), chunks.map((chunk, index) => (SP_JSX.jsx(TextBlock, { lines: chunk }, index))), lines !== null && lines.length === 0 && !error && (SP_JSX.jsx(Note, { label: up ? "The log is empty" : "The system journal has no lines from the service" }))] }));
+};
+const CHECK_WORD = {
+    ok: "OK",
+    warn: "Warning",
+    fail: "Problem",
+    unknown: "Not known",
+};
+const CHECK_COLOR = {
+    ok: colors.ok,
+    warn: colors.warn,
+    fail: colors.bad,
+    unknown: colors.dim,
+};
+function checkSummary(report) {
+    const count = (status) => report.checks.filter((check) => check.status === status).length;
+    const parts = [
+        count("fail") ? `${count("fail")} ${count("fail") === 1 ? "problem" : "problems"}` : "",
+        count("warn") ? `${count("warn")} ${count("warn") === 1 ? "warning" : "warnings"}` : "",
+        count("unknown") ? `${count("unknown")} not known` : "",
+    ].filter(Boolean);
+    return parts.length ? `${report.checks.length} checks: ${parts.join(", ")}.` : `All ${report.checks.length} checks passed.`;
+}
+/**
+ * The doctor's report, which the command line prints for "tcl-me-remo doctor". Asked for
+ * with a button and never by itself: it starts a dozen system tools.
+ */
+const SetupCheck = () => {
+    const [report, setReport] = SP_REACT.useState(null);
+    const [error, setError] = SP_REACT.useState("");
+    const [running, setRunning] = SP_REACT.useState(false);
+    const mounted = SP_REACT.useRef(true);
+    SP_REACT.useEffect(() => {
+        mounted.current = true;
+        return () => {
+            mounted.current = false;
+        };
+    }, []);
+    const run = () => {
+        if (running)
+            return;
+        setRunning(true);
+        void doctor().then((reply) => {
+            if (!mounted.current)
+                return;
+            setRunning(false);
+            if (reply.ok) {
+                setReport(reply.result);
+                setError("");
+            }
+            else {
+                setReport(null);
+                setError(reply.error.message);
+            }
+        });
+    };
+    return (SP_JSX.jsxs(Section, { title: "Check the set-up", children: [SP_JSX.jsx(DFL.Field, { label: "Check Bluetooth, the service, the pairing and the suspend hooks", description: error ? (SP_JSX.jsxs("span", { style: { color: colors.bad }, children: ["The check could not be made: ", error] })) : report ? (SP_JSX.jsx("span", { style: { color: CHECK_COLOR[report.worst] ?? colors.text }, children: checkSummary(report) })) : ("Says what is wrong in plain words. It only looks; nothing is changed. Works when the service does not. Include a screenshot of the result in a bug report."), children: SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: running, onClick: () => run(), children: running ? "Checking…" : report ? "Check again" : "Run check" }) }), report && report.system.length > 0 && SP_JSX.jsx(TextBlock, { lines: report.system }), report?.checks.map((check, index) => (SP_JSX.jsx(DFL.Field, { focusable: true, padding: "compact", label: SP_JSX.jsxs("span", { children: [SP_JSX.jsx("span", { style: { color: CHECK_COLOR[check.status] ?? colors.dim }, children: CHECK_WORD[check.status] ?? check.status }), ` · ${check.name}`] }), description: SP_JSX.jsx("span", { style: { color: colors.text, overflowWrap: "anywhere" }, children: check.detail }) }, index))), report && report.details.length > 0 && SP_JSX.jsx(TextBlock, { lines: report.details })] }));
 };
 const DiagnosticsPage = () => {
     const state = useTv();
@@ -1709,7 +1833,7 @@ const DiagnosticsPage = () => {
                                         ? status
                                             ? `Yes, version ${status.version}, for ${duration(status.uptime)}`
                                             : "Yes, but it does not answer"
-                                        : "No" }) }), SP_JSX.jsx(DFL.Field, { focusable: true, label: "Starts with SteamOS", padding: "compact", children: SP_JSX.jsx(Value, { color: service.enabled ? colors.ok : colors.bad, children: service.enabled ? "Yes" : "No" }) }), SP_JSX.jsx(DFL.Field, { focusable: true, label: "Version in this plugin", padding: "compact", children: SP_JSX.jsxs(Value, { color: service.installed && service.needs_update ? colors.warn : colors.text, children: [service.bundled_version || "unknown", service.installed && service.needs_update ? " (differs from the installed one; Repair updates it)" : ""] }) }), service.problems.map((problem, index) => (SP_JSX.jsx(DFL.Field, { focusable: true, padding: "compact", label: SP_JSX.jsx("span", { style: { color: colors.bad }, children: "Problem" }), description: SP_JSX.jsx("span", { style: { color: colors.text, overflowWrap: "anywhere" }, children: problem }) }, index)))] })) : (SP_JSX.jsx(Note, { label: state.serviceError ? "The service's state could not be checked" : "Checking what is installed", children: state.serviceError })), SP_JSX.jsx(DFL.Field, { label: "Repair, restart, remove", description: "Repair installs, updates and starts the service; it changes nothing that is already right. Restart makes the TV connect and subscribe anew, so use it only when something is stuck.", childrenLayout: "below", children: SP_JSX.jsxs(ButtonRow, { children: [SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: serviceWorking, onClick: () => void installService(), children: KEYS.install in state.pending ? "Working…" : service && !service.installed ? "Install" : "Repair" }), SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: serviceWorking || !service?.installed || (status !== null && status.busy !== ""), onClick: () => void restartService(), children: KEYS.restart in state.pending ? "Working…" : "Restart" }), SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: serviceWorking || !service?.installed, onClick: () => DFL.showModal(SP_JSX.jsx(RemoveServiceModal, {})), children: KEYS.remove in state.pending ? "Working…" : "Remove" })] }) }), SP_JSX.jsx(OutcomeView, { state: state, actionKey: KEYS.install }), SP_JSX.jsx(OutcomeView, { state: state, actionKey: KEYS.restart }), SP_JSX.jsx(OutcomeView, { state: state, actionKey: KEYS.remove })] }), status && status.config_problems.length > 0 && (SP_JSX.jsxs(Section, { title: "Settings problems", children: [status.config_problems.map((problem, index) => (SP_JSX.jsx(DFL.Field, { focusable: true, label: SP_JSX.jsx("span", { style: { color: colors.warn }, children: "Problem in the settings file" }), description: SP_JSX.jsx("span", { style: { color: colors.text, overflowWrap: "anywhere" }, children: problem }) }, index))), status.config_problems.some((problem) => !problem.includes(".broken")) && (SP_JSX.jsx(Note, { children: "Changing any setting writes a clean settings file." })), status.config_problems.some((problem) => problem.includes(".broken")) && (SP_JSX.jsx(Note, { label: "The service is running on default settings", children: "Changing a setting does not clear this, and does not bring the old settings back: they are in the file named above. To get them back, mend that file and move it back in Desktop Mode, then restart the service. Or set things up again here; the notice then ends when the service next restarts." }))] })), status && (SP_JSX.jsxs(Section, { title: "What happened", children: [history.length === 0 && (SP_JSX.jsx(Note, { label: "Nothing yet", children: "Actions show up here with every step that was tried." })), history.map((record) => (SP_JSX.jsx(RecordView, { record: record, startOpen: false }, `${record.time}-${record.name}-${record.trigger}`)))] })), SP_JSX.jsx(Logs, { up: !!status }), status && config && (SP_JSX.jsxs(Section, { title: "Advanced", children: [SP_JSX.jsx(SettingChoice, { state: state, path: "power.on_key", label: "Key that turns the TV on", description: "Other keys can be set from the command line.", choices: onKeys }), SP_JSX.jsx(SettingChoice, { state: state, path: "power.on_repeat", label: "Send the on key", description: "", choices: rangeChoices(settingInfo(state.bundle, "power.on_repeat"), times) }), SP_JSX.jsx(SettingChoice, { state: state, path: "power.off_key", label: "Key that turns the TV off", description: "Other keys can be set from the command line.", choices: offKeys }), SP_JSX.jsx(SettingChoice, { state: state, path: "power.off_repeat", label: "Send the off key", description: "", choices: rangeChoices(settingInfo(state.bundle, "power.off_repeat"), times) }), SP_JSX.jsx(SettingSlider, { state: state, path: "power.repeat_gap", label: "Pause between repeats", description: "Only matters when a key is sent more than once.", step: 0.1, suffix: " s" }), SP_JSX.jsx(SettingChoice, { state: state, path: "log_level", label: "Log detail", description: "", choices: [
+                                        : "No" }) }), SP_JSX.jsx(DFL.Field, { focusable: true, label: "Starts with SteamOS", padding: "compact", children: SP_JSX.jsx(Value, { color: service.enabled ? colors.ok : colors.bad, children: service.enabled ? "Yes" : "No" }) }), SP_JSX.jsx(DFL.Field, { focusable: true, label: "Version in this plugin", padding: "compact", children: SP_JSX.jsxs(Value, { color: service.installed && service.needs_update ? colors.warn : colors.text, children: [service.bundled_version || "unknown", service.installed && service.needs_update ? " (differs from the installed one; Repair updates it)" : ""] }) }), service.problems.map((problem, index) => (SP_JSX.jsx(DFL.Field, { focusable: true, padding: "compact", label: SP_JSX.jsx("span", { style: { color: colors.bad }, children: "Problem" }), description: SP_JSX.jsx("span", { style: { color: colors.text, overflowWrap: "anywhere" }, children: problem }) }, index)))] })) : (SP_JSX.jsx(Note, { label: state.serviceError ? "The service's state could not be checked" : "Checking what is installed", children: state.serviceError })), SP_JSX.jsx(DFL.Field, { label: "Repair, restart, remove", description: "Repair installs, updates and starts the service; it changes nothing that is already right. Restart makes the TV connect and subscribe anew, so use it only when something is stuck.", childrenLayout: "below", children: SP_JSX.jsxs(ButtonRow, { children: [SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: serviceWorking, onClick: () => void installService(), children: KEYS.install in state.pending ? "Working…" : service && !service.installed ? "Install" : "Repair" }), SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: serviceWorking || !service?.installed || (status !== null && status.busy !== ""), onClick: () => void restartService(), children: KEYS.restart in state.pending ? "Working…" : "Restart" }), SP_JSX.jsx(DFL.DialogButton, { style: rowButton, disabled: serviceWorking || !service?.installed, onClick: () => DFL.showModal(SP_JSX.jsx(RemoveServiceModal, {})), children: KEYS.remove in state.pending ? "Working…" : "Remove" })] }) }), SP_JSX.jsx(OutcomeView, { state: state, actionKey: KEYS.install }), SP_JSX.jsx(OutcomeView, { state: state, actionKey: KEYS.restart }), SP_JSX.jsx(OutcomeView, { state: state, actionKey: KEYS.remove })] }), SP_JSX.jsx(Section, { title: "Updates", children: SP_JSX.jsx(DFL.Field, { focusable: true, label: `This plugin is version ${service?.bundled_version || "unknown"}`, description: SP_JSX.jsxs("div", { children: [SP_JSX.jsx("div", { children: "It does not look for updates, and nothing is updated by itself. To update, install the plugin again from the address it came from: Decky settings > Developer > Install Plugin from URL. Type the address exactly; the same address always gives the newest version." }), SP_JSX.jsx("div", { style: { ...pre, fontSize: "13px", margin: "6px 0" }, children: UPDATE_ADDRESS }), SP_JSX.jsx("div", { children: "The address is not on screen while you type it: write it down or have it on a phone before you leave this page. Decky then asks \"Install tcl-me-remo\"; if it shows any other name, the end of the address is wrong, so cancel and correct it." }), SP_JSX.jsx("div", { style: { marginTop: "6px" }, children: "Settings and the pairing with the TV are kept. The background service is updated when the new plugin loads. An update that changes the service restarts it, which for the TV is like a restart of SteamOS: if keys do not arrive afterwards, the Bluetooth page says why." })] }) }) }), SP_JSX.jsx(SetupCheck, {}), status && status.config_problems.length > 0 && (SP_JSX.jsxs(Section, { title: "Settings problems", children: [status.config_problems.map((problem, index) => (SP_JSX.jsx(DFL.Field, { focusable: true, label: SP_JSX.jsx("span", { style: { color: colors.warn }, children: "Problem in the settings file" }), description: SP_JSX.jsx("span", { style: { color: colors.text, overflowWrap: "anywhere" }, children: problem }) }, index))), status.config_problems.some((problem) => !problem.includes(".broken")) && (SP_JSX.jsx(Note, { children: "Changing any setting writes a clean settings file." })), status.config_problems.some((problem) => problem.includes(".broken")) && (SP_JSX.jsx(Note, { label: "The service is running on default settings", children: "Changing a setting does not clear this, and does not bring the old settings back: they are in the file named above. The way on from here: set things up again on these pages, and pair the TV again if it shows as unpaired. This notice then ends when the service next restarts (Restart, at the top of this page). Getting the old settings back instead means mending that file by hand, which takes a terminal in Desktop Mode: see \"A settings file that was moved aside\" in the README." }))] })), status && (SP_JSX.jsxs(Section, { title: "What happened", children: [history.length === 0 && (SP_JSX.jsx(Note, { label: "Nothing yet", children: "Actions show up here with every step that was tried." })), history.map((record) => (SP_JSX.jsx(RecordView, { record: record, startOpen: false }, `${record.time}-${record.name}-${record.trigger}`)))] })), SP_JSX.jsx(Logs, { up: !!status }), status && config && (SP_JSX.jsxs(Section, { title: "Advanced", children: [SP_JSX.jsx(SettingChoice, { state: state, path: "power.on_key", label: "Key that turns the TV on", description: "Other keys can be set from the command line.", choices: onKeys }), SP_JSX.jsx(SettingChoice, { state: state, path: "power.on_repeat", label: "Send the on key", description: "", choices: rangeChoices(settingInfo(state.bundle, "power.on_repeat"), times) }), SP_JSX.jsx(SettingChoice, { state: state, path: "power.off_key", label: "Key that turns the TV off", description: "Other keys can be set from the command line.", choices: offKeys }), SP_JSX.jsx(SettingChoice, { state: state, path: "power.off_repeat", label: "Send the off key", description: "", choices: rangeChoices(settingInfo(state.bundle, "power.off_repeat"), times) }), SP_JSX.jsx(SettingSlider, { state: state, path: "power.repeat_gap", label: "Pause between repeats", description: "Only matters when a key is sent more than once.", step: 0.1, suffix: " s" }), SP_JSX.jsx(SettingChoice, { state: state, path: "log_level", label: "Log detail", description: "", choices: [
                             { value: "DEBUG", label: "Everything", hint: "For bug reports." },
                             { value: "INFO", label: "Normal" },
                             { value: "WARNING", label: "Problems only" },
