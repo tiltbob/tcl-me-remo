@@ -224,6 +224,57 @@ async def test_suspend_falls_back_to_wifi(tmp_path):
     assert wifi.keys == [("192.168.1.50", 223)]  # KEYCODE_SLEEP
 
 
+async def test_suspend_with_link_down_races_both_transports(tmp_path):
+    # Wi-Fi answers at once; the machine must not wait for the Bluetooth attempt to time out.
+    wifi = FakeWifi()
+    remote = FakeRemote(connect_after=None)
+    patch = {"wifi": {"enabled": True, "host": "tv.lan"}, "bluetooth": {"off_connect_timeout": 30.0}}
+    h = Harness(tmp_path, remote=remote, wifi=wifi, patch=patch)
+    started = asyncio.get_running_loop().time()
+    record = await h.service.handle_event("suspend", budget=3.0)
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert record["ok"] and record["detail"] == "TV off (Wi-Fi)"
+    assert wifi.keys == [("tv.lan", 223)]
+
+    # Bluetooth reconnects while Wi-Fi is unreachable: Bluetooth wins.
+    wifi2 = FakeWifi()
+    wifi2.fail_code = "wifi_unreachable"
+    h2 = Harness(tmp_path, remote=FakeRemote(connect_after=0.05), wifi=wifi2, patch=patch)
+    record = await h2.service.handle_event("suspend", budget=3.0)
+    assert record["ok"] and record["detail"] == "TV off (Bluetooth)"
+    assert h2.remote.key_names() == ["SLEEP"]
+    assert any(step.startswith("Wi-Fi: ") for step in record["steps"])
+
+    # Neither works: both reasons are reported.
+    wifi3 = FakeWifi()
+    wifi3.fail_code = "wifi_unreachable"
+    patch3 = {"wifi": {"enabled": True, "host": "tv.lan"}, "bluetooth": {"off_connect_timeout": 0.05}}
+    h3 = Harness(tmp_path, remote=FakeRemote(connect_after=None), wifi=wifi3, patch=patch3)
+    record = await h3.service.handle_event("suspend", budget=3.0)
+    assert not record["ok"]
+    assert "Bluetooth: the TV did not connect" in record["detail"] and "Wi-Fi: wifi problem" in record["detail"]
+
+
+async def test_wake_uses_wifi_only_after_bluetooth_failed(tmp_path):
+    wifi = FakeWifi()
+    patch = {
+        "wifi": {"enabled": True, "host": "tv.lan"},
+        "bluetooth": {"connect_timeout": 1.0},
+        "input": {"method": "none"},
+    }
+    h = Harness(tmp_path, remote=FakeRemote(connect_after=None), wifi=wifi, patch=patch)
+    record = await h.service.tv_on()
+    assert record["ok"] and record["detail"] == "TV on (Wi-Fi)"
+    assert wifi.keys == [("tv.lan", 224)]  # KEYCODE_WAKEUP
+    assert record["steps"][0].startswith("Bluetooth: the TV did not connect")
+
+    # with a working Bluetooth link Wi-Fi is not touched at all
+    wifi_b = FakeWifi()
+    hb = Harness(tmp_path, wifi=wifi_b, patch=patch)
+    assert (await hb.service.tv_on())["detail"] == "TV on (Bluetooth)"
+    assert wifi_b.keys == []
+
+
 async def test_suspend_reports_failure_when_tv_is_unreachable(tmp_path):
     h = Harness(tmp_path, remote=FakeRemote(connect_after=None), patch={"bluetooth": {"off_connect_timeout": 0.05}})
     record = await h.service.handle_event("suspend")

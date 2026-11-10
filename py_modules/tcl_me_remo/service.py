@@ -247,34 +247,73 @@ class Service:
         return f"TV off ({via})"
 
     async def _power(self, trace: Trace, *, on: bool, connect_timeout: float, wifi_timeout: float) -> str:
-        """Send the power key over Bluetooth, falling back to Wi-Fi.  Returns the transport used."""
+        """Send the power key.  Returns the transport that delivered it.
+
+        Bluetooth is tried first and Wi-Fi is the fallback.  The exception is turning the TV
+        off while the Bluetooth link is down: the time before the machine sleeps is too short
+        to try one transport after the other, so both run at once and the first to succeed
+        wins (SLEEP is idempotent, so a double delivery is harmless).
+        """
+        cfg = self.cfg
+        wifi_ok = cfg.wifi.power_fallback and self._wifi_configured()
+        if not on and wifi_ok and not self.remote.state.ready:
+            return await self._power_race(trace, connect_timeout=connect_timeout, wifi_timeout=wifi_timeout)
+        try:
+            await self._power_ble(trace, on=on, connect_timeout=connect_timeout)
+            return "Bluetooth"
+        except RpcError as exc:
+            self._note(trace, f"Bluetooth: {exc.message}")
+            if not wifi_ok:
+                raise RpcError("tv_unreachable", f"Bluetooth: {exc.message}") from None
+            ble_problem = exc.message
+        try:
+            await self._power_wifi(trace, on=on, timeout=wifi_timeout)
+        except RpcError as exc:
+            self._note(trace, f"Wi-Fi: {exc.message}")
+            raise RpcError("tv_unreachable", f"Bluetooth: {ble_problem}; Wi-Fi: {exc.message}") from None
+        return "Wi-Fi"
+
+    async def _power_ble(self, trace: Trace, *, on: bool, connect_timeout: float) -> None:
         cfg = self.cfg
         key = cfg.power.on_key if on else cfg.power.off_key
         repeat = cfg.power.on_repeat if on else cfg.power.off_repeat
-        try:
-            if await self._ble_ready(trace, connect_timeout):
-                for index in range(repeat):
-                    if index:
-                        await self._sleep(cfg.power.repeat_gap)
-                    await self.remote.send_key(key, cfg.bluetooth.key_press_ms / 1000.0)
-                self._note(trace, f"Bluetooth: sent {key}" + (f" x{repeat}" if repeat > 1 else ""))
-                return "Bluetooth"
-            problem = f"the TV did not connect within {connect_timeout:g}s"
-        except TransportError as exc:
-            problem = exc.message
-        self._note(trace, f"Bluetooth: {problem}")
+        if not await self._ble_ready(trace, connect_timeout):
+            raise RpcError("tv_unreachable", f"the TV did not connect within {connect_timeout:g}s")
+        for index in range(repeat):
+            if index:
+                await self._sleep(cfg.power.repeat_gap)
+            await self.remote.send_key(key, cfg.bluetooth.key_press_ms / 1000.0)
+        self._note(trace, f"Bluetooth: sent {key}" + (f" x{repeat}" if repeat > 1 else ""))
 
-        if not (cfg.wifi.power_fallback and self._wifi_configured()):
-            raise RpcError("tv_unreachable", f"Bluetooth: {problem}")
+    async def _power_wifi(self, trace: Trace, *, on: bool, timeout: float) -> None:
         assert self.wifi is not None
-        keycode = KEYCODE_WAKEUP if on else KEYCODE_SLEEP
-        try:
-            await self.wifi.send_key(cfg.wifi.host, keycode, timeout=wifi_timeout)
-        except TransportError as exc:
-            self._note(trace, f"Wi-Fi: {exc.message}")
-            raise RpcError("tv_unreachable", f"Bluetooth: {problem}; Wi-Fi: {exc.message}") from None
+        await self.wifi.send_key(self.cfg.wifi.host, KEYCODE_WAKEUP if on else KEYCODE_SLEEP, timeout=timeout)
         self._note(trace, f"Wi-Fi: sent {'WAKEUP' if on else 'SLEEP'}")
-        return "Wi-Fi"
+
+    async def _power_race(self, trace: Trace, *, connect_timeout: float, wifi_timeout: float) -> str:
+        attempts = {
+            asyncio.ensure_future(self._power_ble(trace, on=False, connect_timeout=connect_timeout)): "Bluetooth",
+            asyncio.ensure_future(self._power_wifi(trace, on=False, timeout=wifi_timeout)): "Wi-Fi",
+        }
+        pending = set(attempts)
+        problems: list[str] = []
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    error = task.exception()
+                    if error is None:
+                        return attempts[task]
+                    if not isinstance(error, RpcError):
+                        raise error
+                    problems.append(f"{attempts[task]}: {error.message}")
+                    self._note(trace, problems[-1])
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        raise RpcError("tv_unreachable", "; ".join(sorted(problems)))
 
     async def _ble_ready(self, trace: Trace, timeout: float) -> bool:
         if self.remote.state.ready:
