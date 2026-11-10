@@ -17,7 +17,7 @@ if _VENDOR not in sys.path:
     # First on the path so the pinned copy wins over any system-wide dbus_fast.
     sys.path.insert(0, _VENDOR)
 
-from dbus_fast import BusType, DBusError, Message, MessageType, PropertyAccess, Variant  # noqa: E402
+from dbus_fast import BusType, DBusError, Message, MessageFlag, MessageType, PropertyAccess, Variant  # noqa: E402
 from dbus_fast.aio import MessageBus  # noqa: E402
 from dbus_fast.service import ServiceInterface, dbus_property, method, signal  # noqa: E402
 
@@ -26,6 +26,7 @@ __all__ = [
     "DBusError",
     "Message",
     "MessageBus",
+    "MessageFlag",
     "MessageType",
     "PropertyAccess",
     "ServiceInterface",
@@ -36,8 +37,10 @@ __all__ = [
     "dbus_property",
     "get_all_properties",
     "get_managed_objects",
+    "get_name_owner",
     "get_property",
     "method",
+    "on_signal",
     "remove_match",
     "set_property",
     "signal",
@@ -104,26 +107,50 @@ async def call(
     return (await call_message(bus, message, timeout=timeout)).body
 
 
-async def get_property(bus: MessageBus, destination: str, path: str, interface: str, name: str) -> Any:
-    body = await call(bus, destination, path, PROPERTIES, "Get", "ss", [interface, name])
+async def get_property(
+    bus: MessageBus, destination: str, path: str, interface: str, name: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> Any:
+    body = await call(bus, destination, path, PROPERTIES, "Get", "ss", [interface, name], timeout=timeout)
     return unwrap(body[0])
 
 
-async def get_all_properties(bus: MessageBus, destination: str, path: str, interface: str) -> dict[str, Any]:
-    body = await call(bus, destination, path, PROPERTIES, "GetAll", "s", [interface])
+async def get_all_properties(
+    bus: MessageBus, destination: str, path: str, interface: str, *, timeout: float = DEFAULT_TIMEOUT
+) -> dict[str, Any]:
+    body = await call(bus, destination, path, PROPERTIES, "GetAll", "s", [interface], timeout=timeout)
     return unwrap(body[0])
 
 
-async def set_property(bus: MessageBus, destination: str, path: str, interface: str, name: str, value: Variant) -> None:
-    await call(bus, destination, path, PROPERTIES, "Set", "ssv", [interface, name, value])
+async def set_property(
+    bus: MessageBus,
+    destination: str,
+    path: str,
+    interface: str,
+    name: str,
+    value: Variant,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> None:
+    await call(bus, destination, path, PROPERTIES, "Set", "ssv", [interface, name, value], timeout=timeout)
 
 
 async def get_managed_objects(
-    bus: MessageBus, destination: str, path: str = "/"
+    bus: MessageBus, destination: str, path: str = "/", *, timeout: float = DEFAULT_TIMEOUT
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """``{object_path: {interface: {property: value}}}`` with all Variants unwrapped."""
-    body = await call(bus, destination, path, OBJECT_MANAGER, "GetManagedObjects")
+    body = await call(bus, destination, path, OBJECT_MANAGER, "GetManagedObjects", timeout=timeout)
     return unwrap(body[0])
+
+
+async def get_name_owner(bus: MessageBus, name: str, *, timeout: float = DEFAULT_TIMEOUT) -> str | None:
+    """Unique name of the connection that owns ``name``, or None if nobody does."""
+    try:
+        body = await call(bus, DBUS_NAME, DBUS_PATH, DBUS_NAME, "GetNameOwner", "s", [name], timeout=timeout)
+    except DBusError as exc:
+        if exc.type == "org.freedesktop.DBus.Error.NameHasNoOwner":
+            return None
+        raise
+    return str(body[0])
 
 
 async def add_match(bus: MessageBus, rule: str) -> None:
