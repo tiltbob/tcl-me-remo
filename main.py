@@ -45,6 +45,8 @@ TIMEOUTS = {
 DEFAULT_TIMEOUT = 15.0
 # Seconds after an uninstall hook before checking whether the plugin is really gone.
 ORPHAN_CHECK_DELAY = 180
+# Where the installer puts the service's code (first choice, then its fallback).
+INSTALLED_MODULES = ("/opt/tcl-me-remo/py_modules", "/var/lib/tcl-me-remo/app/py_modules")
 
 
 def _clean_env():
@@ -120,9 +122,13 @@ def _failure(code, message):
 
 
 class Plugin:
-    async def _main(self):
+    def __init__(self):
+        # Set here, not in _main: the panel can call in before _main has run.
         self._install_lock = asyncio.Lock()
         self._install_error = ""
+        self._startup = None
+
+    async def _main(self):
         decky.logger.info("tcl-me-remo plugin loaded from %s", PLUGIN_DIR)
         # Do not hold up the loader: install or update the service in the background.
         self._startup = asyncio.ensure_future(self._ensure_service())
@@ -132,11 +138,14 @@ class Plugin:
         decky.logger.info("tcl-me-remo plugin unloaded (the service keeps running)")
 
     async def _uninstall(self):
-        # Decky calls this for updates as well as removals, and kills us a few seconds later.
-        # So nothing is removed here: a timer checks later whether the plugin is really gone
-        # and only then removes the service.  Settings and the TV pairing are kept either way.
-        state = await _installer("status", timeout=4.0)
-        modules = os.path.join(state.get("install_dir") or "/opt/tcl-me-remo", "py_modules")
+        # Decky calls this for updates as well as removals, and kills us 5 seconds after asking
+        # us to stop.  So nothing is removed here: a timer checks later whether the plugin is
+        # really gone and only then removes the service.  Settings and the TV pairing are kept
+        # either way.
+        modules = next(
+            (path for path in INSTALLED_MODULES if os.path.isdir(os.path.join(path, "tcl_me_remo"))),
+            INSTALLED_MODULES[0],
+        )
         argv = [
             "systemd-run",
             f"--on-active={ORPHAN_CHECK_DELAY}",
@@ -146,7 +155,7 @@ class Plugin:
             SYSTEM_PYTHON, "-I", "-c", INSTALLER_SNIPPET, modules,
             "uninstall-if-orphaned", PLUGIN_DIR,
         ]  # fmt: skip
-        code, _out, err = await _run(argv, 4.0)
+        code, _out, err = await _run(argv, 3.0)
         if code != 0:
             decky.logger.warning("could not schedule the clean-up check: %s", err.strip())
 

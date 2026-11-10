@@ -81,9 +81,7 @@ async def test_rpc_timeout(backend, tmp_path, monkeypatch):
 
 
 async def test_service_info_runs_the_bundled_installer_with_the_system_python(backend):
-    plugin = backend.Plugin()
-    await plugin._main()
-    plugin._startup.cancel()
+    plugin = backend.Plugin()  # the panel may call before _main has run
     state = await plugin.service_info()
     assert state["installed"] is False and state["bundled_version"]
     assert set(state) >= {"installed", "active", "enabled", "installed_version", "needs_update", "problems"}
@@ -114,13 +112,10 @@ async def test_uninstall_hook_only_schedules_a_check(backend, monkeypatch):
 
     async def fake_run(argv, timeout):
         commands.append(argv)
+        assert timeout <= 3.0  # Decky kills the plugin 5 s after asking it to stop
         return 0, "", ""
 
-    async def fake_installer(*args, timeout=120.0):
-        return {"install_dir": "/opt/tcl-me-remo"}
-
     monkeypatch.setattr(backend, "_run", fake_run)
-    monkeypatch.setattr(backend, "_installer", fake_installer)
     plugin = backend.Plugin()
     await plugin._uninstall()
     (argv,) = commands
