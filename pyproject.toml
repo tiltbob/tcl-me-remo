@@ -1,0 +1,24 @@
+[project]
+name = "tcl-me-remo"
+version = "0.1.0"
+description = "Let a SteamOS machine drive a TCL Google TV as a Bluetooth remote"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["py_modules"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["py_modules/tcl_me_remo/_vendor", "node_modules", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = ["UP035", "UP006", "UP007"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tcl_me_remo"]
