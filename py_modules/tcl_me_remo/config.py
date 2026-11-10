@@ -151,7 +151,7 @@ class BluetoothConfig:
         metadata=_meta(min=0, max=10000, help="Pause after the TV connects before the first key is sent."),
     )
     resubscribe_wait: float = field(
-        default=4.0,
+        default=6.0,
         metadata=_meta(
             min=0,
             max=30,
