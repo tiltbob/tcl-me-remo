@@ -21,6 +21,10 @@ async def h(private_bus, tmp_path, monkeypatch):
     async with fake_bluez.harness(tmp_path, monkeypatch) as harness:
         yield harness
 
+#: What a loaded machine may add to any step.  Upper bounds on elapsed time allow this much, and
+#: each test that has one makes the wrong behaviour take clearly longer than that.
+SLOW = 2.0
+
 
 async def parted(h, **overrides):
     """A paired TV whose link has been closed again: the usual state between uses."""
@@ -40,7 +44,7 @@ async def test_happy_path_advertises_until_the_tv_connects_then_settles(h):
     started = time.monotonic()
     assert await remote.ensure_ready(5.0) is True
     elapsed = time.monotonic() - started
-    assert 0.05 + 0.15 <= elapsed < 1.0  # connect delay + settle: the link alone is not readiness
+    assert 0.05 + 0.15 <= elapsed < 0.2 + SLOW  # connect delay + settle: the link alone is not readiness
 
     state = remote.state
     assert state.connected and state.ready and state.delivery == "bluez" and state.error == ""
@@ -79,7 +83,7 @@ async def test_timeout_returns_false_and_stops_advertising(h):
     tv.auto_connect = False  # the TV is off / out of range
     started = time.monotonic()
     assert await remote.ensure_ready(0.3) is False
-    assert 0.3 <= time.monotonic() - started < 1.0
+    assert 0.3 <= time.monotonic() - started < 0.3 + SLOW
     assert h.bluez.event_names() == ["advert_registered", "advert_unregistered"]
     assert h.bluez.advert is None and not remote.state.advertising
     assert remote.state.error == "the TV did not connect over Bluetooth"
@@ -173,11 +177,11 @@ async def test_concurrent_callers_share_a_failure_and_respect_their_own_deadline
 
     remote, tv = await parted(h)
     tv.auto_connect = False
-    slow = asyncio.ensure_future(remote.ensure_ready(0.6))
+    slow = asyncio.ensure_future(remote.ensure_ready(0.1 + SLOW + 1.0))
     await eventually(lambda: h.bluez.advert is not None)
     started = time.monotonic()
     assert await remote.ensure_ready(0.1) is False  # waits its own 0.1 s for the first caller, no longer
-    assert time.monotonic() - started < 0.4
+    assert time.monotonic() - started < 0.1 + SLOW and not slow.done()
     assert await slow is False
 
 
@@ -229,8 +233,8 @@ async def test_tv_connecting_while_the_advertisement_is_being_registered_is_noti
     remote, tv = await parted(h)
     tv.connect_delay = 0.0  # an awake TV answers the first advertising event
     started = time.monotonic()
-    assert await remote.ensure_ready(3.0) is True
-    assert time.monotonic() - started < 0.5  # connect + settle (0.04 s), not the whole budget
+    assert await remote.ensure_ready(10.0) is True
+    assert time.monotonic() - started < 0.04 + SLOW  # connect + settle (0.04 s), not the whole budget
     assert remote.state.ready and h.bluez.advert is None
 
 
@@ -246,24 +250,24 @@ async def test_tv_connecting_while_the_wake_beacon_is_being_registered_is_notice
 
     monkeypatch.setattr(fake_bluez.FakeBluez, "_register_advertisement", register)
     started = time.monotonic()
-    assert await remote.ensure_ready(3.0, wake=True) is True
-    assert time.monotonic() - started < 0.5
+    assert await remote.ensure_ready(10.0, wake=True) is True
+    assert time.monotonic() - started < 0.1 + SLOW
     await eventually(lambda: h.bluez.advert is None and h.bluez.beacon is None)
 
 
 async def test_tv_connecting_during_the_pause_after_a_release_is_noticed(h, monkeypatch):
     """After Release() we stay off air for a moment; the TV may have answered the last event."""
-    monkeypatch.setattr(remote_module, "ADVERT_RETRY", 1.0)
+    monkeypatch.setattr(remote_module, "ADVERT_RETRY", 8.0)
     remote, tv = await parted(h)
     tv.auto_connect = False
-    task = asyncio.ensure_future(remote.ensure_ready(3.0))
+    task = asyncio.ensure_future(remote.ensure_ready(10.0))
     await eventually(lambda: h.bluez.advert is not None)
     await h.bluez.release_advertisement()
     await asyncio.sleep(0.02)
     started = time.monotonic()
     await tv.connect()
     assert await task is True
-    assert time.monotonic() - started < 0.5  # not the rest of the pause, let alone of the budget
+    assert time.monotonic() - started < SLOW  # not the rest of the pause, let alone of the budget
 
 
 async def test_disconnect_calls_off_an_ensure_ready_that_is_talking_to_bluetoothd(h):
@@ -271,11 +275,11 @@ async def test_disconnect_calls_off_an_ensure_ready_that_is_talking_to_bluetooth
     tv.auto_connect = False
     h.bluez.advert_register_delay = 0.1
     started = time.monotonic()
-    waiting = asyncio.ensure_future(remote.ensure_ready(3.0))
+    waiting = asyncio.ensure_future(remote.ensure_ready(10.0))
     await asyncio.sleep(0.03)  # RegisterAdvertisement is in flight
     await remote.disconnect()
     assert await waiting is False
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 0.1 + SLOW
     assert h.bluez.advert is None and not remote.state.advertising
 
 
@@ -286,27 +290,29 @@ async def test_a_slow_bluetoothd_does_not_stretch_the_budget(h):
     """Near suspend the service has about three seconds; a busy bluetoothd must not add its own."""
     remote, tv = await parted(h)
     tv.auto_connect = False
-    h.bluez.advert_register_delay = 0.8
+    h.bluez.advert_register_delay = 3.0
     started = time.monotonic()
     assert await remote.ensure_ready(0.3) is False
-    assert 0.3 <= time.monotonic() - started < 0.3 + remote_module.CLEANUP_GRACE + 0.2
+    assert 0.3 <= time.monotonic() - started < 0.3 + remote_module.CLEANUP_GRACE + SLOW
     assert not remote.state.advertising and "too slow" in remote.state.error
     # The request that was under way is taken back: nothing goes on air behind our back.
-    await asyncio.sleep(0.8)
+    await asyncio.sleep(max(0.0, 3.3 - (time.monotonic() - started)))  # bluetoothd has answered by now
+    await eventually(lambda: h.bluez.advert is None and not remote._tasks and remote._ensure_active == 0)
+    await asyncio.sleep(0.2)
     assert h.bluez.advert is None and not remote._tasks and remote._ensure_active == 0
 
 
 async def test_the_pause_after_a_refused_advertisement_counts_against_the_budget(h, monkeypatch):
-    monkeypatch.setattr(remote_module, "ADVERT_RETRY", 1.0)
+    monkeypatch.setattr(remote_module, "ADVERT_RETRY", 8.0)
     remote, tv = await parted(h)
     tv.auto_connect = False
     h.bluez.max_adverts = 0
     with pytest.raises(TransportError):
-        await remote.ensure_ready(1.0)  # refused: a one second pause begins
+        await remote.ensure_ready(1.0)  # refused: a pause of eight seconds begins
     h.bluez.max_adverts = 5
     started = time.monotonic()
     assert await remote.ensure_ready(0.2) is False
-    assert 0.2 <= time.monotonic() - started < 0.5
+    assert 0.2 <= time.monotonic() - started < 0.2 + SLOW
     assert "advert_registered" not in h.bluez.event_names()
 
 
@@ -314,12 +320,12 @@ async def test_switching_the_adapter_on_counts_against_the_budget(h):
     remote, tv = await parted(h, power_on_adapter=True)
     h.bluez.set_powered(False)
     await eventually(lambda: not remote.state.powered)
-    h.bluez.power_on_delay = 1.0  # bluetoothd answers Powered=true only after a second
+    h.bluez.power_on_delay = 4.0  # bluetoothd answers Powered=true only after seconds
     started = time.monotonic()
     with pytest.raises(TransportError) as err:
         await remote.ensure_ready(0.2)
     assert err.value.code == "bluetooth_off" and "could not be turned on" in err.value.message
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 0.2 + SLOW
 
 
 async def test_too_little_time_to_be_answered_does_not_go_on_air(h):
@@ -338,15 +344,15 @@ async def test_stopping_the_advertisement_gives_up_waiting_but_not_the_request(h
 
     async def slow(self, msg, after):
         if msg.member == "UnregisterAdvertisement":
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(3.0)
         return await real(self, msg, after)
 
     monkeypatch.setattr(fake_bluez.FakeBluez, "_call", slow)
     started = time.monotonic()
     assert await waiting is False
-    assert time.monotonic() - started < 0.15 + remote_module.CLEANUP_GRACE + 0.2
+    assert time.monotonic() - started < 0.15 + remote_module.CLEANUP_GRACE + SLOW
     assert not remote.state.advertising
-    await eventually(lambda: h.bluez.advert is None, what="the unregistration to arrive")
+    await eventually(lambda: h.bluez.advert is None, timeout=8.0, what="the unregistration to arrive")
     await eventually(lambda: not remote._tasks and remote._ensure_active == 0)
 
 
@@ -757,7 +763,7 @@ async def test_no_adapter_at_all_then_one_is_plugged_in(no_adapters):
     with pytest.raises(TransportError) as err:
         await remote.ensure_ready(5.0)
     assert err.value.code == "no_adapter" and err.value.message == "no Bluetooth adapter was found"
-    assert time.monotonic() - started < 1.0
+    assert time.monotonic() - started < 5.0 - SLOW  # not the whole budget
     with pytest.raises(TransportError) as err:
         await remote.start_pairing(30)
     assert err.value.code == "no_adapter"

@@ -25,6 +25,10 @@ async def h(private_bus, tmp_path, monkeypatch):
     async with fake_bluez.harness(tmp_path, monkeypatch) as harness:
         yield harness
 
+#: What a loaded machine may add to any step.  Upper bounds on elapsed time allow this much, and
+#: each test that has one makes the wrong behaviour take clearly longer than that.
+SLOW = 2.0
+
 
 async def rebooted(h, *, android=12, **overrides):
     """A TV paired in an earlier bluetoothd life; bluetoothd has restarted since (a reboot)."""
@@ -84,7 +88,7 @@ async def test_ensure_ready_while_bluetoothd_is_down(h, monkeypatch):
     with pytest.raises(TransportError) as err:
         await remote.ensure_ready(5.0)
     assert err.value.code == "no_adapter" and "bluetoothd" in err.value.message
-    assert 0.2 <= time.monotonic() - started < 1.0  # waited the grace period, not the whole budget
+    assert 0.2 <= time.monotonic() - started < 0.2 + SLOW  # waited the grace period, not the whole budget
 
     # If it comes back within the grace period the caller never notices.
     monkeypatch.setattr(fake_bluez.remote_module, "ADAPTER_GRACE", 3.0)
@@ -130,11 +134,11 @@ async def test_adapter_removed_and_added_back(h):
 
 
 async def test_android_14_resubscribes_and_bluez_delivers(h):
-    remote, tv = await rebooted(h, android=14)
+    remote, tv = await rebooted(h, android=14, resubscribe_wait=6.0)
     tv.resubscribe_delay = 0.1
     started = time.monotonic()
-    assert await remote.ensure_ready(5.0) is True
-    assert time.monotonic() - started < 0.3 + 0.2  # did not sit out the whole resubscribe_wait
+    assert await remote.ensure_ready(10.0) is True
+    assert time.monotonic() - started < 0.1 + SLOW  # did not sit out the whole resubscribe_wait
     assert remote.state.delivery == "bluez" and remote.state.subscribed
     assert remote.bounces == 0 and tv.connections == 2  # pairing link + this one
 
@@ -197,9 +201,13 @@ async def test_android_12_gets_one_bounce_then_direct_delivery(h, caplog):
     assert h.raw.filters == [rawhci.command_complete_filter(rawhci.OPCODE_LE_READ_BUFFER_SIZE)]
 
     # Next use in the same bluetoothd lifetime: no second bounce, and hardly any waiting.
+    # "Hardly any waiting" is checked on the wait the transport will use, not with a stopwatch
+    # around the whole reconnect: the full resubscribe_wait here is 0.3 s, and a busy machine
+    # needs longer than that just to get the fake TV connected again.
+    assert remote._resubscribe_wait() < 0.3  # the remembered hint shortens it
     started = time.monotonic()
     assert await remote.ensure_ready(5.0) is True
-    assert time.monotonic() - started < 0.3  # not the full resubscribe_wait again
+    assert time.monotonic() - started < 0.5 + SLOW  # nowhere near the 5 s budget
     assert remote.bounces == 1 and remote.state.delivery == "raw" and tv.connections == 4
     await remote.send_key("HOME", 0.01)
     assert len(tv.keys("raw")) == 8 and tv.ignored == []
@@ -262,10 +270,11 @@ async def test_background_policy_prepares_direct_delivery_ahead_of_time(h):
     await asyncio.sleep(0.15)
     assert remote.bounces == 1 and tv.connections == 3  # once is enough
 
-    # The few seconds before suspend are now plenty.
+    # The few seconds before suspend are now plenty: nothing is left to do but settle.
     started = time.monotonic()
-    assert await remote.ensure_ready(0.2) is True
-    assert time.monotonic() - started < 0.1 and remote.state.delivery == "raw"
+    assert await remote.ensure_ready(3.0) is True
+    assert time.monotonic() - started < SLOW and remote.state.delivery == "raw"
+    assert remote.bounces == 1 and tv.connections == 3  # no new connection was needed
     await remote.send_key("SLEEP", 0.01)
     assert tv.keys("raw") == [(CONSUMER, bytes.fromhex("32000000")), (CONSUMER, bytes(4))] and tv.ignored == []
 
@@ -275,12 +284,14 @@ async def test_background_policy_leaves_a_subscribing_tv_alone(h):
     await eventually(lambda: remote.state.connected and remote.state.subscribed)
     await asyncio.sleep(0.5)  # longer than resubscribe_wait
     assert remote.bounces == 0 and tv.connections == 2
-    assert await remote.ensure_ready(0.2) is True and remote.state.delivery == "bluez"
+    assert await remote.ensure_ready(3.0) is True and remote.state.delivery == "bluez"
 
 
 async def test_budget_shorter_than_the_waits_returns_false_without_bouncing(h):
-    remote, tv = await rebooted(h, android=12)
-    assert await remote.ensure_ready(0.15) is False  # resubscribe_wait is 0.3
+    # A wait far longer than the budget, and a budget far longer than connecting takes, so that
+    # neither a slow machine nor a fast one changes which of the two runs out.
+    remote, tv = await rebooted(h, android=12, resubscribe_wait=4.0)
+    assert await remote.ensure_ready(1.0) is False
     assert remote.bounces == 0 and tv.connected and not remote.state.ready
     assert remote.state.error == "the TV connected but was not ready for keys in time"
     assert h.bluez.advert is None
