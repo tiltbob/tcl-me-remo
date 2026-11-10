@@ -21,6 +21,8 @@ from dbus_fast import BusType, DBusError, Message, MessageFlag, MessageType, Pro
 from dbus_fast.aio import MessageBus  # noqa: E402
 from dbus_fast.service import ServiceInterface, dbus_property, method, signal  # noqa: E402
 
+from . import aio  # noqa: E402
+
 __all__ = [
     "BusType",
     "DBusError",
@@ -114,7 +116,7 @@ def unwrap(value: Any) -> Any:
 
 async def call_message(bus: MessageBus, message: Message, *, timeout: float = DEFAULT_TIMEOUT) -> Message:
     """Send a method call and return the reply message, raising ``DBusError`` on an error reply."""
-    reply = await asyncio.wait_for(bus.call(message), timeout)
+    reply = await aio.wait_for(bus.call(message), timeout)  # not asyncio.wait_for: see aio.wait_for
     if reply is None:  # only for calls flagged "no reply expected"
         raise DBusError("org.freedesktop.DBus.Error.NoReply", "no reply")
     if reply.message_type == MessageType.ERROR:

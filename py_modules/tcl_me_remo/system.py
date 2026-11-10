@@ -9,6 +9,8 @@ import socket
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from . import aio
+
 log = logging.getLogger(__name__)
 
 # systemd targets whose pending start job tells a reboot from a power-off.
@@ -51,7 +53,7 @@ async def run_command(argv: list[str], timeout: float) -> tuple[int, str]:
         log.debug("could not run %s: %s", argv[0], exc)
         return -1, ""
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        stdout, _ = await aio.wait_for(proc.communicate(), timeout)
     except TimeoutError:
         proc.kill()
         await proc.wait()
