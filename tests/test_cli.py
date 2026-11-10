@@ -15,7 +15,11 @@ async def running(tmp_path):
     """A real Service behind a real control socket, driven through the CLI's sync client."""
     cfg = C.apply_patch(
         C.default_config(),
-        {"input": {"macro": "HOME DOWN*{port} OK", "delay_after_wake": 0.0}, "display": {"require_external": "no"}},
+        {
+            "input": {"method": "macro", "preset": "custom", "macro": "HOME DOWN*{port} OK", "delay_after_wake": 0.0},
+            "display": {"require_external": "no"},
+            "power": {"on_repeat": 2, "repeat_gap": 0.1},
+        },
     )
     remote, wifi = FakeRemote(), FakeWifi(paired=False)
     service = Service(cfg, remote=remote, wifi=wifi, sys_root=tmp_path, recent_logs=lambda n: ["a", "b", "c"][-n:])

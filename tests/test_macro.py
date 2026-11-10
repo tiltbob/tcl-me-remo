@@ -88,6 +88,16 @@ async def test_run_plays_steps_in_order_with_gaps():
     ]
 
 
+def test_builtin_presets():
+    assert list(macro.PRESETS) == ["tcl-row", "tcl-row-home", "tcl-row-first", "tcl-column"]
+    assert macro.render(macro.PRESETS["tcl-row"].template, 2) == "F3 1.5s LEFT*8 RIGHT*2 OK"
+    # HDMI 1 listed first: no step to the right at all for port 1
+    steps = macro.parse(macro.render(macro.PRESETS["tcl-row-first"].template, 1))
+    assert [s.key for s in steps if s.key] == ["F3", "LEFT", "OK"]
+    for preset in macro.PRESETS.values():
+        assert preset.title and preset.description
+
+
 def test_presets_are_valid_for_all_ports():
     for preset in macro.PRESETS.values():
         for port in (1, 2, 3, 4):

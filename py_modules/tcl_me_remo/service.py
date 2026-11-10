@@ -26,7 +26,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import __version__, display, keys, macro
+from . import __version__, display, keys, macro, tvdata
 from . import config as config_mod
 from .config import Config, ConfigError
 from .interfaces import (
@@ -80,6 +80,14 @@ def effective_macro(cfg: Config) -> str:
     preset = macro.PRESETS.get(cfg.input.preset)
     template = preset.template if preset is not None else cfg.input.macro
     return macro.render(template, cfg.input.hdmi_port)
+
+
+def wifi_input_link(cfg: Config) -> str:
+    """The app link the Wi-Fi assist opens to show the configured HDMI input ("" if none)."""
+    preset = tvdata.LINK_PRESETS.get(cfg.wifi.link_preset)
+    if preset is not None:
+        return preset.links.get(cfg.input.hdmi_port, "")
+    return cfg.wifi.app_link.replace("{port}", str(cfg.input.hdmi_port)).strip()
 
 
 class Service:
@@ -278,6 +286,8 @@ class Service:
         cfg = self.cfg
         key = cfg.power.on_key if on else cfg.power.off_key
         repeat = cfg.power.on_repeat if on else cfg.power.off_repeat
+        if keys.resolve(key).spec == "POWER":
+            repeat = 1  # a toggle sent twice undoes itself, and TCL shows a shutdown dialog
         if not await self._ble_ready(trace, connect_timeout):
             raise RpcError("tv_unreachable", f"the TV did not connect within {connect_timeout:g}s")
         for index in range(repeat):
@@ -375,7 +385,7 @@ class Service:
         if not self.wifi.status().get("paired"):
             raise TransportError("wifi_not_paired", "the Wi-Fi assist is not paired with the TV")
         if cfg.wifi.input_mode == "app_link":
-            link = cfg.wifi.app_link.replace("{port}", str(cfg.input.hdmi_port)).strip()
+            link = wifi_input_link(cfg)
             if not link:
                 raise RpcError("not_configured", "no app link is set for Wi-Fi input switching")
             what = f"opened {link}"
@@ -622,6 +632,7 @@ class Service:
             "input": {
                 "method": cfg.input.method,
                 "hdmi_port": cfg.input.hdmi_port,
+                "wifi_link": wifi_input_link(cfg) if cfg.wifi.input_mode == "app_link" else "",
                 "macro": text,
                 "macro_error": macro_error,
                 "macro_seconds": round(macro_seconds, 1),
@@ -652,6 +663,7 @@ class Service:
                 for p in macro.PRESETS.values()
             ],
             "keys": keys.catalog(),
+            "link_presets": tvdata.link_preset_catalog(),
         }
 
     async def _rpc_set_config(self, params: dict[str, Any]) -> Any:

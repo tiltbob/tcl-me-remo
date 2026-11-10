@@ -58,7 +58,8 @@ export interface WifiConfig {
   enabled: boolean;
   host: string;
   name: string;
-  input_mode: "keycode" | "app_link";
+  input_mode: "app_link" | "keycode";
+  link_preset: string;
   app_link: string;
   power_fallback: boolean;
   connect_timeout: number;
@@ -104,11 +105,20 @@ export interface KeyInfo {
   android: string;
 }
 
+export interface LinkPreset {
+  name: string;
+  title: string;
+  description: string;
+  /** HDMI port number (as a string key) to app link. */
+  links: Record<string, string>;
+}
+
 export interface ConfigBundle {
   config: Config;
   schema: Record<string, unknown>;
   presets: Preset[];
   keys: KeyInfo[];
+  link_presets: LinkPreset[];
 }
 
 export interface BluetoothState {
@@ -161,6 +171,7 @@ export interface DisplayStatus {
 export interface InputStatus {
   method: InputConfig["method"];
   hdmi_port: number;
+  wifi_link: string;
   macro: string;
   macro_error: string;
   macro_seconds: number;

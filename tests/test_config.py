@@ -13,6 +13,8 @@ def test_defaults_round_trip():
     assert cfg.events.boot_tv_on and cfg.events.suspend_tv_off
     assert cfg.events.reboot_tv_off is False
     assert cfg.wifi.enabled is False  # Wi-Fi assist is strictly opt-in
+    assert cfg.input.method == "none"  # no navigation keys until the user has tested a macro
+    assert cfg.power.on_key == "WAKE" and cfg.power.off_key == "SLEEP" and cfg.power.on_repeat == 1
 
 
 def test_apply_patch_merges_and_validates():
@@ -34,6 +36,7 @@ def test_apply_patch_merges_and_validates():
         ({"input": {"macro": "DOWN*999"}}, "input.macro"),
         ({"input": {"macro": "NOT_A_KEY"}}, "input.macro"),
         ({"input": {"preset": "nope"}}, "input.preset"),
+        ({"wifi": {"link_preset": "nope"}}, "wifi.link_preset"),
         ({"power": {"on_key": "BANANA"}}, "power.on_key"),
         ({"bluetooth": {"tv_address": "nonsense"}}, "bluetooth.tv_address"),
         ({"bluetooth": {"adapter": "wlan0"}}, "bluetooth.adapter"),
@@ -112,4 +115,5 @@ def test_describe_lists_every_leaf_with_help():
     assert desc["input"]["hdmi_port"]["min"] == 1
     assert desc["input"]["hdmi_port"]["max"] == 4
     assert desc["input"]["method"]["choices"] == ("macro", "wifi", "none")
+    assert desc["input"]["method"]["default"] == "none"
     json.dumps(desc)  # must be serialisable for the control channel

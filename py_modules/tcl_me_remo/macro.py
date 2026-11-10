@@ -208,3 +208,42 @@ async def run(
         for _ in range(step.repeat):
             await send_key(step.key, step.hold or key_press)
             await sleep(key_gap)
+
+
+# --------------------------------------------------------------------------- built-in presets
+#
+# TCL's source list does not wrap around, so every preset first runs to one end of the list
+# (more presses than the list can have entries) and then counts back to the wanted input.
+# F3 is reported to open the source list on a TCL QM8; which key does so on a given
+# firmware has to be confirmed by watching the TV.
+
+for _preset in (
+    Preset(
+        name="tcl-row",
+        title="TCL source row (2023 and newer)",
+        description="F3 opens the source list, Left to the far end, Right once per HDMI number, OK. "
+        "Assumes one entry (TV) sits before HDMI 1.",
+        template="F3 1.5s LEFT*8 RIGHT*{port} OK",
+    ),
+    Preset(
+        name="tcl-row-home",
+        title="TCL source row, from the home screen",
+        description="Same as the source row, but presses Home first. If the list does not open you end up "
+        "on the home screen rather than in whatever was showing.",
+        template="HOME 2s F3 1.5s LEFT*8 RIGHT*{port} OK",
+    ),
+    Preset(
+        name="tcl-row-first",
+        title="TCL source row, HDMI 1 listed first",
+        description="For lists that start with HDMI 1 (no TV entry before it).",
+        template="F3 1.5s LEFT*8 RIGHT*{port-1} OK",
+    ),
+    Preset(
+        name="tcl-column",
+        title="TCL source column (2022 firmware)",
+        description="For the older vertical source list: F3, Up to the top, Down once per HDMI number, OK.",
+        template="F3 1.5s UP*8 DOWN*{port} OK",
+    ),
+):
+    register_preset(_preset)
+del _preset

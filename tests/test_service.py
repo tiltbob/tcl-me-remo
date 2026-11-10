@@ -35,9 +35,12 @@ def make_sysfs(tmp_path, connectors):
 
 class Harness:
     def __init__(self, tmp_path, *, patch=None, remote=None, wifi=None, connectors=None):
+        # Explicit values so these tests do not depend on the shipped defaults.
         base = {
-            "input": {"macro": "HOME DOWN*{port} OK", "delay_after_wake": 2.0},
+            "input": {"method": "macro", "preset": "custom", "macro": "HOME DOWN*{port} OK", "delay_after_wake": 2.0},
             "display": {"wait_seconds": 0.0},
+            "power": {"on_repeat": 2, "repeat_gap": 0.8},
+            "wifi": {"input_mode": "keycode"},
         }
         cfg = C.apply_patch(C.default_config(), base)
         if patch:
@@ -403,11 +406,36 @@ async def test_wifi_input_switch_app_link(tmp_path):
     wifi = FakeWifi()
     patch = {
         "input": {"method": "wifi", "hdmi_port": 2},
-        "wifi": {"enabled": True, "host": "tv.lan", "input_mode": "app_link", "app_link": "tv://input/HDMI{port}"},
+        "wifi": {
+            "enabled": True,
+            "host": "tv.lan",
+            "input_mode": "app_link",
+            "link_preset": "custom",
+            "app_link": "tv://input/HDMI{port}",
+        },
     }
     h = Harness(tmp_path, wifi=wifi, patch=patch)
     assert (await h.service.switch_input())["ok"]
     assert wifi.links == [("tv.lan", "tv://input/HDMI2")]
+    assert h.service.status()["input"]["wifi_link"] == "tv://input/HDMI2"
+
+    # built-in TV tables: the ids are not a simple function of the port number
+    h.service.set_config({"wifi": {"link_preset": "tcl-realtek"}, "input": {"hdmi_port": 4}})
+    assert (await h.service.switch_input())["ok"]
+    assert wifi.links[-1] == (
+        "tv.lan",
+        "content://android.media.tv/passthrough/com.tcl.tvinput%2F.passthroughinput.TvPassThroughService%2FHW1413745664",
+    )
+    h.service.set_config({"wifi": {"link_preset": "tcl-mediatek"}, "input": {"hdmi_port": 1}})
+    assert (await h.service.switch_input())["ok"]
+    assert wifi.links[-1][1].endswith("com.tcl.tvinput%2F.TvPassThroughService%2FHW15")
+
+    # a custom preset with nothing entered is a configuration problem, not a crash
+    h.service.set_config(
+        {"wifi": {"link_preset": "custom", "app_link": ""}, "input": {"wifi_fallback_to_macro": False}}
+    )
+    record = await h.service.switch_input()
+    assert not record["ok"] and "no app link" in record["detail"]
 
 
 async def test_wifi_failure_falls_back_to_macro(tmp_path):
@@ -438,6 +466,24 @@ async def test_macro_method_without_macro_explains(tmp_path):
     h = Harness(tmp_path, patch={"input": {"macro": ""}})
     record = await h.service.switch_input()
     assert not record["ok"] and "no input macro" in record["detail"]
+
+
+async def test_shipped_defaults_do_not_press_navigation_keys(tmp_path):
+    # Out of the box only the discrete power keys are sent: an untested input macro could
+    # wander around the TV's UI on every boot.
+    remote = FakeRemote()
+    service = Service(C.default_config(), remote=remote, sys_root=make_sysfs(tmp_path, {"card0-HDMI-A-1": "connected"}))
+    record = await service.handle_event("boot")
+    assert record["ok"] and record["detail"] == "TV on (Bluetooth)"
+    assert remote.key_names() == ["WAKE"]  # exactly one press
+    down = await service.handle_event("suspend")
+    assert down["ok"] and remote.key_names() == ["WAKE", "SLEEP"]
+
+
+async def test_power_toggle_is_never_repeated(tmp_path):
+    h = Harness(tmp_path, patch={"power": {"on_key": "POWER", "on_repeat": 3}, "input": {"method": "none"}})
+    assert (await h.service.tv_on())["ok"]
+    assert h.remote.key_names() == ["POWER"]
 
 
 async def test_input_method_none(tmp_path):
@@ -518,6 +564,8 @@ async def test_rpc_surface(tmp_path):
     json.dumps(info)
     assert info["config"]["input"]["hdmi_port"] == 1
     assert {"name": "WAKE", "label": "Wake (discrete on)"}.items() <= info["keys"][0].items()
+    assert [p["name"] for p in info["presets"]][:2] == ["tcl-row", "tcl-row-home"]
+    assert info["link_presets"][0]["links"]["2"].endswith("%2FHW16")
 
     result = await rpc("set_config", {"patch": {"input": {"hdmi_port": 4}}})
     assert result["config"]["input"]["hdmi_port"] == 4

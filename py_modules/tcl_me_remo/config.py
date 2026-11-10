@@ -96,16 +96,19 @@ class DisplayConfig:
 class PowerConfig:
     on_key: str = field(default="WAKE", metadata=_meta(check="key", help="Key sent to turn the TV on."))
     off_key: str = field(default="SLEEP", metadata=_meta(check="key", help="Key sent to turn the TV off."))
-    on_repeat: int = field(default=2, metadata=_meta(min=1, max=5, help="How many times to send the on key."))
+    on_repeat: int = field(default=1, metadata=_meta(min=1, max=5, help="How many times to send the on key."))
     off_repeat: int = field(default=1, metadata=_meta(min=1, max=5, help="How many times to send the off key."))
-    repeat_gap: float = field(default=0.8, metadata=_meta(min=0.1, max=10, help="Seconds between repeats."))
+    repeat_gap: float = field(default=3.0, metadata=_meta(min=0.1, max=10, help="Seconds between repeats."))
 
 
 @dataclass
 class InputConfig:
     method: str = field(
-        default="macro",
-        metadata=_meta(choices=("macro", "wifi", "none"), help="How the TV input is switched."),
+        default="none",
+        metadata=_meta(
+            choices=("macro", "wifi", "none"),
+            help="How the TV input is switched. Starts as 'none': try a macro from the UI first.",
+        ),
     )
     hdmi_port: int = field(default=1, metadata=_meta(min=1, max=4, help="HDMI port the SteamOS machine is on."))
     delay_after_wake: float = field(
@@ -113,7 +116,7 @@ class InputConfig:
         metadata=_meta(min=0, max=60, help="Seconds to wait after the on key before switching input."),
     )
     preset: str = field(
-        default="custom",
+        default="tcl-row",
         metadata=_meta(check="preset", help="Name of a built-in macro preset, or 'custom' to use 'macro'."),
     )
     macro: str = field(
@@ -166,8 +169,11 @@ class BluetoothConfig:
         ),
     )
     reconnect_on_drop: bool = field(
-        default=False,
-        metadata=_meta(help="Call the TV again whenever it drops the link (may wake some TVs)."),
+        default=True,
+        metadata=_meta(
+            help="Keep calling the TV whenever it is not connected, so the link is up when it is needed. "
+            "Turn off if the TV wakes up by itself."
+        ),
     )
     idle_disconnect_seconds: float = field(
         default=0.0,
@@ -202,10 +208,20 @@ class WifiConfig:
     host: str = field(default="", metadata=_meta(maxlen=253, check="host", help="IP address or hostname of the TV."))
     name: str = field(default="", metadata=_meta(maxlen=64, help="Friendly name of the TV."))
     input_mode: str = field(
-        default="keycode",
-        metadata=_meta(choices=("keycode", "app_link"), help="Send an HDMI key code, or launch an app link."),
+        default="app_link",
+        metadata=_meta(
+            choices=("app_link", "keycode"),
+            help="app_link opens the TV-input link (works on TCL); keycode sends the HDMI key (ignored by TCL).",
+        ),
     )
-    app_link: str = field(default="", metadata=_meta(maxlen=512, help="App link / URI used when input_mode=app_link."))
+    link_preset: str = field(
+        default="tcl-mediatek",
+        metadata=_meta(check="link_preset", help="Which built-in set of TV-input links to use, or 'custom'."),
+    )
+    app_link: str = field(
+        default="",
+        metadata=_meta(maxlen=512, help="Custom app link when link_preset is 'custom'; {port} is the HDMI number."),
+    )
     power_fallback: bool = field(
         default=True,
         metadata=_meta(help="Use Wi-Fi for power on/off when the Bluetooth link is not available."),
@@ -276,6 +292,13 @@ def _check_special(kind: str, path: str, value: Any) -> Any:
             return macro.validate(str(value))
         except macro.MacroError as exc:
             raise ConfigError(path, str(exc)) from None
+    if kind == "link_preset":
+        from . import tvdata
+
+        if value != "custom" and value not in tvdata.LINK_PRESETS:
+            names = ", ".join(["custom", *tvdata.LINK_PRESETS])
+            raise ConfigError(path, f"unknown link preset {value!r} (choose one of: {names})")
+        return value
     if kind == "preset":
         from . import macro
 

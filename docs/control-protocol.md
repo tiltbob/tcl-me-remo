@@ -26,7 +26,7 @@ echo '{"id":1,"method":"status"}' | sudo socat - UNIX-CONNECT:/run/tcl-me-remo/c
 | Method | Params | Result |
 |---|---|---|
 | `status` | | [Status](#status) |
-| `get_config` | | `{config, schema, presets, keys}` |
+| `get_config` | | `{config, schema, presets, keys, link_presets}` |
 | `set_config` | `{patch}` nested object of changes, e.g. `{"input": {"hdmi_port": 2}}` | `{config}` |
 | `tv_on` | `{switch_input?: bool}` (default `true`) | [Action record](#action-record) |
 | `tv_off` | | Action record |
@@ -84,9 +84,9 @@ always gets the trace of what was tried.
   "steps": [
     "display check: HDMI-A-1 (TCL TCL TV) is connected",
     "Bluetooth: TV connected after 2.3s",
-    "Bluetooth: sent WAKE x2",
+    "Bluetooth: sent WAKE",
     "waiting 8s for the TV to start up",
-    "Bluetooth: playing macro: HOME 2s F3 1.5s LEFT*6 RIGHT*2 OK"
+    "Bluetooth: playing macro: F3 1.5s LEFT*8 RIGHT*2 OK"
   ],
   "time": 1794300000.0,
   "seconds": 14.2
@@ -119,7 +119,7 @@ action decided there was nothing to do (disabled, display gate closed, duplicate
     "gate_ok": true, "gate_reason": "HDMI-A-1 (TCL TCL TV) is connected", "has_internal": false,
     "connectors": [{"name": "HDMI-A-1", "card": "card0", "status": "connected", "internal": false, "maker": "TCL", "model": "TCL TV", "connected": true, "label": "HDMI-A-1 (TCL TCL TV)"}]
   },
-  "input": {"method": "macro", "hdmi_port": 2, "macro": "HOME 2s F3 1.5s LEFT*6 RIGHT*2 OK", "macro_error": "", "macro_seconds": 9.4},
+  "input": {"method": "macro", "hdmi_port": 2, "wifi_link": "", "macro": "F3 1.5s LEFT*8 RIGHT*2 OK", "macro_error": "", "macro_seconds": 6.2},
   "last_action": { "…": "action record" },
   "history": [],
   "config_problems": []
@@ -138,3 +138,5 @@ action decided there was nothing to do (disabled, display gate closed, duplicate
 - `schema` mirrors its shape; every leaf is `{type, default, help, min?, max?, maxlen?, choices?}`.
 - `presets` lists the built-in input macros: `{name, title, description, template}`.
 - `keys` lists the named keys: `{name, label, page, usage, android}`.
+- `link_presets` lists the built-in TV-input links for the Wi-Fi assist:
+  `{name, title, description, links}` where `links` maps the HDMI port number to an app link.
