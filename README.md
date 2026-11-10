@@ -17,6 +17,14 @@ The machine pairs with the TV once, as a Bluetooth remote control. From then on:
 > still need to be observed. [`docs/hardware-testing.md`](docs/hardware-testing.md) is the
 > plan for doing that.
 
+## Is this what you want?
+
+If your machine and TV can talk over **HDMI-CEC**, use that: it wakes the TV and switches
+the input in one step, and SteamOS 3.8 and newer support it natively on hardware that has
+it (the Steam Machine, or a USB CEC adapter). Most PCs and graphics cards do not pass CEC
+through, and docks often do not either. This project is for those: it needs nothing but the
+Bluetooth both sides already have.
+
 ## What you need
 
 - SteamOS 3.7 or newer (Bazzite and similar systems should work the same way), with Bluetooth
@@ -31,10 +39,14 @@ The machine pairs with the TV once, as a Bluetooth remote control. From then on:
 ### With Decky Loader
 
 1. Download `tcl-me-remo.zip` from the [releases page](https://github.com/tiltbob/tcl-me-remo/releases).
+   Keep the file name exactly as it is: Decky tells an update from a fresh install by it.
 2. In Game Mode open the Decky menu, go to its settings, enable **Developer mode**, then under
    **Developer** choose **Install plugin from ZIP file** and pick the download.
 
 The plugin installs and starts the background service by itself.
+
+The plugin is not in Decky's plugin store, and will not be: the store does not take plugins
+written mostly with AI assistance, which this one was.
 
 ### Without Decky
 

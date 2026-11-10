@@ -160,7 +160,7 @@ async def add_match(bus: MessageBus, rule: str) -> None:
 async def remove_match(bus: MessageBus, rule: str) -> None:
     try:
         await call(bus, DBUS_NAME, DBUS_PATH, DBUS_NAME, "RemoveMatch", "s", [rule])
-    except (DBusError, TimeoutError, OSError):
+    except Exception:  # noqa: BLE001 - best-effort clean-up; the bus may already be gone
         pass
 
 

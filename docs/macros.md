@@ -47,8 +47,11 @@ Built-in presets (`input.preset`):
 | `tcl-column` | `F3 1.5s UP*8 DOWN*{port} OK` | 2022 firmware: a vertical list |
 | `custom` | whatever is in `input.macro` | everything else |
 
-These are starting points taken from owners' reports, not confirmed layouts. To find out
-what your TV needs:
+These are starting points taken from owners' reports, not confirmed layouts, and the whole
+approach is best effort: `F3` opening the source list rests on a single report, made through
+the TV's network remote service rather than a Bluetooth keyboard. If it does not work on your
+TV, the TV's *Last Input Used* setting and the Wi-Fi assist are the dependable routes. To find
+out what your TV needs:
 
 1. Switch the TV to some other input with its own remote.
 2. Find the key that opens the source list: `tcl-me-remo key F3`. If nothing opens, try

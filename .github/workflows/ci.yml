@@ -35,3 +35,14 @@ jobs:
         run: ruff check .
       - name: Test
         run: python -m pytest -q --timeout 60
+
+  vendored:
+    name: Vendored dependency is unmodified
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Re-vendor and compare
+        run: |
+          scripts/vendor.sh
+          git diff --exit-code -- py_modules/tcl_me_remo/_vendor
+          test -z "$(git status --porcelain -- py_modules/tcl_me_remo/_vendor)"

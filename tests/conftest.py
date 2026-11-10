@@ -9,7 +9,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 @pytest.fixture
-def private_bus(tmp_path, monkeypatch):
+def _private_bus_holder():
+    return {}
+
+
+@pytest.fixture
+def kill_private_bus(private_bus, _private_bus_holder):
+    """Returns a function that kills the private bus daemon (to test losing the system bus)."""
+
+    def kill():
+        proc = _private_bus_holder["proc"]
+        proc.kill()
+        proc.wait(timeout=5)
+
+    return kill
+
+
+@pytest.fixture
+def private_bus(tmp_path, monkeypatch, _private_bus_holder):
     """A throw-away dbus-daemon standing in for the system bus.
 
     Yields its address and points DBUS_SYSTEM_BUS_ADDRESS at it, so code that connects to
@@ -22,6 +39,7 @@ def private_bus(tmp_path, monkeypatch):
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
+    _private_bus_holder["proc"] = proc
     try:
         address = proc.stdout.readline().decode().strip()
         if not address:

@@ -163,6 +163,17 @@ class Advertiser:
         self.settings = None
         self._use_basic = False
 
+    def discard(self) -> None:
+        """Give the advertisement up without waiting (the adapter was switched off).
+
+        The kernel would put a registered advertisement back on air when the adapter is
+        switched on again, behind our back; so it is unregistered, not just forgotten.
+        """
+        if self.active:
+            self._unregister_blind(self.adapter_path, self.active_path)
+        self.active_path = ""
+        self.settings = None
+
     async def _register(self, adapter_path: str, path: str) -> None:
         await dbus.call(
             self._bus, BLUEZ, adapter_path, ADVERTISING_MANAGER, "RegisterAdvertisement", "oa{sv}", [path, {}],
@@ -299,6 +310,12 @@ class Beacon:
             self._exported = False
 
     def forget(self) -> None:
+        self.active = False
+
+    def discard(self) -> None:
+        """Like :meth:`Advertiser.discard`."""
+        if self.active:
+            self._unregister_blind()
         self.active = False
 
     async def start(self, adapter_path: str, company: int, data: bytes) -> None:

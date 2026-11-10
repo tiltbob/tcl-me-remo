@@ -29,7 +29,9 @@ The facts that shape it (BlueZ 5.79+ and Android sources, see the research notes
   notifications its HID host wanted.  Direct delivery therefore starts on the second link:
   the first one is dropped once on purpose ("bounce").
 * **Device1.Disconnect() takes two seconds** (bluetoothd's ``DISCONNECT_TIMER``) and only
-  answers once the link is down.
+  answers once the link is down.  That is too long for the moments before suspend, so with
+  ``reconnect_on_drop`` the bounce is done in the background as soon as it is known to be
+  needed, not when the first key is due.
 """
 
 from __future__ import annotations
@@ -543,6 +545,9 @@ class BleRemote:
         if powered != self._powered:
             self._powered = powered
             log.info("Bluetooth adapter is %s", "on" if powered else "off")
+            if not powered and self._pairing is None:
+                self._advertiser.discard()
+                self._beacon.discard()
         if not self._registered or (powered and self._store.stale):
             self._kick_reconcile()
 
@@ -715,8 +720,8 @@ class BleRemote:
             self._advert_not_before = time.monotonic() + ADVERT_RETRY
             raise
 
-    def _should_call(self) -> bool:
-        """Whether the bonded TV should be called although nobody is waiting for it."""
+    def _keeping_link(self) -> bool:
+        """Whether the background policy (``reconnect_on_drop``) currently applies."""
         return bool(
             self._cfg.reconnect_on_drop
             and not self._parked
@@ -724,25 +729,79 @@ class BleRemote:
             and self._registered
             and self._powered
             and self._tv_path
-            and not self._connected
             and self._pairing is None
         )
 
     def _call_in_background(self) -> None:
-        if self._ensure_active or not self._should_call():
+        if self._ensure_active or not self._keeping_link():
             return
         if self._reconnect_task is None or self._reconnect_task.done():
-            log.info("calling the TV in the background until it connects")
-            self._reconnect_task = asyncio.ensure_future(self._reconnect_in_background())
+            self._reconnect_task = asyncio.ensure_future(self._keep_link())
 
-    async def _reconnect_in_background(self) -> None:
+    def _first_link(self) -> bool:
+        """True on the one link that carried the Service Changed indication (module docstring).
+
+        A TV that paired during this registration never got that indication: it is sent to
+        devices that were bonded when the service was registered.
+        """
+        return self._links < 2 and not self._paired_this_registration
+
+    def _needs_bounce(self) -> bool:
+        """The TV will need direct delivery, which cannot work on the current link."""
+        assert self._app is not None
+        mode = self._cfg.raw_notify
+        return (
+            self._connected
+            and self._first_link()
+            and not self._ready
+            and mode != "off"
+            and (mode == "always" or not self._app.subscribed)
+        )
+
+    async def _keep_link(self) -> None:
+        """Background policy: call the TV while it is away, and get the bounce out of the way.
+
+        The second part matters before suspend: the service then has a few seconds to deliver
+        the off key, which is not enough for dropping the link and waiting for the TV to
+        come back.  Doing that as soon as it is known to be necessary leaves a link that
+        ensure_ready can declare ready at once.
+        """
+        calling = False
         try:
-            while self._should_call():
-                try:
-                    await self._advertise(discoverable=False, fast=False)
-                except (DBusError, TimeoutError, OSError) as exc:
-                    log.warning("could not advertise for the TV to reconnect: %s", _describe(exc))
-                    await asyncio.sleep(max(ADVERT_RETRY, 5.0))
+            while self._keeping_link():
+                now = time.monotonic()
+                if not self._connected:
+                    if not calling:
+                        log.info("calling the TV in the background until it connects")
+                        calling = True
+                    try:
+                        await self._advertise(discoverable=False, fast=False)
+                    except (DBusError, TimeoutError, OSError) as exc:
+                        log.warning("could not advertise for the TV to reconnect: %s", _describe(exc))
+                        await asyncio.sleep(max(ADVERT_RETRY, 5.0))
+                        continue
+                    await self._wakeup.wait(60.0)
+                    continue
+                calling = False
+                if self._advertiser.active:
+                    await self._advertiser.stop()
+                    continue
+                if self._closing():
+                    await self._wakeup.wait(0.5)
+                    continue
+                if self._needs_bounce():
+                    due = self._connected_at + max(self._resubscribe_wait(), self._cfg.settle_ms / 1000.0)
+                    if now < due:
+                        await self._wakeup.wait(due - now)
+                        continue
+                    self._note_silent()
+                    log.info("the TV did not subscribe; reconnecting it once so that direct delivery is ready")
+                    self.bounces += 1
+                    try:
+                        await self._request_disconnect(now + DISCONNECT_WAIT)
+                    except (DBusError, TimeoutError, OSError) as exc:
+                        log.warning("could not reconnect the TV: %s", _describe(exc))
+                        await asyncio.sleep(max(ADVERT_RETRY, 5.0))
                     continue
                 await self._wakeup.wait(60.0)
         finally:
@@ -927,7 +986,11 @@ class BleRemote:
                 elif mode == "off":
                     self._note_silent()
                     raise self._fail("not_subscribed", NOT_SUBSCRIBED)
-                elif self._links < 2:
+                elif since < settle:
+                    # Also before a bounce: the Service Changed indication must have reached the
+                    # TV on this link, or it would simply arrive on the next one.
+                    wait = settle - since
+                elif self._first_link():
                     # First link since the registration: see the module docstring.
                     self._note_silent()
                     if remaining <= 0:
@@ -937,8 +1000,6 @@ class BleRemote:
                     self.bounces += 1
                     await self._request_disconnect(min(deadline, now + DISCONNECT_WAIT))
                     continue
-                elif since < settle:
-                    wait = settle - since
                 else:
                     self._note_silent()
                     self._attach_raw()
@@ -996,7 +1057,7 @@ class BleRemote:
             handle, _source = self._app.report_value_handle(report_id)
             try:
                 self._raw.notify(handle, payload)
-            except RawError as exc:
+            except (RawError, ValueError) as exc:
                 self._ready, self._delivery = False, ""
                 raise self._fail("bluetooth_error", f"direct delivery to the TV failed: {exc}") from None
             char.value = bytes(payload)

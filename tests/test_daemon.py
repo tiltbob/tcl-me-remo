@@ -194,6 +194,17 @@ async def test_damaged_config_still_starts(rig):
     assert status["config_problems"] and "not valid JSON" in status["config_problems"][0]
 
 
+async def test_losing_the_system_bus_ends_the_service_with_an_error(rig, kill_private_bus):
+    # systemd restarts on failure; a process that silently lost BlueZ and logind is useless.
+    rig.uptime = 5000.0
+    await rig.start()
+    kill_private_bus()
+    code = await asyncio.wait_for(rig.task, 10)
+    rig.task = None
+    assert code == 1
+    assert rig.remote.keys == []  # no TV action is attempted on the way out
+
+
 async def test_no_system_bus_is_a_clean_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("DBUS_SYSTEM_BUS_ADDRESS", f"unix:path={tmp_path}/no-such-bus")
     monkeypatch.setenv("TCL_ME_REMO_CONFIG", str(tmp_path / "config.json"))

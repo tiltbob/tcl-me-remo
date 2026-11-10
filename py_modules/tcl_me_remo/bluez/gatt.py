@@ -205,19 +205,23 @@ class GattCharacteristic(ServiceInterface):
         self.value = data
         log.debug("%s written: %s", self.path, data.hex())
 
+    def _notify_changed(self, enabled: bool) -> None:
+        self.notifying = enabled
+        if self.on_notify is not None:
+            try:
+                self.on_notify(self, enabled)
+            except Exception:  # noqa: BLE001 - bluetoothd ignores the reply anyway; keep our state sane
+                log.exception("subscription callback failed for %s", self.path)
+
     @method()
     def StartNotify(self):
         if not self.can_notify:
             raise DBusError(ERR_NOT_SUPPORTED, "this characteristic does not notify")
-        self.notifying = True
-        if self.on_notify is not None:
-            self.on_notify(self, True)
+        self._notify_changed(True)
 
     @method()
     def StopNotify(self):
-        self.notifying = False
-        if self.on_notify is not None:
-            self.on_notify(self, False)
+        self._notify_changed(False)
 
 
 class GattDescriptor(ServiceInterface):

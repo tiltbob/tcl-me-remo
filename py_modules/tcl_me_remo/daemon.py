@@ -77,6 +77,7 @@ class Daemon:
         self._shutdown_kind = shutdown_kind
         self._watchdog_interval = watchdog_interval
         self._stop = asyncio.Event()
+        self._bus_lost = False
         self._tasks: set[asyncio.Task[Any]] = set()
         self.service: Service | None = None
         self.logind: Logind | None = None
@@ -138,6 +139,7 @@ class Daemon:
                 except (NotImplementedError, RuntimeError, ValueError):  # not the main thread
                     pass
 
+            self._spawn(self._watch_bus(bus))
             first_start = system.first_start_since_boot(paths.runtime_dir())
             if first_start and self._uptime() <= BOOT_WINDOW_SECONDS:
                 self._spawn(service.handle_event("boot"))
@@ -150,6 +152,10 @@ class Daemon:
             await self._stop.wait()
 
             system.sd_notify("STOPPING=1")
+            if self._bus_lost:
+                # Nothing works without the system bus (no BlueZ, no logind).  Exit non-zero
+                # so systemd starts a fresh process instead of leaving a deaf one running.
+                return 1
             await self._going_down()
             return 0
         finally:
@@ -207,6 +213,20 @@ class Daemon:
             return
         log.info("the system is going down (%s)", kind)
         await self.service.handle_event(kind, budget=self._budget())
+
+    async def _watch_bus(self, bus: Any) -> None:
+        try:
+            await bus.wait_for_disconnect()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the library reports the reason by raising
+            log.error("lost the connection to the system D-Bus: %s", exc)
+        else:
+            if self._stop.is_set():
+                return
+            log.error("the system D-Bus closed the connection")
+        self._bus_lost = True
+        self._stop.set()
 
     async def _watchdog(self) -> None:
         assert self.service is not None
