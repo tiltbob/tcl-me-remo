@@ -64,15 +64,11 @@ async def test_a_plain_cancellation_stays_a_cancellation():
 
 def test_the_package_waits_through_the_helper():
     # asyncio.wait_for is fine on Python 3.12 and later, where CI would never notice it coming
-    # back; on 3.11 it loses cancellations.  Everything a cancellable long-lived task runs
-    # through (D-Bus calls, the whole Bluetooth transport, the Wi-Fi assist, system commands)
-    # must use aio.wait_for.  The two modules excepted here still call the original in
-    # places where a lost cancellation cannot leave anybody waiting; they are to follow.
-    not_yet = {"lifecycle.py", "service.py"}
+    # back; on 3.11 it loses cancellations.  Nothing in the package calls it directly.
     offenders = []
     for path in sorted(PACKAGE.rglob("*.py")):
         name = path.relative_to(PACKAGE).as_posix()
-        if "_vendor" in path.parts or name == "aio.py" or name in not_yet:
+        if "_vendor" in path.parts or name == "aio.py":
             continue
         if re.search(r"\basyncio\.wait_for\(", path.read_text(encoding="utf-8")):
             offenders.append(name)

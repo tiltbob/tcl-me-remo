@@ -20,7 +20,7 @@ import logging
 import os
 from typing import Awaitable, Callable
 
-from . import dbus
+from . import aio, dbus
 from .dbus import DBusError, Message, MessageBus
 
 log = logging.getLogger(__name__)
@@ -243,7 +243,7 @@ class Logind:
             if not self._metadata_seen.is_set():
                 # Newer logind sends the metadata variant alongside; give it a moment.
                 try:
-                    await asyncio.wait_for(self._metadata_seen.wait(), METADATA_WAIT)
+                    await aio.wait_for(self._metadata_seen.wait(), METADATA_WAIT)
                 except TimeoutError:
                     pass
             kind = self._pending_kind or "unknown"

@@ -31,7 +31,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from . import __version__, display, keys, macro, tvdata
+from . import __version__, aio, display, keys, macro, tvdata
 from . import config as config_mod
 from .config import Config, ConfigError
 from .interfaces import (
@@ -504,7 +504,7 @@ class Service:
         """
         attempt.deadline = time.monotonic() + budget
         try:
-            return await asyncio.wait_for(self._do_tv_off(trace, attempt), budget)
+            return await aio.wait_for(self._do_tv_off(trace, attempt), budget)
         except TimeoutError:
             if attempt.sent:
                 when = "with the key down; it was released at once" if attempt.cut else "right after the key went out"
@@ -543,7 +543,7 @@ class Service:
 
     async def _disconnect_quietly(self) -> None:
         try:
-            await asyncio.wait_for(self.remote.disconnect(fast=True), DISCONNECT_SECONDS)
+            await aio.wait_for(self.remote.disconnect(fast=True), DISCONNECT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - best effort on the way down
             log.debug("disconnect before going down failed: %s", exc)
 
