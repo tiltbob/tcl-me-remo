@@ -118,6 +118,14 @@ class WifiAssist(Protocol):
     async def unpair(self) -> None:
         """Forget the client certificate so the TV no longer accepts us."""
 
+    async def probe(self, host: str, *, timeout: float) -> dict[str, Any]:
+        """Connect, complete the handshake and report what the TV says.
+
+        Returns ``{"on": bool | None, "name": str}``: whether the TV's screen is on (None if
+        it did not say).  Raises :class:`TransportError` if the TV cannot be reached or does
+        not accept us.
+        """
+
     async def send_key(self, host: str, keycode: int, *, timeout: float) -> None:
         """Send one Android key code (press and release)."""
 

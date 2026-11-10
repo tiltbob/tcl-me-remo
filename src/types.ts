@@ -219,6 +219,13 @@ export interface WifiDevice {
   port: number;
 }
 
+/** Result of `wifi_test`. `on` is null when the TV did not report its power state. */
+export interface WifiTest {
+  reachable: boolean;
+  on: boolean | null;
+  name: string;
+}
+
 export interface RpcError {
   code: string;
   message: string;

@@ -44,6 +44,7 @@ echo '{"id":1,"method":"status"}' | sudo socat - UNIX-CONNECT:/run/tcl-me-remo/c
 | `wifi_pair_start` | `{host}` | Wi-Fi status |
 | `wifi_pair_finish` | `{code, name?}` the code shown on the TV | Wi-Fi status |
 | `wifi_pair_cancel` | | Wi-Fi status |
+| `wifi_test` | `{host?}` defaults to the configured TV | `{reachable, on, name}`; changes nothing on the TV |
 | `wifi_unpair` | | Wi-Fi status |
 | `logs` | `{lines?}` 1..1000, default 100 | `{lines: [string]}` |
 

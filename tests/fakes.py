@@ -127,6 +127,12 @@ class FakeWifi:
     async def unpair(self) -> None:
         self.paired = False
 
+    async def probe(self, host: str, *, timeout: float) -> dict[str, Any]:
+        self._maybe_fail()
+        if not self.paired:
+            raise TransportError("wifi_not_paired", "the TV does not accept this machine: pair first")
+        return {"on": True, "name": "Living Room TV"}
+
     async def send_key(self, host: str, keycode: int, *, timeout: float) -> None:
         self._maybe_fail()
         self.keys.append((host, keycode))

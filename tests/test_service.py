@@ -648,8 +648,16 @@ async def test_rpc_wifi_pairing_flow(tmp_path):
     assert (await rpc("wifi_pair_finish", {"code": "A1B2C3", "name": "Living Room TV"}))["paired"] is True
     assert h.service.cfg.wifi.enabled and h.service.cfg.wifi.host == "192.168.1.50"
     assert h.service.cfg.wifi.name == "Living Room TV"
+    assert await rpc("wifi_test", {}) == {"reachable": True, "on": True, "name": "Living Room TV"}
     assert (await rpc("wifi_unpair", {}))["paired"] is False
     assert h.service.cfg.wifi.enabled is False
+    with pytest.raises(RpcError) as err:
+        await rpc("wifi_test", {})
+    assert err.value.code == "wifi_not_paired"
+    h.service.set_config({"wifi": {"host": ""}})
+    with pytest.raises(RpcError) as err:
+        await rpc("wifi_test", {})
+    assert err.value.code == "wifi_not_configured"
 
     no_wifi = Harness(tmp_path)
     with pytest.raises(RpcError) as err:

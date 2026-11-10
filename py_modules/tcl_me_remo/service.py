@@ -794,6 +794,15 @@ class Service:
         await wifi.cancel_pairing()
         return wifi.status()
 
+    async def _rpc_wifi_test(self, params: dict[str, Any]) -> Any:
+        """Check that the TV answers over Wi-Fi and accepts us, without changing anything on it."""
+        wifi = self._need_wifi()
+        host = params.get("host", self.cfg.wifi.host)
+        if not isinstance(host, str) or not host.strip():
+            raise RpcError("wifi_not_configured", "no TV address is set for the Wi-Fi assist")
+        result = await wifi.probe(host.strip(), timeout=6.0)
+        return {"reachable": True, "on": result.get("on"), "name": str(result.get("name", ""))}
+
     async def _rpc_wifi_unpair(self, params: dict[str, Any]) -> Any:
         wifi = self._need_wifi()
         await wifi.unpair()
