@@ -34,7 +34,7 @@ echo '{"id":1,"method":"status"}' | sudo socat - UNIX-CONNECT:/run/tcl-me-remo/c
 | `send_key` | `{key, hold?}` key name or raw usage; `hold` in seconds | `{key}` |
 | `run_macro` | `{macro}` macro text; `{port}` placeholders allowed | Action record |
 | `check_macro` | `{macro}` | `{ok, normalized, rendered, seconds}` or `{ok: false, error}` |
-| `event` | `{name, simulate?, budget?}` name is `boot`, `resume`, `suspend`, `shutdown` or `reboot` | Action record |
+| `event` | `{name, simulate?, budget?, wait?}` name is `boot`, `resume`, `suspend`, `shutdown` or `reboot` | Action record, or `{queued, name}` with `wait: false` |
 | `pair_start` | `{timeout?}` 10..600 seconds, default 120 | Bluetooth state |
 | `pair_cancel` | | Bluetooth state |
 | `forget_tv` | | Bluetooth state |

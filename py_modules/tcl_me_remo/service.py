@@ -118,6 +118,7 @@ class Service:
         self._start_lock = asyncio.Lock()
         self._key_lock = asyncio.Lock()
         self._history: deque[dict[str, Any]] = deque(maxlen=HISTORY_LENGTH)
+        self._background: set[asyncio.Task[Any]] = set()
         self._started_at = time.time()
         self.remote.apply_config(cfg.bluetooth)
 
@@ -691,11 +692,19 @@ class Service:
         budget = params.get("budget")
         if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0):
             raise RpcError("bad_request", "'budget' must be a positive number of seconds")
-        return await self.handle_event(
-            _str(params, "name"),
-            budget=float(budget) if budget is not None else None,
-            simulate=_bool(params, "simulate", False),
-        )
+        name = _str(params, "name")
+        if name not in EVENTS:
+            raise RpcError("bad_request", f"unknown event {name!r} (expected one of: {', '.join(EVENTS)})")
+        simulate, wait = _bool(params, "simulate", False), _bool(params, "wait", True)
+        coro = self.handle_event(name, budget=float(budget) if budget is not None else None, simulate=simulate)
+        if wait:
+            return await coro
+        # Fire and forget: a caller such as a systemd hook must not be held up by an action
+        # that can take a minute (connect, wait for the TV, play a macro).
+        task = asyncio.ensure_future(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return {"queued": True, "name": name}
 
     async def _rpc_pair_start(self, params: dict[str, Any]) -> Any:
         timeout = params.get("timeout", 120)

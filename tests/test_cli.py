@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 
@@ -20,8 +21,6 @@ async def running(tmp_path):
     service = Service(cfg, remote=remote, wifi=wifi, sys_root=tmp_path, recent_logs=lambda n: ["a", "b", "c"][-n:])
     server = ipc.IpcServer(tmp_path / "control.sock", service.rpc, group=None)
     await server.start()
-
-    import asyncio
 
     async def run_cli(*argv, ask=lambda prompt: ""):
         out, err = io.StringIO(), io.StringIO()
@@ -106,6 +105,15 @@ async def test_event_and_logs(running):
     assert code == 0 and "skipped: duplicate" in out
     code, out, _ = await running("logs", "-n", "2")
     assert out.split() == ["b", "c"]
+
+    running.remote.keys.clear()
+    code, out, _ = await running("event", "suspend", "--simulate", "--no-wait")
+    assert (code, out.strip()) == (0, "queued: suspend")
+    for _ in range(100):
+        if running.remote.key_names() == ["SLEEP"]:
+            break
+        await asyncio.sleep(0.02)
+    assert running.remote.key_names() == ["SLEEP"]  # the action ran although nobody waited for it
 
 
 async def test_wifi_commands(running):

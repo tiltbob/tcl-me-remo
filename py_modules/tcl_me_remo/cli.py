@@ -68,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", choices=["boot", "resume", "suspend", "shutdown", "reboot"])
     p.add_argument("--simulate", action="store_true", help="run the actions without affecting event bookkeeping")
     p.add_argument("--budget", type=float, metavar="SECONDS", help="time limit for suspend/shutdown actions")
+    p.add_argument("--no-wait", action="store_true", help="return at once instead of waiting for the actions")
 
     p = sub.add_parser("wifi", help="set up the optional Wi-Fi assist")
     wsub = p.add_subparsers(dest="wifi_command", metavar="action")
@@ -330,6 +331,11 @@ def run(
             params = {"name": args.name, "simulate": args.simulate}
             if args.budget is not None:
                 params["budget"] = args.budget
+            if args.no_wait:
+                params["wait"] = False
+                call("event", params, timeout=5.0)
+                print(f"queued: {args.name}", file=out)
+                return EXIT_OK
             # Up events can legitimately take minutes (connect, wait, macro).
             timeout = (args.budget + 3.0) if args.budget is not None else 240.0
             return _print_record(call("event", params, timeout=timeout), out)

@@ -552,6 +552,8 @@ async def test_rpc_surface(tmp_path):
         ("send_key", {}),
         ("send_key", {"key": "OK", "hold": "long"}),
         ("event", {"name": "boot", "budget": -1}),
+        ("event", {"name": "hibernate-ish", "wait": False}),
+        ("event", {"name": "boot", "wait": "no"}),
         ("event", {"name": "boot", "simulate": "yes"}),
         ("pair_start", {"timeout": 5}),
         ("logs", {"lines": 0}),
