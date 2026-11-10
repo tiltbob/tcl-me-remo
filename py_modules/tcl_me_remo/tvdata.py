@@ -64,3 +64,33 @@ def link_preset_catalog() -> list[dict[str, object]]:
         }
         for preset in LINK_PRESETS.values()
     ]
+
+
+# --------------------------------------------------------------------------- wake beacon
+#
+# MediaTek TV platforms arm a filter in the Bluetooth controller before suspending and wake
+# when an advertisement with matching manufacturer data arrives.  MediaTek's reference driver
+# (btmtk, "WoBLE by BLE RC") uses this default: company id 0x0046, one ignored byte, the TV's
+# own Bluetooth address, four ignored bytes, then the ASCII text "CRKTM".  A product can
+# replace the pattern; what TCL ships is not public.
+
+MEDIATEK_COMPANY_ID = 0x0046
+
+
+def mediatek_wake_data(tv_address: str) -> bytes:
+    """Manufacturer data (without the company id) matching MediaTek's default wake filter."""
+    octets = bytes(int(part, 16) for part in tv_address.split(":"))
+    if len(octets) != 6:
+        raise ValueError(f"not a Bluetooth address: {tv_address!r}")
+    # The driver copies the address as the controller reports it: least significant byte first.
+    return b"\x00" + octets[::-1] + b"\x00\x00\x00\x00" + b"CRKTM"
+
+
+def wake_beacon(mode: str, custom_hex: str, tv_address: str) -> tuple[int, bytes] | None:
+    """``(company_id, data)`` to broadcast for the configured wake beacon, or None for none."""
+    if mode == "mediatek" and tv_address:
+        return MEDIATEK_COMPANY_ID, mediatek_wake_data(tv_address)
+    if mode == "custom" and custom_hex:
+        raw = bytes.fromhex(custom_hex)
+        return int.from_bytes(raw[:2], "little"), raw[2:]
+    return None

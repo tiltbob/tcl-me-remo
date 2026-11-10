@@ -37,6 +37,11 @@ def test_apply_patch_merges_and_validates():
         ({"input": {"macro": "NOT_A_KEY"}}, "input.macro"),
         ({"input": {"preset": "nope"}}, "input.preset"),
         ({"wifi": {"link_preset": "nope"}}, "wifi.link_preset"),
+        ({"bluetooth": {"wake_beacon": "loud"}}, "bluetooth.wake_beacon"),
+        ({"bluetooth": {"wake_beacon_data": "46 0"}}, "bluetooth.wake_beacon_data"),
+        ({"bluetooth": {"wake_beacon_data": "zz00ff"}}, "bluetooth.wake_beacon_data"),
+        ({"bluetooth": {"wake_beacon_data": "4600"}}, "bluetooth.wake_beacon_data"),
+        ({"bluetooth": {"wake_beacon_data": "00" * 30}}, "bluetooth.wake_beacon_data"),
         ({"power": {"on_key": "BANANA"}}, "power.on_key"),
         ({"bluetooth": {"tv_address": "nonsense"}}, "bluetooth.tv_address"),
         ({"bluetooth": {"adapter": "wlan0"}}, "bluetooth.adapter"),
@@ -66,6 +71,8 @@ def test_values_are_normalised():
         },
     )
     assert cfg.bluetooth.tv_address == "AA:BB:CC:DD:EE:0F"
+    beacon = C.apply_patch(cfg, {"bluetooth": {"wake_beacon_data": "46:00 00 A1-B2-C3 d4e5f6"}})
+    assert beacon.bluetooth.wake_beacon_data == "460000a1b2c3d4e5f6"
     assert cfg.power.on_key == "WAKE"
     assert cfg.input.macro == "home 1s down*{port} ok"
 

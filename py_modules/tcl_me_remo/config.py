@@ -175,6 +175,22 @@ class BluetoothConfig:
             "Turn off if the TV wakes up by itself."
         ),
     )
+    wake_beacon: str = field(
+        default="off",
+        metadata=_meta(
+            choices=("off", "mediatek", "custom"),
+            help="Experimental: while turning the TV on, also broadcast the advertisement a suspended "
+            "MediaTek TV listens for ('mediatek'), or the bytes in wake_beacon_data ('custom').",
+        ),
+    )
+    wake_beacon_data: str = field(
+        default="",
+        metadata=_meta(
+            check="hexdata",
+            help="Manufacturer data for wake_beacon=custom, as hex in on-air order (company id first), "
+            "for example a pattern captured from the TV's own remote.",
+        ),
+    )
     idle_disconnect_seconds: float = field(
         default=0.0,
         metadata=_meta(
@@ -292,6 +308,18 @@ def _check_special(kind: str, path: str, value: Any) -> Any:
             return macro.validate(str(value))
         except macro.MacroError as exc:
             raise ConfigError(path, str(exc)) from None
+    if kind == "hexdata":
+        text = re.sub(r"[\s:,-]", "", str(value)).lower()
+        if text.startswith("0x"):
+            text = text[2:]
+        if text == "":
+            return ""
+        if len(text) % 2 or not re.fullmatch(r"[0-9a-f]+", text):
+            raise ConfigError(path, "must be hexadecimal bytes, for example 4600 00 a1b2c3d4e5f6")
+        # One legacy advertisement holds 31 bytes; a manufacturer-data field has 2 of overhead.
+        if not 3 <= len(text) // 2 <= 29:
+            raise ConfigError(path, "must be between 3 and 29 bytes (2 bytes company id, then the data)")
+        return text
     if kind == "link_preset":
         from . import tvdata
 

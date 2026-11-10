@@ -47,6 +47,8 @@ export interface BluetoothConfig {
   resubscribe_wait: number;
   raw_notify: "auto" | "off" | "always";
   reconnect_on_drop: boolean;
+  wake_beacon: "off" | "mediatek" | "custom";
+  wake_beacon_data: string;
   idle_disconnect_seconds: number;
   gatt_security: "encrypt" | "plain";
   key_press_ms: number;
