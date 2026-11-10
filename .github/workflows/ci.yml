@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Service (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # SteamOS 3.7/3.8 ship 3.13, SteamOS 3.9 ships 3.14.
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dbus
+          python -m pip install --quiet pytest pytest-asyncio pytest-timeout ruff
+      - name: Lint
+        run: ruff check .
+      - name: Test
+        run: python -m pytest -q --timeout 60
+
+  vendored:
+    name: Vendored dependency is unmodified
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Re-vendor and compare
+        run: |
+          scripts/vendor.sh
+          git diff --exit-code -- py_modules/tcl_me_remo/_vendor
+          test -z "$(git status --porcelain -- py_modules/tcl_me_remo/_vendor)"
+
+  plugin:
+    name: Decky plugin (build, UI checks, package)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        run: pnpm run typecheck
+      - name: Build
+        run: pnpm run build
+      - name: The committed panel bundle is current
+        # dist/index.js is committed so that a checkout can be packaged without Node.js.
+        # If this fails: run "pnpm run build" and commit dist/index.js.
+        run: git diff --exit-code -- dist/index.js
+      - name: UI checks in a browser preview
+        # Renders the real components against mocked Decky modules and a fake backend and
+        # clicks through them.  Playwright is not a project dependency; the script loads it
+        # through NODE_PATH.
+        run: |
+          npm install --global playwright@1
+          npx playwright install --with-deps chromium
+          NODE_PATH="$(npm root --global)" pnpm run preview
+      - name: Package
+        run: python3 scripts/build_zip.py
+      - uses: actions/upload-artifact@v4
+        # A convenience only: everything that verifies the plugin has run by now.  Uploading
+        # can fail for reasons outside the code (the account's artifact storage quota).
+        continue-on-error: true
+        with:
+          name: tcl-me-remo-plugin
+          path: out/tcl-me-remo.zip
+          if-no-files-found: error

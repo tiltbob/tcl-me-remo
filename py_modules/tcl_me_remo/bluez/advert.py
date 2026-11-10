@@ -1,0 +1,403 @@
+"""LE advertising: how the TV finds us.
+
+Facts this module relies on (BlueZ 5.79-5.87 ``src/advertising.c``):
+
+* ``RegisterAdvertisement`` makes bluetoothd read the object's properties with
+  ``Properties.GetAll`` and answer only after the kernel accepted the instance.  A property
+  it cannot parse fails the whole registration with ``org.bluez.Error.Failed``.
+* ``Type = "peripheral"`` makes the advertisement connectable.
+* ``Discoverable`` controls the Flags field: true gives "LE General Discoverable" (the TV
+  lists us in its pairing screen), false gives a connectable advertisement that pairing
+  screens ignore but a bonded TV still connects to.  The adapter's own ``Discoverable``
+  property must stay untouched: it turns on classic inquiry scan, and a TV that finds the
+  machine over classic Bluetooth pairs with the wrong transport.
+* ``MinInterval``/``MaxInterval`` (milliseconds) are regular properties in these versions,
+  but they are the newest ones we use, so registration is retried without them if
+  bluetoothd answers ``org.bluez.Error.Failed`` ("Failed to parse advertisement." for a
+  property it cannot read, "Failed to register advertisement" when the kernel refuses the
+  instance).  Other errors (``NotPermitted``: no free instance, ``InvalidLength``) are not
+  about the interval and are reported as they are.  The plain advertisement is then used
+  for a few minutes before the full one is tried again, so that one hiccup does not slow
+  every later connection down to bluetoothd's default interval.
+* ``LocalName`` travels in the scan response; ``Appearance`` 0x03C1 (keyboard) is what makes
+  an Android TV offer the device in "pair remote or accessory".
+* bluetoothd calls ``Release()`` when it drops the advertisement on its own.
+
+When and for how long we advertise is decided in remote.py.
+
+The wake beacon is a second, separate advertisement: ``Type = "broadcast"`` (not connectable)
+carrying nothing but a manufacturer-data field.  Some TVs arm a filter for such a field in
+their Bluetooth controller before suspending and wake when it is heard.  Experimental.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+from .. import dbus
+from ..dbus import DBusError, MessageBus, PropertyAccess, ServiceInterface, Variant, dbus_property, method
+from .gatt import UUID_HID_SERVICE, uuid16
+
+log = logging.getLogger(__name__)
+
+BLUEZ = "org.bluez"
+ADVERTISING_MANAGER = "org.bluez.LEAdvertisingManager1"
+ADVERT_PATH = "/org/tclmeremo/advert"
+ADVERT_BASIC_PATH = "/org/tclmeremo/advert_basic"
+BEACON_PATH = "/org/tclmeremo/beacon"
+
+APPEARANCE_KEYBOARD = 0x03C1
+#: Advertising intervals in ms: quick while somebody waits for the TV, relaxed in the background.
+FAST_INTERVAL = (30, 60)
+SLOW_INTERVAL = (150, 250)
+#: The scan response holds 31 bytes, two of which are the length and type of the name field.
+MAX_NAME_BYTES = 26
+
+CALL_TIMEOUT = 5.0
+ERR_FAILED = "org.bluez.Error.Failed"
+#: After falling back to the advertisement without intervals, try the full one again after this long.
+BASIC_RETRY_SECONDS = 300.0
+
+
+def fit_name(name: str, limit: int = MAX_NAME_BYTES) -> str:
+    """Cut ``name`` to at most ``limit`` UTF-8 bytes without splitting a character."""
+    encoded = name.encode("utf-8")[:limit]
+    return encoded.decode("utf-8", errors="ignore").rstrip()
+
+
+@dataclass(frozen=True)
+class AdvertSettings:
+    name: str
+    discoverable: bool = False
+    fast: bool = True
+
+    @property
+    def interval(self) -> tuple[int, int]:
+        return FAST_INTERVAL if self.fast else SLOW_INTERVAL
+
+
+class BasicAdvertisement(ServiceInterface):
+    """The properties every supported bluetoothd understands."""
+
+    def __init__(self, on_release: Callable[[], None]):
+        super().__init__("org.bluez.LEAdvertisement1")
+        self.settings = AdvertSettings(name="")
+        self._on_release = on_release
+
+    @dbus_property(PropertyAccess.READ)
+    def Type(self) -> "s":
+        return "peripheral"
+
+    @dbus_property(PropertyAccess.READ)
+    def ServiceUUIDs(self) -> "as":
+        return [uuid16(UUID_HID_SERVICE)]
+
+    @dbus_property(PropertyAccess.READ)
+    def Appearance(self) -> "q":
+        return APPEARANCE_KEYBOARD
+
+    @dbus_property(PropertyAccess.READ)
+    def LocalName(self) -> "s":
+        return fit_name(self.settings.name)
+
+    @dbus_property(PropertyAccess.READ)
+    def Discoverable(self) -> "b":
+        return self.settings.discoverable
+
+    @method()
+    def Release(self):
+        self._on_release()
+
+
+class TimedAdvertisement(BasicAdvertisement):
+    """Adds the advertising interval."""
+
+    @dbus_property(PropertyAccess.READ)
+    def MinInterval(self) -> "u":
+        return self.settings.interval[0]
+
+    @dbus_property(PropertyAccess.READ)
+    def MaxInterval(self) -> "u":
+        return self.settings.interval[1]
+
+
+class Advertiser:
+    """Registers and unregisters our single advertisement with one adapter."""
+
+    def __init__(self, bus: MessageBus, on_released: Callable[[], None] | None = None):
+        self._bus = bus
+        self._on_released = on_released
+        self._timed = TimedAdvertisement(self._released)
+        self._basic = BasicAdvertisement(self._released)
+        self._exported = False
+        self._basic_until = 0.0        # monotonic time until which the interval properties are left out
+        # start() and stop() are called from several tasks (a waiting ensure_ready, the
+        # background caller, the pairing loop); bluetoothd must see them one at a time.
+        self._lock = asyncio.Lock()
+        self.adapter_path = ""
+        self.active_path = ""          # object registered with bluetoothd, "" if none
+        self.settings: AdvertSettings | None = None
+
+    @property
+    def active(self) -> bool:
+        return bool(self.active_path)
+
+    def export(self) -> None:
+        if not self._exported:
+            self._bus.export(ADVERT_PATH, self._timed)
+            self._bus.export(ADVERT_BASIC_PATH, self._basic)
+            self._exported = True
+
+    def unexport(self) -> None:
+        if self._exported:
+            self._bus.unexport(ADVERT_PATH, self._timed)
+            self._bus.unexport(ADVERT_BASIC_PATH, self._basic)
+            self._exported = False
+
+    def _released(self) -> None:
+        if self.active_path:
+            log.info("bluetoothd released our advertisement")
+        self.active_path = ""
+        self.settings = None
+        if self._on_released is not None:
+            self._on_released()
+
+    def forget(self) -> None:
+        """bluetoothd or the adapter went away: nothing is registered any more."""
+        self.active_path = ""
+        self.settings = None
+        self._basic_until = 0.0
+
+    def discard(self) -> None:
+        """Give the advertisement up without waiting (the adapter was switched off).
+
+        The kernel would put a registered advertisement back on air when the adapter is
+        switched on again, behind our back; so it is unregistered, not just forgotten.
+        """
+        if self.active:
+            self._unregister_blind(self.adapter_path, self.active_path)
+        self.active_path = ""
+        self.settings = None
+
+    async def _register(self, adapter_path: str, path: str) -> None:
+        await dbus.call(
+            self._bus, BLUEZ, adapter_path, ADVERTISING_MANAGER, "RegisterAdvertisement", "oa{sv}", [path, {}],
+            timeout=CALL_TIMEOUT,
+        )  # fmt: skip
+
+    async def _unregister(self, adapter_path: str, path: str) -> None:
+        try:
+            await dbus.call(
+                self._bus, BLUEZ, adapter_path, ADVERTISING_MANAGER, "UnregisterAdvertisement", "o", [path],
+                timeout=CALL_TIMEOUT,
+            )  # fmt: skip
+        except (DBusError, TimeoutError, OSError) as exc:
+            # DoesNotExist (already released), bluetoothd gone, ...: either way it is not on air.
+            log.debug("UnregisterAdvertisement(%s): %s", path, exc)
+
+    def _unregister_blind(self, adapter_path: str, path: str) -> None:
+        """Fire-and-forget unregistration, usable where awaiting is not possible."""
+        try:
+            self._bus.send(
+                dbus.Message(
+                    destination=BLUEZ, path=adapter_path, interface=ADVERTISING_MANAGER,
+                    member="UnregisterAdvertisement", signature="o", body=[path],
+                    flags=dbus.MessageFlag.NO_REPLY_EXPECTED,
+                )
+            )  # fmt: skip
+        except Exception as exc:  # noqa: BLE001 - the bus is gone, and so is the advertisement
+            log.debug("could not send UnregisterAdvertisement: %s", exc)
+
+    async def start(self, adapter_path: str, settings: AdvertSettings, *, timeout: float = CALL_TIMEOUT) -> None:
+        """Advertise with ``settings``; a no-op if exactly that is already on air.
+
+        Raises ``DBusError`` if bluetoothd refuses and ``TimeoutError`` if the whole thing
+        (waiting for another start/stop included) takes longer than ``timeout``; nothing is
+        left on air in either case.
+        """
+        async with asyncio.timeout(timeout):
+            async with self._lock:
+                await self._start(adapter_path, settings)
+
+    async def _start(self, adapter_path: str, settings: AdvertSettings) -> None:
+        if self.active and self.adapter_path == adapter_path and self.settings == settings:
+            return
+        if self.active:
+            await self._stop()
+        self.export()
+        self._timed.settings = self._basic.settings = settings
+        self.adapter_path = adapter_path
+
+        use_basic = time.monotonic() < self._basic_until
+        candidates = [ADVERT_BASIC_PATH] if use_basic else [ADVERT_PATH, ADVERT_BASIC_PATH]
+        error: Exception | None = None
+        for path in candidates:
+            try:
+                try:
+                    await self._register(adapter_path, path)
+                except DBusError as exc:
+                    if exc.type != "org.bluez.Error.AlreadyExists":
+                        raise
+                    # A registration we lost track of (its reply timed out, say): start clean.
+                    await self._unregister(adapter_path, path)
+                    await self._register(adapter_path, path)
+            except DBusError as exc:
+                error = exc
+                log.debug("RegisterAdvertisement(%s) failed: %s: %s", path, exc.type, exc.text)
+                if exc.type != ERR_FAILED:
+                    break  # not about the properties: the plain advertisement would fare no better
+                continue
+            except BaseException:
+                # Timed out or cancelled with the request possibly accepted: make sure nothing
+                # stays on air behind our back.
+                self._unregister_blind(adapter_path, path)
+                raise
+            if path == ADVERT_BASIC_PATH and not use_basic:
+                log.warning(
+                    "bluetoothd refused the advertising interval settings (%s); advertising with its defaults "
+                    "for the next %g minutes",
+                    getattr(error, "text", "") or "no reason given",
+                    BASIC_RETRY_SECONDS / 60,
+                )
+                self._basic_until = time.monotonic() + BASIC_RETRY_SECONDS
+            self.active_path = path
+            self.settings = settings
+            log.info(
+                "advertising as %r (%s%s)",
+                fit_name(settings.name),
+                "discoverable" if settings.discoverable else "bonded TV only",
+                "" if path == ADVERT_BASIC_PATH else f", {settings.interval[0]}-{settings.interval[1]} ms",
+            )
+            return
+        assert error is not None
+        raise error
+
+    async def stop(self, *, timeout: float = CALL_TIMEOUT) -> None:
+        """Take the advertisement off air.  Never raises, and returns after ``timeout`` at the latest.
+
+        When time runs out the request has either been sent already (bluetoothd will act on
+        it; only its answer is not waited for) or is sent without waiting for an answer.
+        """
+        try:
+            async with asyncio.timeout(timeout):
+                async with self._lock:
+                    await self._stop()
+        except TimeoutError:
+            if self.active:
+                self._unregister_blind(self.adapter_path, self.active_path)
+                self.active_path = ""
+                self.settings = None
+
+    async def _stop(self) -> None:
+        if not self.active:
+            return
+        path, self.active_path, self.settings = self.active_path, "", None
+        await self._unregister(self.adapter_path, path)
+        log.info("advertising stopped")
+
+
+class BeaconAdvertisement(ServiceInterface):
+    def __init__(self, on_release: Callable[[], None]):
+        super().__init__("org.bluez.LEAdvertisement1")
+        self.company = 0
+        self.data = b""
+        self._on_release = on_release
+
+    @dbus_property(PropertyAccess.READ)
+    def Type(self) -> "s":
+        return "broadcast"
+
+    @dbus_property(PropertyAccess.READ)
+    def ManufacturerData(self) -> "a{qv}":
+        return {self.company: Variant("ay", self.data)}
+
+    @method()
+    def Release(self):
+        self._on_release()
+
+
+class Beacon:
+    """Registers and unregisters the wake beacon."""
+
+    def __init__(self, bus: MessageBus):
+        self._bus = bus
+        self._object = BeaconAdvertisement(self.forget)
+        self._exported = False
+        self._adapter_path = ""
+        self.active = False
+
+    def export(self) -> None:
+        if not self._exported:
+            self._bus.export(BEACON_PATH, self._object)
+            self._exported = True
+
+    def unexport(self) -> None:
+        if self._exported:
+            self._bus.unexport(BEACON_PATH, self._object)
+            self._exported = False
+
+    def forget(self) -> None:
+        self.active = False
+
+    def discard(self) -> None:
+        """Like :meth:`Advertiser.discard`."""
+        if self.active:
+            self._unregister_blind()
+        self.active = False
+
+    async def start(self, adapter_path: str, company: int, data: bytes, *, timeout: float = CALL_TIMEOUT) -> None:
+        """Broadcast ``data`` as manufacturer data of ``company``.  Raises if bluetoothd refuses."""
+        current = (self._adapter_path, self._object.company, self._object.data)
+        if self.active and current == (adapter_path, company, bytes(data)):
+            return
+        await self.stop(timeout=timeout)
+        self.export()
+        self._object.company, self._object.data = company, bytes(data)
+        self._adapter_path = adapter_path
+        try:
+            await dbus.call(
+                self._bus, BLUEZ, adapter_path, ADVERTISING_MANAGER, "RegisterAdvertisement", "oa{sv}",
+                [BEACON_PATH, {}], timeout=timeout,
+            )  # fmt: skip
+        except DBusError as exc:
+            if exc.type != "org.bluez.Error.AlreadyExists":
+                raise
+        except BaseException:
+            self._unregister_blind()
+            raise
+        self.active = True
+        log.info("broadcasting the wake beacon (company 0x%04X, %d bytes)", company, len(data))
+
+    def _unregister_blind(self) -> None:
+        try:
+            self._bus.send(
+                dbus.Message(
+                    destination=BLUEZ, path=self._adapter_path, interface=ADVERTISING_MANAGER,
+                    member="UnregisterAdvertisement", signature="o", body=[BEACON_PATH],
+                    flags=dbus.MessageFlag.NO_REPLY_EXPECTED,
+                )
+            )  # fmt: skip
+        except Exception as exc:  # noqa: BLE001 - the bus is gone, and so is the beacon
+            log.debug("could not send UnregisterAdvertisement: %s", exc)
+
+    async def stop(self, *, timeout: float = CALL_TIMEOUT) -> None:
+        """Take the beacon off air.  Never raises.
+
+        Like :meth:`Advertiser.stop`: after ``timeout`` the request is on its way and only its
+        answer is not waited for.
+        """
+        if not self.active:
+            return
+        self.active = False
+        try:
+            await dbus.call(
+                self._bus, BLUEZ, self._adapter_path, ADVERTISING_MANAGER, "UnregisterAdvertisement", "o",
+                [BEACON_PATH], timeout=timeout,
+            )  # fmt: skip
+        except (DBusError, TimeoutError, OSError) as exc:
+            log.debug("UnregisterAdvertisement(%s): %s", BEACON_PATH, exc)
+        log.info("wake beacon stopped")

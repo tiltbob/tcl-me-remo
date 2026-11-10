@@ -1,0 +1,11 @@
+{
+  "name": "tcl-me-remo",
+  "author": "tcl-me-remo contributors",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["tv", "bluetooth", "remote", "root"],
+    "description": "Turn a TCL Google TV on and off and switch its input from SteamOS over Bluetooth.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/PluginLoader"
+  }
+}

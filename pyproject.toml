@@ -1,0 +1,34 @@
+[project]
+name = "tcl-me-remo"
+version = "0.1.0"
+description = "Let a SteamOS machine drive a TCL Google TV as a Bluetooth remote"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["py_modules"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["py_modules/tcl_me_remo/_vendor", "node_modules", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = [
+    "UP035", "UP006", "UP007",
+    "ASYNC109",  # "timeout" parameters are part of this project's API on purpose
+]
+
+[tool.ruff.lint.per-file-ignores]
+# D-Bus interface definitions annotate methods with D-Bus signature strings ("a{sv}", "ay"),
+# which are not Python forward references.
+# UP037 would "fix" them by removing the quotes, which breaks the interface definition.
+"py_modules/tcl_me_remo/bluez/*.py" = ["F722", "F821", "UP037"]
+"tests/*.py" = ["F722", "F821", "UP037"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tcl_me_remo"]
