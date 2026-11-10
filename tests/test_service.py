@@ -1691,7 +1691,9 @@ async def test_a_power_key_stuck_behind_a_held_key_is_neither_sent_nor_tried_aga
     h.remote.state.connected = h.remote.state.ready = True
     held = asyncio.create_task(h.service.send_key("OK", 5.0))
     await asyncio.wait_for(h.remote.holding.wait(), 10)
-    down = asyncio.create_task(h.service.handle_event("suspend", budget=1.0))
+    # The time has to end with the power key behind the lock, so the 0.2 s wait for the cut
+    # key must be over well before it does: 3.5 s leaves a busy machine more than 3 s for that.
+    down = asyncio.create_task(h.service.handle_event("suspend", budget=3.5))
     finished, _ = await asyncio.wait({down}, timeout=15)
     try:
         assert finished, "the down event is still waiting for the held key"

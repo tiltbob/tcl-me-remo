@@ -3,6 +3,7 @@ import contextlib
 import gc
 import json
 import logging
+import time
 
 import pytest
 from fake_logind import FakeLogind, eventually
@@ -32,6 +33,7 @@ class Rig:
         self.uptime = 30.0
         self.kind = None
         self.kind_asked = 0  # how often the service asked whether the system is going down
+        self.kind_asked_at = []  # and when (time.monotonic())
         self.daemon = None
         self.task = None
         self.options = {}  # further Daemon(...) arguments
@@ -52,6 +54,9 @@ class Rig:
 
         async def shutdown_kind():
             self.kind_asked += 1
+            self.kind_asked_at.append(time.monotonic())
+            if isinstance(self.kind, Exception):  # systemd gave no answer
+                raise self.kind
             return self.kind
 
         self.daemon = Daemon(
@@ -407,13 +412,99 @@ async def test_a_shutdown_that_is_merely_slow_is_not_taken_for_one_that_did_not_
     resumes = rig.remote.resumes
 
     # The watchdog comes to the point where it would give the down event up, asks, and
-    # leaves it alone.  And again one such period later.
-    await eventually(lambda: rig.kind_asked >= 2, timeout=10)
+    # leaves it alone.  And again one such period later: not at its next round, which would
+    # start two systemctl processes every two seconds for as long as the stop job hangs.
+    await eventually(lambda: rig.kind_asked >= 3, timeout=20)
     assert service.phase == Phase.DOWN and rig.remote.resumes == resumes
     assert rig.remote.key_names() == [off_key]
+    asked_at = list(rig.kind_asked_at)
+    gaps = [later - earlier for earlier, later in zip(asked_at, asked_at[1:], strict=False)]
+    assert min(gaps) >= service_module.STALE_DOWN_SECONDS, gaps  # a round of the watchdog is 0.05 s here
 
     assert await rig.stop() == 0  # the stop signal: the second report of the same shutdown
     assert rig.remote.key_names() == [off_key]
+
+
+async def test_silence_from_systemd_is_not_taken_for_a_machine_that_stayed_up(rig, monkeypatch):
+    """The same slow shutdown, with a systemd that does not answer when the watchdog asks
+    (systemctl ran into its time-out).  Silence used to count as "not shutting down": the
+    down event was called off, and the stop signal sent the toggle a second time."""
+    monkeypatch.setattr(service_module, "STALE_DOWN_SECONDS", 0.5)
+    cfg, _ = C.load(rig.config_path)
+    C.save(C.apply_patch(cfg, {"power": {"off_key": "POWER"}}), rig.config_path)
+    rig.uptime = 5000.0
+    await rig.start()
+    service = rig.daemon.service
+    rig.remote.state.connected = rig.remote.state.ready = True
+    rig.kind = daemon_module.NoAnswer("systemctl is-system-running gave no answer")
+    rig.logind.prepare_for_shutdown(True, "power-off")
+    await eventually(lambda: rig.remote.key_names() == ["POWER"] and service.phase == Phase.DOWN, timeout=10)
+    resumes = rig.remote.resumes
+
+    await eventually(lambda: rig.kind_asked >= 3 or service.phase != Phase.DOWN, timeout=20)
+    assert service.phase == Phase.DOWN and rig.remote.resumes == resumes  # left alone, and asked again
+    asked_at = list(rig.kind_asked_at)  # a full period later each time, not at the watchdog's next round
+    gaps = [later - earlier for earlier, later in zip(asked_at, asked_at[1:], strict=False)]
+    assert min(gaps) >= service_module.STALE_DOWN_SECONDS, gaps
+
+    rig.kind = "shutdown"  # by the time of the stop signal systemd answers
+    assert await rig.stop() == 0
+    assert rig.remote.key_names() == ["POWER"]
+
+
+async def test_a_down_event_stands_for_as_long_as_systemd_is_silent_and_no_longer(rig, monkeypatch):
+    """The price of the rule above, on a machine that did stay up: while systemd says nothing
+    the handled suspend keeps counting.  The first answer that the system is not shutting
+    down ends that, as before."""
+    monkeypatch.setattr(service_module, "STALE_DOWN_SECONDS", 0.5)
+    rig.uptime = 5000.0
+    await rig.start()
+    service = rig.daemon.service
+    rig.remote.state.connected = rig.remote.state.ready = True
+    rig.kind = daemon_module.NoAnswer("systemctl is-system-running gave no answer")
+    assert (await rig.call("event", {"name": "suspend"}))["ok"]  # by hand; no suspend follows
+    await eventually(lambda: rig.kind_asked >= 2 or service.phase != Phase.DOWN, timeout=10)
+    assert service.phase == Phase.DOWN and rig.remote.resumes == 0
+
+    rig.kind = None  # systemd answers: not shutting down
+    await eventually(lambda: service.phase == Phase.RUNNING, timeout=10)
+    assert rig.remote.resumes == 1
+    rig.logind.prepare_for_sleep(True)
+    await eventually(lambda: rig.remote.key_names() == ["SLEEP", "SLEEP"], timeout=10)
+
+
+async def test_a_stop_without_an_answer_from_systemd_is_a_plain_stop(rig):
+    # At stop time silence is still "the service is merely being stopped": nothing is sent.
+    rig.uptime = 5000.0
+    await rig.start()
+    rig.remote.state.connected = rig.remote.state.ready = True
+    rig.kind = daemon_module.NoAnswer("systemctl is-system-running gave no answer")
+    assert await rig.stop() == 0
+    assert rig.kind_asked == 1 and rig.remote.keys == []
+
+
+async def test_a_systemctl_that_gave_no_answer_is_told_from_one_that_said_no():
+    """``system.shutdown_kind`` returns None for both.  The service's own question does not."""
+    import inspect
+
+    def systemctl(state, jobs=(0, "")):
+        async def run(argv, timeout):
+            return state if "is-system-running" in argv else jobs
+
+        return run
+
+    ask = daemon_module.shutdown_kind
+    assert inspect.signature(Daemon).parameters["shutdown_kind"].default is ask
+    for silence in ((-1, ""), (-1, "\n")):  # could not be run, or given up on after its time-out
+        with pytest.raises(daemon_module.NoAnswer):
+            await ask(systemctl(silence))
+    assert await ask(systemctl((0, "running\n"))) is None
+    assert await ask(systemctl((1, "degraded\n"))) is None
+    assert await ask(systemctl((1, "stopping\n"), (0, "7 reboot.target start waiting\n"))) == "reboot"
+    assert await ask(systemctl((1, "stopping\n"), (0, "7 poweroff.target start waiting\n"))) == "shutdown"
+    # Only the first question decides whether there is an answer: "stopping" without the job
+    # list is a shutdown of an unknown kind, as it was.
+    assert await ask(systemctl((1, "stopping\n"), (-1, ""))) == "shutdown"
 
 
 async def test_systemd_is_not_asked_about_a_down_event_that_is_not_old(rig):

@@ -951,13 +951,13 @@ def test_orphan_check_command_for_the_service(env):
 def test_the_time_budgets_fit_into_the_time_outs_of_the_units(tmp_path):
     """These numbers live in five files: the unit texts and HOOK_BUDGET (installer.py), the
     command's own wait (cli.py), the attempt and the tidy-up after it (service.py), the stop
-    budget (daemon.py) and the questions to systemd (system.py).  Here they are held against
-    each other, each read from where it is used."""
+    budget (daemon.py) and the questions to systemd (system.py, asked through daemon.py).
+    Here they are held against each other, each read from where it is used."""
     import asyncio
     import io
     import re
 
-    from tcl_me_remo import cli, daemon, system
+    from tcl_me_remo import cli, daemon
     from tcl_me_remo import service as service_module
 
     target = tmp_path / "opt" / "tcl-me-remo"
@@ -998,7 +998,7 @@ def test_the_time_budgets_fit_into_the_time_outs_of_the_units(tmp_path):
         asked.append(timeout)
         return 0, "stopping\n" if "is-system-running" in argv else ""
 
-    assert asyncio.run(system.shutdown_kind(run)) == "shutdown" and len(asked) == 2
+    assert asyncio.run(daemon.shutdown_kind(run)) == "shutdown" and len(asked) == 2  # the service's question
     rest_of_the_way_out = 5.0
     stop_path = sum(asked) + daemon.STOP_BUDGET + service_module.DISCONNECT_SECONDS
     assert stop_path + rest_of_the_way_out <= seconds(SERVICE, "TimeoutStopSec")

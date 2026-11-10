@@ -48,6 +48,28 @@ def system_uptime() -> float:
         return 0.0
 
 
+class NoAnswer(RuntimeError):
+    """systemd was asked whether the system is going down, and did not say."""
+
+
+async def shutdown_kind(run: system.Runner | None = None) -> str | None:
+    """``system.shutdown_kind``, except that silence is not an answer.
+
+    A ``systemctl is-system-running`` that could not be run, or was given up on after its
+    time-out, comes back as ``(-1, "")``, which ``system.shutdown_kind`` cannot tell from
+    "not stopping".  Here it raises ``NoAnswer``.  At stop time that makes no difference
+    (``Daemon._going_down``); to the watchdog it does.
+    """
+
+    async def asking(argv: list[str], timeout: float) -> tuple[int, str]:
+        code, output = await (run or system.run_command)(argv, timeout)
+        if code == -1 and not output.strip() and "is-system-running" in argv:
+            raise NoAnswer("systemctl is-system-running gave no answer")
+        return code, output
+
+    return await system.shutdown_kind(asking)
+
+
 async def _default_remote(bus: Any, cfg: config.Config) -> Remote:
     from .bluez import BleRemote
 
@@ -72,7 +94,7 @@ class Daemon:
         make_remote: RemoteFactory = _default_remote,
         make_wifi: WifiFactory = _default_wifi,
         uptime: Callable[[], float] = system_uptime,
-        shutdown_kind: Callable[[], Awaitable[str | None]] = system.shutdown_kind,
+        shutdown_kind: Callable[[], Awaitable[str | None]] = shutdown_kind,
         watchdog_interval: float = WATCHDOG_INTERVAL,
         run_command: system.Runner = system.run_command,
         orphan_check_delay: float = installer.ORPHAN_CHECK_DELAY,
@@ -294,9 +316,16 @@ class Daemon:
                 # time, and only now: not on every tick.
                 try:
                     going_down = await self._shutdown_kind() is not None
-                except Exception:  # noqa: BLE001 - as in _going_down: no answer is "not shutting down"
-                    log.debug("could not determine whether the system is going down", exc_info=True)
-                    going_down = False
+                except Exception as exc:  # noqa: BLE001 - whatever went wrong, there is no answer
+                    # Unlike in _going_down, no answer is not "not shutting down" here.  The
+                    # down event is called off only on systemd's word that the system is not
+                    # stopping; until then it stands, and the question is put again a full
+                    # period later.  The price: with a systemd that never answers, a machine
+                    # that did stay up keeps taking the next suspend for a duplicate, until a
+                    # resume.  The other way round one missed answer during a slow shutdown
+                    # was enough for the second off key.
+                    log.info("systemd did not say whether the system is going down (%s): asking again later", exc)
+                    going_down = True
                 if going_down:
                     self.service.down_event_stands()
                 else:

@@ -68,7 +68,8 @@ WIFI_AFTER_BLE_SECONDS = 1.5
 # the kernel freezes us (or systemd stops us) there are at most other inhibitors (5 s), the
 # sleep hook (10 s) and the kernel's own freeze time-out (20 s); two minutes is well clear
 # of that.  A shutdown has no such limit (a stop job ahead of ours can hang for longer), so
-# the daemon asks systemd whether the system is stopping before it lets the rule act.
+# the daemon asks systemd whether the system is stopping before it lets the rule act, and
+# lets it act only on the answer that it is not (Daemon._watchdog).
 STALE_DOWN_SECONDS = 120.0
 # Pause after the last key of a down action: the kernel drops every Bluetooth link as part
 # of suspend, so the key-up report must be on the air before the suspend lock is released.
@@ -248,7 +249,8 @@ class Service:
         return (time.monotonic() if now is None else now) - self._down_since >= STALE_DOWN_SECONDS
 
     def down_event_stands(self) -> None:
-        """The machine is still on its way down, only slowly: look again STALE_DOWN_SECONDS from now."""
+        """The machine is still on its way down, only slowly, or systemd would not say whether
+        it is: look again STALE_DOWN_SECONDS from now."""
         if self.phase == Phase.DOWN:
             self._down_since = time.monotonic()
 

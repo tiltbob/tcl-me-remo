@@ -147,10 +147,11 @@ toggle would turn the TV back on.
 
 A down event is taken to be followed by the machine going down. If the service is still
 running two minutes after it handled one, and the clocks show no sleep, it asks systemd
-whether the system is shutting down. If it is (a shutdown that is merely slow), nothing
-changes and the question is put again two minutes later. If it is not, the service
-concludes that the machine stayed up and counts the next suspend or shutdown as a new one;
-should the resume of that suspend still be reported after all, it is handled as a wake.
+whether the system is shutting down. If it is (a shutdown that is merely slow), or if
+systemd gives no answer, nothing changes and the question is put again two minutes later.
+If it is not, the service concludes that the machine stayed up and counts the next suspend
+or shutdown as a new one; should the resume of that suspend still be reported after all, it
+is handled as a wake.
 
 A handheld that wakes on the sofa must not turn the TV on. The **display check** looks at the
 kernel's display connectors: with a built-in panel (eDP, DSI, LVDS), TV actions run only

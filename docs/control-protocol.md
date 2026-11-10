@@ -94,8 +94,10 @@ Without `simulate`, `event` is for the systemd units: it tells the service that 
 *is* booting, waking, suspending or going down, and the service believes it. After a
 `suspend`, `shutdown` or `reboot` it considers the machine down: further down events are
 duplicates and are skipped, until a `resume` arrives, the clocks show that the machine
-slept, or two minutes have passed with the service still running (it then concludes that
-the machine stayed up). A real suspend inside those two minutes would leave the TV on.
+slept, or two minutes have passed with the service still running and systemd saying that
+no shutdown is under way (it then concludes that the machine stayed up; while systemd says
+the system is stopping, or gives no answer, the down event stands). A real suspend inside
+those two minutes would leave the TV on.
 
 `budget` (seconds, more than 0 and at most 120) limits the attempt to turn the TV off on a
 down event; closing the Bluetooth link afterwards takes up to half a second more. Without
