@@ -107,14 +107,15 @@ class Daemon:
             log.error("cannot connect to the system D-Bus: %s", exc)
             return 1
 
-        remote = server = None
+        remote = server = wifi = None
         hooked: list[int] = []
         try:
             remote = await self._make_remote(bus, cfg)
+            wifi = self._make_wifi(cfg)
             service = Service(
                 cfg,
                 remote=remote,
-                wifi=self._make_wifi(cfg),
+                wifi=wifi,
                 save_config=lambda new_cfg: config.save(new_cfg, cfg_path),
                 on_config_changed=lambda new_cfg: logsetup.set_level(new_cfg.log_level),
                 recent_logs=ring.tail,
@@ -169,6 +170,12 @@ class Daemon:
                 await self.logind.stop()
             if server is not None:
                 await server.stop()
+            if wifi is not None and hasattr(wifi, "close"):
+                try:
+                    # Drops a pairing connection that is still waiting for the code on the TV.
+                    await wifi.close()  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 - shutting down regardless
+                    log.debug("wifi.close() failed", exc_info=True)
             if remote is not None and hasattr(remote, "stop"):
                 try:
                     await remote.stop()  # type: ignore[attr-defined]

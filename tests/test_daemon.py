@@ -23,6 +23,7 @@ class Rig:
         monkeypatch.delenv("TCL_ME_REMO_SOCKET", raising=False)
         monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
         self.remote = FakeRemote()
+        self.wifi = None
         self.uptime = 30.0
         self.kind = None
         self.daemon = None
@@ -46,7 +47,7 @@ class Rig:
 
         self.daemon = Daemon(
             make_remote=make_remote,
-            make_wifi=lambda _cfg: None,
+            make_wifi=lambda _cfg: self.wifi,
             uptime=lambda: self.uptime,
             shutdown_kind=shutdown_kind,
             watchdog_interval=0.05,
@@ -184,6 +185,37 @@ async def test_settings_are_persisted_and_pairing_callback_is_wired(rig):
     assert json.loads(rig.config_path.read_text())["bluetooth"]["tv_name"] == "Den TV"
     logs = (await rig.call("logs", {"lines": 50}))["lines"]
     assert any("starting" in line for line in logs)
+
+
+async def test_stopping_closes_the_wifi_assist(rig):
+    class Assist:
+        closed = 0
+
+        def status(self):
+            return {"available": True, "paired": False, "pairing": True}
+
+        async def close(self):
+            self.closed += 1
+
+    rig.wifi = Assist()
+    await rig.start()
+    assert (await rig.call("status"))["wifi"]["pairing"] is True
+    assert await rig.stop() == 0
+    assert rig.wifi.closed == 1  # a pairing still waiting for its code does not outlive the service
+
+
+async def test_an_assist_that_fails_to_close_does_not_keep_the_service_from_stopping(rig):
+    class Assist:
+        def status(self):
+            return {"available": True, "paired": False, "pairing": False}
+
+        async def close(self):
+            raise RuntimeError("socket already gone")
+
+    rig.wifi = Assist()
+    await rig.start()
+    assert await rig.stop() == 0
+    assert not rig.socket_path.exists()  # the rest of the shutdown still ran
 
 
 async def test_damaged_config_still_starts(rig):
