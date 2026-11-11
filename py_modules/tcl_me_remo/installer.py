@@ -54,6 +54,12 @@ PLUGIN_NAME = "tcl-me-remo"
 # Files of the installer's own in the state directory:
 #   the note the plugin's uninstall hook leaves (main.py writes it: {"plugins_dir", "time"}),
 REMOVED_MARKER = "plugin-removed.json"
+#   where Decky keeps the plugin that installed the service ({"plugins_dir"}); absent when
+#   the service was installed another way (install.sh).  Decky runs the uninstall hook only
+#   in a plugin that is loaded, so a plugin that was disabled when it was uninstalled
+#   leaves no note, and this is what tells the service that it was put there by a plugin,
+#   and where to look for it,
+PLUGIN_RECORD = "installed-by-plugin.json"
 #   and the links to the command that were made, so that uninstall removes exactly those.
 LINKS_RECORD = "command-links.json"
 # In the install directory: the boot in which code or units were replaced and the moment
@@ -65,6 +71,10 @@ RESTART_PENDING = "RESTART-PENDING"
 # waits before it looks for a note that a reboot left unanswered.
 ORPHAN_CHECK_DELAY = 180
 ORPHAN_MIN_AGE = 120
+# Seconds of running between the service's later looks at the same question.  Without them a
+# machine that is only ever suspended would go on for weeks with a service whose plugin is
+# gone and left no timer behind.
+ORPHAN_RECHECK = 3600
 # Decky unpacks a plugin folder by folder: a plugins directory that changed within this many
 # seconds may be in the middle of that, and what is missing from it proves nothing yet.
 PLUGINS_SETTLE = 60
@@ -562,6 +572,14 @@ def _remove_links(layout: Layout, log: list[str]) -> None:
         pass
 
 
+# Where to read why the service does not start.  These messages are shown in the Decky panel
+# and printed by install.sh, so they name the way that needs no terminal first.
+LOG_HINT = "the Diagnostics page of the Decky panel shows it, or run: journalctl -b -u tcl-me-remo"
+# How to remove a Bluetooth bond that neither the service nor this installer could remove;
+# the TV's address follows.  (Whether SteamOS lists the TV there has not been observed.)
+BOND_HINT = "forget it in SteamOS's Bluetooth settings if it is listed there, or run: bluetoothctl remove"
+
+
 def _start_trouble(run: Run) -> str:
     """For a unit that "is-active" calls "activating": what is wrong if it is not simply starting.
 
@@ -579,10 +597,10 @@ def _start_trouble(run: Run) -> str:
     if failures >= 2:
         return (
             f"the service keeps failing (systemd has had to start it again {failures} times);"
-            " to see why: journalctl -b -u tcl-me-remo"
+            f" its log says why ({LOG_HINT})"
         )
     if failures:
-        return "the service failed and systemd is starting it again; if this goes on, see: journalctl -b -u tcl-me-remo"
+        return f"the service failed and systemd is starting it again; if this goes on, read its log ({LOG_HINT})"
     return ""
 
 
@@ -644,9 +662,16 @@ def install(
     *,
     source: Path | None = None,
     user_home: Path | None = None,
+    plugins_dir: Path | None = None,
     start: bool = True,
 ) -> dict[str, Any]:
-    """Install or update.  Idempotent; restarts the service only if something changed."""
+    """Install or update.  Idempotent; restarts the service only if something changed.
+
+    ``plugins_dir`` is given by the Decky plugin: the folder Decky keeps its plugins in.  It
+    is recorded, and the service then removes itself when no plugin of ours is in that
+    folder any more (see ``uninstall_if_orphaned``).  An install without it (install.sh)
+    removes the record: that service is wanted for its own sake.
+    """
     layout = layout or Layout()
     source = source or source_root()
     log: list[str] = []
@@ -676,6 +701,7 @@ def install(
         os.chmod(layout.state_dir, 0o755)
     except OSError as exc:
         raise InstallError(f"could not create {layout.state_dir}: {exc}") from None
+    _record_plugin(layout, plugins_dir, notes)
 
     units_changed = False
     try:
@@ -717,9 +743,7 @@ def install(
         if verb:
             code, out = run(["systemctl", verb, SERVICE], 60.0)
             if code != 0:
-                raise InstallError(
-                    f"the service did not start: {out.strip() or 'see journalctl -u tcl-me-remo'}"
-                )
+                raise InstallError(f"the service did not start: {out.strip() or f'read its log ({LOG_HINT})'}")
             if verb == "restart" and running and not (code_changed or units_changed):
                 restarted = True
                 log.append("service restarted to finish an earlier update")
@@ -781,6 +805,31 @@ def _clear_removed_marker(layout: Layout) -> None:
         pass
 
 
+def _record_plugin(layout: Layout, plugins_dir: Path | None, notes: list[str]) -> None:
+    """Note which plugins folder the installing Decky plugin is in, or that there is none."""
+    path = layout.state_dir / PLUGIN_RECORD
+    if plugins_dir is None or not plugins_dir.is_absolute():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    try:
+        _write_if_changed(path, json.dumps({"plugins_dir": str(plugins_dir)}) + "\n", 0o644)
+    except OSError as exc:
+        notes.append(f"could not write {path}: {exc}")
+
+
+def _recorded_plugins_dir(state_dir: Path) -> Path | None:
+    """Decky's plugins folder, if the service was installed by the plugin; None if not (or not known)."""
+    try:
+        data = json.loads((state_dir / PLUGIN_RECORD).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    where = data.get("plugins_dir") if isinstance(data, dict) else None
+    return Path(where) if isinstance(where, str) and os.path.isabs(where) else None
+
+
 def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bool = False) -> dict[str, Any]:
     """Remove the service.  Settings and the TV pairing are kept unless ``purge`` is set."""
     layout = layout or Layout()
@@ -823,12 +872,12 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
                 # The service has reported the pairing removed; this was only to make sure.
                 log.append(
                     f"could not check that no Bluetooth pairing with {address} is left;"
-                    f" if pairing that TV fails later, run: bluetoothctl remove {address}"
+                    f" if pairing that TV fails later, {BOND_HINT} {address}"
                 )
             else:
                 log.append(
                     f"could not remove the Bluetooth pairing with {address};"
-                    f" before pairing that TV again, run: bluetoothctl remove {address}"
+                    f" before pairing that TV again, {BOND_HINT} {address}"
                 )
     _remove_links(layout, log)
     for candidate in layout.install_dirs:
@@ -842,11 +891,16 @@ def uninstall(layout: Layout | None = None, run: Run = run_command, *, purge: bo
                 continue
             log.append(f"could not remove {path}" if os.path.lexists(path) else f"removed {path}")
     _clear_removed_marker(layout)
+    _record_plugin(layout, None, [])
     if purge and layout.state_dir.exists():
         shutil.rmtree(layout.state_dir, ignore_errors=True)
         log.append(f"removed settings and state in {layout.state_dir}")
     elif layout.state_dir.exists():
-        log.append(f"kept settings in {layout.state_dir} (use --purge to remove them)")
+        # Shown in the Decky panel after its Remove, and printed by the command line.
+        log.append(
+            f"kept settings in {layout.state_dir} (to delete them too: Remove with 'Also delete settings and the"
+            " pairing' in the Decky panel, or uninstall --purge)"
+        )
     if not log:
         log.append("nothing was installed")
     return {"log": log}
@@ -959,38 +1013,51 @@ def uninstall_if_orphaned(
     Decky calls a plugin's uninstall hook for updates as well as real removals, so the hook
     cannot remove the service itself.  It leaves a note in the state directory and this check
     runs a little later: from a timer the hook sets, and, because a reboot discards that
-    timer, again some minutes after each start of the service for as long as the note is
-    there.  Any install removes the note.
+    timer, again from the running service for as long as the note is there.  Any install
+    removes the note.
 
-    Without ``plugins_dir`` the note decides where to look, and without a note nothing
-    happens.  (The hook passes the directory only when it could not write the note.)  The
-    service is removed only when the plugins directory is there and holds no plugin of ours;
-    when that cannot be told, the note stays for the next check.
+    Decky does not run the hook at all in a plugin that is not loaded (one the user disabled
+    before uninstalling it), so there may be no note.  For that, an install by the plugin
+    records Decky's plugins folder, and the service starts this check when it finds no
+    plugin of ours there (``orphan_check_command``).
+
+    Without ``plugins_dir`` the note decides where to look, then that record; with neither,
+    nothing happens.  (The hook passes the directory only when it could not write the note.)
+    The service is removed only when the plugins directory is there, was not changed a
+    moment ago and holds no plugin of ours; when that cannot be told, nothing is removed and
+    the question is asked again later.
     """
     layout = layout or Layout()
     now = time.time() if now is None else now
     if plugins_dir is None:
         noted, marker = _removed_marker(layout)
-        if not noted:
-            return {"orphaned": False, "log": ["no removed plugin is on record; leaving the service alone"]}
-        if marker is None:
-            # Kept, it would have the service start this check after every start, for nothing.
+        recorded = _recorded_plugins_dir(layout.state_dir)
+        if noted and marker is None:
+            # Kept, it would have the service start this check again and again, for nothing.
             _clear_removed_marker(layout)
-            return {
-                "orphaned": None,
-                "log": [
-                    f"the note that the plugin was removed ({layout.state_dir / REMOVED_MARKER}) cannot be"
-                    " read; discarding it and leaving the service alone (if the plugin is gone, remove the"
-                    " service with: tcl-me-remo uninstall)"
-                ],
-            }
-        written = marker.get("time")
-        age = now - (written if isinstance(written, (int, float)) else 0)
-        if 0 <= age < ORPHAN_MIN_AGE:
-            # Decky may be in the middle of an update: the old folder is gone, the new one
-            # not there yet.  The timer set together with this note comes back later.
-            return {"orphaned": None, "log": ["the plugin was removed moments ago; a later check decides"]}
-        plugins_dir = Path(marker["plugins_dir"])
+            if recorded is None:
+                return {
+                    "orphaned": None,
+                    "log": [
+                        f"the note that the plugin was removed ({layout.state_dir / REMOVED_MARKER}) cannot be"
+                        " read; discarding it and leaving the service alone (if the plugin is gone, the service"
+                        " stays: install the plugin once more and use Remove on its Diagnostics page, or run:"
+                        " tcl-me-remo uninstall)"
+                    ],
+                }
+            noted = False  # what the install recorded still says where to look
+        if noted and marker is not None:
+            written = marker.get("time")
+            age = now - (written if isinstance(written, (int, float)) else 0)
+            if 0 <= age < ORPHAN_MIN_AGE:
+                # Decky may be in the middle of an update: the old folder is gone, the new one
+                # not there yet.  The timer set together with this note comes back later.
+                return {"orphaned": None, "log": ["the plugin was removed moments ago; a later check decides"]}
+            plugins_dir = Path(marker["plugins_dir"])
+        elif recorded is not None:
+            plugins_dir = recorded
+        else:
+            return {"orphaned": False, "log": ["no removed plugin is on record; leaving the service alone"]}
     present, why = _look_for_plugin(plugins_dir, now)
     if present is None:
         return {
@@ -1010,15 +1077,20 @@ def self_command(*args: str) -> list[str]:
     return [sys.executable, "-I", "-c", INSTALLER_SNIPPET, str(modules), *args]
 
 
-def orphan_check_command(state_dir: Path) -> list[str] | None:
-    """What the running service starts when the plugin left a note that it was removed.
+def orphan_check_command(state_dir: Path, *, now: float | None = None) -> list[str] | None:
+    """What the running service starts when the plugin that installed it may be gone.
 
-    None if there is no note.  The check may end in removing the service, so it must not be
-    a child of the service (stopping the unit would kill it half-way): systemd-run starts it
-    as a unit of its own.
+    That is when the plugin left a note that it was removed, or when the service was
+    installed by the plugin and Decky's plugins folder holds no plugin of ours (settled:
+    not while Decky may be unpacking one).  None otherwise, which is the usual answer and
+    costs a look into one folder.  The check may end in removing the service, so it must
+    not be a child of the service (stopping the unit would kill it half-way): systemd-run
+    starts it as a unit of its own, and it decides for itself once more.
     """
     if not (state_dir / REMOVED_MARKER).is_file():
-        return None
+        recorded = _recorded_plugins_dir(state_dir)
+        if recorded is None or _look_for_plugin(recorded, time.time() if now is None else now)[0] is not False:
+            return None
     return ["systemd-run", *ORPHAN_CHECK_OPTIONS, *self_command("uninstall-if-orphaned")]
 
 
@@ -1078,6 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("install", help="install or update the service and start it")
     p.add_argument("--user-home", type=Path, help="also link the command into this user's ~/.local/bin")
+    p.add_argument("--plugins-dir", type=Path, help=argparse.SUPPRESS)  # the Decky plugin: where Decky keeps it
     p = sub.add_parser("uninstall", help="stop and remove the service")
     p.add_argument("--purge", action="store_true", help="also delete settings and state")
     sub.add_parser("status", help="show what is installed")
@@ -1096,7 +1169,7 @@ def main(argv: list[str] | None = None) -> int:
         return emit({"error": message}, 1)
     try:
         if args.command == "install":
-            result = install(source=args.source, user_home=args.user_home)
+            result = install(source=args.source, user_home=args.user_home, plugins_dir=args.plugins_dir)
         elif args.command == "uninstall":
             result = uninstall(purge=args.purge)
         elif args.command == "uninstall-if-orphaned":

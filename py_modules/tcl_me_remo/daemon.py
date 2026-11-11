@@ -98,6 +98,7 @@ class Daemon:
         watchdog_interval: float = WATCHDOG_INTERVAL,
         run_command: system.Runner = system.run_command,
         orphan_check_delay: float = installer.ORPHAN_CHECK_DELAY,
+        orphan_recheck: float = installer.ORPHAN_RECHECK,
     ):
         self._make_remote = make_remote
         self._make_wifi = make_wifi
@@ -106,6 +107,7 @@ class Daemon:
         self._watchdog_interval = watchdog_interval
         self._run_command = run_command
         self._orphan_check_delay = orphan_check_delay
+        self._orphan_recheck = orphan_recheck
         self._stop = asyncio.Event()
         self._bus_lost = False
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -332,20 +334,34 @@ class Daemon:
                     self.service.check_still_up()
 
     async def _orphan_check(self) -> None:
-        """Some minutes after start-up: was the Decky plugin removed while nobody checked?
+        """Some minutes after start-up, and then every hour: is the Decky plugin gone?
 
         The plugin's uninstall hook leaves a note and sets a timer for the check, and a
-        reboot discards the timer.  If the note is (still) there, the installer is started
+        reboot discards the timer.  Decky does not run the hook at all in a plugin that was
+        disabled, so a service the plugin installed also looks into Decky's plugins folder
+        itself.  If the note is (still) there, or the plugin is not, the installer is started
         outside this service to decide; see ``installer.uninstall_if_orphaned``.
         """
-        await asyncio.sleep(self._orphan_check_delay)
-        argv = installer.orphan_check_command(paths.state_dir())
-        if argv is None:
-            return
-        log.info("the Decky plugin left a note that it was removed; checking whether it is gone for good")
-        code, _ = await self._run_command(argv, 15.0)
-        if code != 0:
-            log.warning("could not start that check (systemd-run failed); it is made again after the next start")
+        delay = self._orphan_check_delay
+        told = False
+        while True:
+            await asyncio.sleep(delay)
+            delay = self._orphan_recheck
+            # In a thread: it reads a folder in the user's home, which must not be able to
+            # hold up the service.
+            argv = await asyncio.to_thread(installer.orphan_check_command, paths.state_dir())
+            if argv is None:
+                continue
+            # Said once: a question that cannot be answered (the folder is not there) is
+            # asked again every hour.
+            log.log(
+                logging.DEBUG if told else logging.INFO,
+                "the Decky plugin that installed this service may have been removed; checking whether it is gone",
+            )
+            told = True
+            code, _ = await self._run_command(argv, 15.0)
+            if code != 0:
+                log.warning("could not start that check (systemd-run failed); it is made again later")
 
 
 def main() -> int:

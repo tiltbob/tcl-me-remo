@@ -6,13 +6,15 @@
 
 import { callable } from "@decky/api";
 
-import type { InstallResult, RpcReply, ServiceInfo } from "./types";
+import type { DoctorReport, InstallResult, RpcReply, ServiceInfo } from "./types";
 
 const callRpc = callable<[method: string, params: Record<string, unknown>], unknown>("rpc");
 const callServiceInfo = callable<[], unknown>("service_info");
 const callInstallService = callable<[], unknown>("install_service");
 const callRemoveService = callable<[purge: boolean], unknown>("remove_service");
 const callRestartService = callable<[], unknown>("restart_service");
+const callDoctor = callable<[], unknown>("doctor");
+const callServiceLog = callable<[lines: number], unknown>("service_log");
 
 // Safety nets only. main.py gives up first (its TIMEOUTS table: 240 s at most for the slow
 // methods, 45 s or less for the rest); these fire when the backend itself has gone away.
@@ -24,6 +26,8 @@ const STATUS_SECONDS = 20;
 // installs the service in the background when the plugin loads; up to 120 s) and then run
 // their own (up to another 120 s).
 const INSTALLER_SECONDS = 260;
+// The doctor asks a dozen system tools, each with its own time limit; main.py gives it 75 s.
+const DOCTOR_SECONDS = 90;
 
 export function failure(code: string, message: string): RpcReply<never> {
   return { ok: false, error: { code, message } };
@@ -115,4 +119,38 @@ export function removeService(purge: boolean): Promise<RpcReply<{ log?: string[]
 
 export function restartService(): Promise<RpcReply<Record<string, never>>> {
   return settle<Record<string, never>>("restart_service", 90, callRestartService);
+}
+
+/** The report of "tcl-me-remo doctor". Read-only; works when the service itself does not. */
+export function doctor(): Promise<RpcReply<DoctorReport>> {
+  return settle<DoctorReport>("doctor", DOCTOR_SECONDS, callDoctor, (value) => {
+    const reply = asReply<DoctorReport>(value);
+    if (!reply.ok) return reply;
+    const result: unknown = reply.result;
+    if (!isObject(result) || !Array.isArray(result.checks)) {
+      return failure("bad_reply", "the plugin backend sent an unreadable report");
+    }
+    const lines = (list: unknown) => (Array.isArray(list) ? list.map(String) : []);
+    return {
+      ok: true,
+      result: {
+        worst: String(result.worst ?? "unknown") as DoctorReport["worst"],
+        system: lines(result.system),
+        checks: result.checks.filter(isObject).map((check) => ({
+          name: String(check.name ?? ""),
+          status: String(check.status ?? "unknown") as DoctorReport["worst"],
+          detail: String(check.detail ?? ""),
+        })),
+        details: lines(result.details),
+      },
+    };
+  });
+}
+
+/**
+ * The service's lines in the system journal, oldest first. For when the service does not
+ * answer; while it does, its own "logs" request is the better source.
+ */
+export function serviceLog(lines: number): Promise<RpcReply<{ lines: string[] }>> {
+  return settle<{ lines: string[] }>("service_log", NORMAL_SECONDS, () => callServiceLog(lines));
 }

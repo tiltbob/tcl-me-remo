@@ -504,23 +504,85 @@ tcl-me-remo config bluetooth.wake_beacon custom
 
 Then repeat T4 and record the result.
 
-## T12. The plugin in Game Mode, and removal
+## T12. The plugin in Game Mode: install, update, removal
 
 Nothing of the Decky plugin has run inside Steam; only a browser preview of its screens
-exists. Record each step:
+exists. The README promises that a person needs no terminal for any of this, so do every
+step in Game Mode with a controller, and use the terminal only to look at what happened
+(the commands in brackets). Record each step, and every place where the README's wording
+does not match what Decky shows.
 
-1. Build the ZIP (`python3 scripts/build_zip.py`) and install it through Decky's developer
-   settings (*Install plugin from ZIP file*). Does the panel appear, and does it install and
-   start the service by itself (the Setup page says so; `systemctl is-active tcl-me-remo`)?
-2. Walk through every page of the settings and the Quick Access panel. Note anything that
+1. **Install from the address.** Follow the README's *Install* section to the letter: Decky
+   settings > General > *Developer mode*, then *Developer* > *Install Plugin from URL*, and
+   type
+
+   ```
+   github.com/tiltbob/tcl-me-remo/releases/latest/download/tcl-me-remo.zip
+   ```
+
+   Does Decky accept it without `https://`? What do its warning and its question say (the
+   README expects the question to read *Install tcl-me-remo*)? Does
+   the panel appear, and does it install and start the service by itself, without asking
+   for a password (the Setup page says so; `systemctl is-active tcl-me-remo`)?
+
+   To test a version that has no release (a branch), build the archive
+   (`python3 scripts/build_zip.py`) and use *Install Plugin from ZIP File* instead; say in
+   the results which of the two was used.
+2. **An install that fails.** Uninstall, then try three things and write down what Decky
+   really shows for each, and whether the next attempt with the right address works without
+   restarting anything. Going by Decky's source, the README says that none of them gives a
+   message:
+   - the address with a letter wrong in its last part: Decky's question then names that
+     wrong plugin (cancel there);
+   - the address with a letter wrong in the middle: Decky should return to its list of
+     plugins, without the plugin;
+   - the right address with the network off: nothing should be installed; does a dialog
+     stay open, and does **B** close it?
+
+   Repeat the last two with the plugin installed: the installed copy must still be there
+   and working afterwards.
+3. Walk through every page of the settings and the Quick Access panel. Note anything that
    does not fit the screen, cannot be reached with a controller, or shows an error.
-3. Pair, TV off, TV on from the panel (as T1 to T3, but with the buttons).
-4. Uninstall the plugin in Decky and leave the machine on. After about three minutes the
-   service should be gone (`systemctl status tcl-me-remo`, `ls /opt/tcl-me-remo`).
-5. Install it again, uninstall it, and restart the machine within a minute. A few minutes
+4. Pair, TV off, TV on from the panel (as T1 to T3, but with the buttons).
+5. **What replaces the terminal.** On the Diagnostics page: *Run check* must give the same
+   verdicts as `tcl-me-remo doctor` run with `sudo`. Then stop the service
+   (`sudo systemctl stop tcl-me-remo`) and open Diagnostics again: the *Log* section must
+   show the service's last lines from the system journal, *Run check* must name the stopped
+   service, and *Repair* must bring it back.
+6. **Update.** With the plugin installed and the TV paired, install again from the same
+   address. Decky must treat it as an update of the installed plugin (its progress screen
+   mentions uninstalling the previous copy) and the panel must come back. Settings and the
+   pairing must be unchanged, and with the same version the service must not have been
+   restarted (Diagnostics: *Running ... for* keeps counting). Leave the machine on for five
+   minutes: the service must still be there (`systemctl is-active tcl-me-remo`), and the
+   check that ran three minutes after the update should have logged that it left the
+   service alone (`journalctl -b | grep "leaving the service alone"`).
+   If a newer release exists than the one installed, also record that Diagnostics shows the
+   new version for the plugin and for the service afterwards, and what the TV needed after
+   the restart of the service that such an update brings (nothing, a moment, or pairing
+   again; see T6 for what a restart means to the TV).
+   Also record how typing the address went the second time: the panel shows it only on its
+   own Diagnostics page, which cannot be open beside Decky's.
+7. **Removal.** Uninstall the plugin in Decky (settings > Plugins > the … button >
+   Uninstall) and leave the machine on. After about three minutes the service should be
+   gone (`systemctl status tcl-me-remo`, `ls /opt/tcl-me-remo`).
+8. Install it again, uninstall it, and restart the machine within a minute. A few minutes
    after the restart the service should be gone as well.
-6. Install it once more, then `tcl-me-remo uninstall --purge`, install again and pair the
-   same TV. Pairing must work: the purge is meant to remove the Bluetooth bond too.
+9. **Disable, then uninstall.** Install it again. In Decky's list choose *Disable* for the
+   plugin: the panel goes, the service must keep running (`systemctl is-active
+   tcl-me-remo`) and the TV must still follow a suspend. Then *Uninstall* the disabled
+   plugin. Decky runs no uninstall hook in a disabled plugin, so no note is written
+   (`ls /var/lib/tcl-me-remo/plugin-removed.json` finds nothing); the service has to notice
+   by itself from `/var/lib/tcl-me-remo/installed-by-plugin.json`. It looks three minutes
+   after each of its starts and then hourly: either wait for the hour, or restart the
+   machine and wait five minutes. The service should then be gone
+   (`journalctl -b | grep "the plugin is gone"`). Also the other way round: *Disable*, wait
+   more than an hour, *Enable*: the service must have stayed all along.
+10. **Removal with the settings.** Install it once more and pair. On the Diagnostics page
+    choose *Remove* with *Also delete settings and the pairing* (the result must name the
+    next step, uninstalling the plugin in Decky), then uninstall the plugin.
+    Install again and pair the same TV. Pairing must work: the purge is meant to remove the
+    Bluetooth bond too. (`tcl-me-remo uninstall --purge` is the same from a terminal.)
 
 ## When a test fails
 

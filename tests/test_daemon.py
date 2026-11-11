@@ -3,6 +3,8 @@ import contextlib
 import gc
 import json
 import logging
+import os
+import shutil
 import time
 
 import pytest
@@ -566,8 +568,39 @@ async def test_a_removed_plugin_is_looked_into_some_time_after_start(rig):
     assert commands[0][0] == "systemd-run" and commands[0][-1] == "uninstall-if-orphaned"
     assert commands[0] == installer.orphan_check_command(state)
     await asyncio.sleep(0.25)
-    assert len(commands) == 1  # once per start
+    assert len(commands) == 1  # and not again for an hour
     assert rig.remote.keys == []  # and the TV is not involved
+
+
+async def test_a_plugin_that_vanished_without_a_note_is_looked_into_too(rig):
+    # Decky runs no uninstall hook in a plugin that was disabled.  A service the plugin
+    # installed knows Decky's plugins folder and looks there, after start and then hourly.
+    rig.uptime = 5000.0
+    commands = []
+
+    async def run_command(argv, timeout):
+        commands.append(argv)
+        return 0, ""
+
+    rig.options = {"run_command": run_command, "orphan_check_delay": 0.05, "orphan_recheck": 0.05}
+    state = rig.tmp_path / "state"
+    state.mkdir()
+    plugins = rig.tmp_path / "homebrew" / "plugins"
+    (plugins / "tcl-me-remo").mkdir(parents=True)
+    (plugins / "tcl-me-remo" / "plugin.json").write_text(json.dumps({"name": installer.PLUGIN_NAME}))
+    (state / installer.PLUGIN_RECORD).write_text(json.dumps({"plugins_dir": str(plugins)}))
+    await rig.start()
+    await asyncio.sleep(0.3)
+    assert commands == []  # the plugin is there: asked several times, nothing started
+    # "Disable" and "Uninstall" in Decky, while the service runs.
+    shutil.rmtree(plugins / "tcl-me-remo")
+    await asyncio.sleep(0.2)
+    assert commands == []  # the folder was changed a moment ago: Decky may be unpacking an update
+    long_ago = time.time() - 600
+    os.utime(plugins, (long_ago, long_ago))
+    await eventually(lambda: len(commands) >= 1)
+    assert commands[0][0] == "systemd-run" and commands[0][-1] == "uninstall-if-orphaned"
+    assert rig.remote.keys == []
 
 
 async def test_no_system_bus_is_a_clean_failure(tmp_path, monkeypatch):

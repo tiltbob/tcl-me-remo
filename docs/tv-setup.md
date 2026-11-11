@@ -37,7 +37,7 @@ Menu names differ between firmware versions; the 2025 models fold the first two 
 
 ## Pairing
 
-1. In the tcl-me-remo panel choose **Pair TV** (or run `tcl-me-remo pair`). Pairing mode
+1. In the tcl-me-remo panel choose **Pair TV** (it is on the Setup page too). Pairing mode
    stays open for two minutes.
 2. On the TV: **Settings > Remotes & Accessories > Pair accessory** (older firmware: *Add
    accessory*).
@@ -64,16 +64,20 @@ a pairing that got halfway can take a couple of seconds while the half-made bond
 
 ## Check that it works
 
-In the panel, or from a terminal:
+In the panel:
 
-```sh
-tcl-me-remo key HOME     # the TV should go to its home screen
-tcl-me-remo off          # the TV should turn off
-tcl-me-remo on           # ...and back on
-```
+1. On the **Remote** page press *Home*: the TV should go to its home screen.
+2. **TV off** in the Quick Access panel: the TV should turn off.
+3. **TV on**: ...and back on.
+4. On the **Setup** page, **Test sleep** and **Test wake** run exactly what a real suspend
+   and wake would run, without SteamOS going to sleep.
 
-Then let the TV sit in standby for an hour and try `tcl-me-remo on` again. Some sets change
+Then let the TV sit in standby for an hour and choose **TV on** again. Some sets change
 standby state a while after they are switched off.
+
+(From a terminal the same three are `tcl-me-remo key HOME`, `tcl-me-remo off` and
+`tcl-me-remo on`. Every step in this document has a command as well; the
+[README](../README.md#command-line) lists them. None is needed with the panel.)
 
 ## Wi-Fi assist (optional)
 
@@ -85,13 +89,17 @@ does not answer over Bluetooth.
 
 1. The TV and the machine must be on the same network. Give the TV a fixed address (a DHCP
    reservation in your router): the service keeps using the address you pair with.
-2. Find the TV: `tcl-me-remo wifi discover`, or *Search the network* on the Wi-Fi page of
-   the settings. If nothing is found, look the address up on the TV under Settings >
-   Network & Internet.
-3. Pair: `tcl-me-remo wifi pair 192.168.1.50` (your TV's address). The TV shows a code of
-   six characters; type it in. The TV has to be on for this.
-4. To switch inputs this way, choose the set of links that matches your TV
-   (`wifi.link_preset`) and, once it is shown to work, set `input.method` to `wifi`:
+2. Find the TV: on the **Wi-Fi assist** page of the panel's settings choose *Search the
+   network* and pick the TV. If nothing is found, look the address up on the TV under
+   Settings > Network & Internet and enter it under *TV address*.
+   (Terminal: `tcl-me-remo wifi discover`.)
+3. Pair: choose *Pair with this address*. The TV shows a code of six characters; type it
+   in. The TV has to be on for this. (Terminal: `tcl-me-remo wifi pair 192.168.1.50`, with
+   your TV's address.)
+4. To switch inputs this way, choose the set of links that matches your TV (on the same
+   page, under *Switching the input*; the setting is `wifi.link_preset`) and, once it is
+   shown to work, set *Switch the input* on the **Input** page to *Wi-Fi* (`input.method`
+   `wifi`):
 
    | Preset | For |
    |---|---|
@@ -100,20 +108,22 @@ does not answer over Bluetooth.
    | `tcl-realtek-alt` | reported for C635 |
    | `custom` | your own link in `wifi.app_link`, with `{port}` for the port number |
 
-   Try it first, while the TV shows some other input: `tcl-me-remo input --via wifi`, and
-   watch the TV: the service can only tell that the TV accepted the request, not that the
-   input changed. These links come from owners' reports of other models, not from tests on
-   your TV: if the first preset does nothing, try the next. Set `input.method` only once
-   one works.
+   Try it first, while the TV shows some other input: *Test: switch to HDMI … now* on the
+   Wi-Fi assist page (terminal: `tcl-me-remo input --via wifi`), and watch the TV: the
+   service can only tell that the TV accepted the request, not that the input changed.
+   These links come from owners' reports of other models, not from tests on your TV: if the
+   first preset does nothing, try the next. Change *Switch the input* only once one works.
 
    When the TV's network is not up in time after a wake, the request fails. The service
-   falls back to the Bluetooth key macro only if you turn on `input.wifi_fallback_to_macro`;
-   watch that macro work first ([macros](macros.md)), because it presses keys blindly.
+   falls back to the Bluetooth key macro only if you turn on *Fall back to the Bluetooth
+   macro* on the Input page (`input.wifi_fallback_to_macro`); watch that macro work first
+   ([macros](macros.md)), because it presses keys blindly.
 
 Pairing stores a key for this machine in `/var/lib/tcl-me-remo/atv` and remembers the TV's
 certificate; later connections are refused unless the TV presents the same one, so after a
-factory reset of the TV you pair again. `tcl-me-remo wifi unpair` deletes the key and the
-record, which is enough to stop the pairing being used. (This project knows of no screen in
+factory reset of the TV you pair again. *Unpair* on the Wi-Fi assist page (terminal:
+`tcl-me-remo wifi unpair`) deletes the key and the record, which is enough to stop the
+pairing being used. (This project knows of no screen in
 the TV's settings that lists paired network remotes.)
 
 Over Wi-Fi the TV can only be reached while its network is up, which in standby again
@@ -138,8 +148,8 @@ depends on *Screenless service* / the network standby mode.
 
 The service keeps calling the TV whenever the link is down, so that the link is ready when
 it is needed. If your TV turns its screen on because of that, turn off **Keep calling the
-TV** (`bluetooth.reconnect_on_drop`). The service then only calls the TV at the moment it
-has something to send.
+TV** on the Bluetooth page (`bluetooth.reconnect_on_drop`). The service then only calls the
+TV at the moment it has something to send.
 
 Note that on Android TVs any key from a remote wakes the screen. tcl-me-remo never sends keys
 on its own apart from the power keys and the input macro you configured.

@@ -272,3 +272,20 @@ export interface InstallResult extends Partial<ServiceInfo> {
   restarted?: boolean;
   log?: string[];
 }
+
+/** One line of the doctor's report (doctor.py). */
+export interface DoctorCheck {
+  name: string;
+  status: "ok" | "warn" | "fail" | "unknown";
+  detail: string;
+}
+
+/** What "tcl-me-remo doctor" prints, in the pieces the panel shows (doctor.panel_report). */
+export interface DoctorReport {
+  worst: DoctorCheck["status"];
+  /** What this is running on: versions of the service, SteamOS, kernel, BlueZ. */
+  system: string[];
+  checks: DoctorCheck[];
+  /** BlueZ settings in effect, paired Bluetooth devices, connected displays. */
+  details: string[];
+}

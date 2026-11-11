@@ -371,6 +371,66 @@ link; `tvdata.py` holds the link sets owners have reported.
 
 It only works while the TV's network is up: on, or in standby with Screenless service.
 
+## Installing, updating, removing
+
+The Decky plugin is the installer. Its backend (`main.py`) is started by Decky Loader as
+root, because `plugin.json` asks for that with the `root` flag, and Decky Loader itself runs
+as root; so the plugin can put a system service in place without anyone typing a password.
+Each time it loads it runs the bundled `installer.py` with the system's Python, which copies
+the code to `/opt/tcl-me-remo`, writes the two systemd units, and starts the service or, if
+the code changed, restarts it. A load that finds everything in place changes nothing.
+
+The plugin itself comes from a GitHub release. The release workflow publishes one whenever
+`main` carries a version number that has no release yet and the CI workflow has passed for
+that commit, with a single asset, `tcl-me-remo.zip`. People install it by typing
+
+```
+github.com/tiltbob/tcl-me-remo/releases/latest/download/tcl-me-remo.zip
+```
+
+into *Install Plugin from URL* on Decky's Developer page; Decky's backend downloads it.
+The name of the asset is part of the mechanism. Decky takes the last part of the address,
+without `.zip`, for the plugin's name and compares it with the `name` of the plugins it has:
+only when the two match does it treat the install as an update (unload, uninstall hook,
+remove the folder, unpack, start). With any other file name it would unpack the archive over
+the running plugin. A test holds the asset, the address in the README and the one the panel
+shows to that name. **Updating** is therefore the same step again, and the address always
+serves the newest release that is not a draft or a pre-release.
+
+Decky's plugin store is not used (it does not take plugins written mostly with AI
+assistance), and neither is its *custom store* setting: that replaces the official store
+for all plugins rather than adding to it, and Decky fetches a store from the Steam client's
+browser with a request header of its own, which a static file host does not allow (the
+browser's preliminary `OPTIONS` request is refused by GitHub Pages and by
+raw.githubusercontent.com).
+
+**Removal** is the uninstall of the plugin, with one complication: Decky calls a plugin's
+uninstall hook for updates as well, and kills the backend a few seconds later. The hook
+therefore removes nothing. It leaves a note in `/var/lib/tcl-me-remo` and sets a timer; three
+minutes later the installed copy of the installer checks whether a plugin of ours is in
+Decky's plugins folder, and only if none is does it remove the service. A reboot discards
+the timer but not the note, which the service looks for a few minutes after each start and
+hourly after that. The
+next install removes the note. Settings and the pairing stay, unless the panel's *Remove*
+with *Also delete settings and the pairing* was used first.
+
+The hook is not all there is, because Decky runs it only in a plugin that is loaded: a
+plugin the user *disabled* in Decky has no backend process, and uninstalling it then removes
+its folder without a word to anybody. So the plugin's install also records, in
+`/var/lib/tcl-me-remo/installed-by-plugin.json`, the folder Decky keeps its plugins in, and
+a service with such a record looks into that folder itself, three minutes after each start
+and then once an hour: if no plugin named `tcl-me-remo` is in it, the same check as above is
+started and removes the service. A folder that is not there, cannot be read, or was changed
+within the last minute (Decky may be unpacking an update) proves nothing, and the service
+stays. A disabled plugin keeps its folder, so disabling alone removes nothing: the service
+runs on without its panel. An install without Decky (`./install.sh`) removes the record;
+that service belongs to nobody and never removes itself.
+
+Not covered: Decky Loader's own uninstaller leaves the plugins folder, with this plugin in
+it, where it is. The service then finds its plugin "installed" and stays.
+
+Without Decky, `./install.sh` in a checkout runs the same installer through `sudo`.
+
 ## Files
 
 | Path | Contents |
@@ -380,7 +440,7 @@ It only works while the TV's network is up: on, or in standby with Screenless se
 | `/etc/systemd/system/tcl-me-remo-sleep.service` | the suspend/resume hook |
 | `/var/lib/tcl-me-remo/config.json` | settings. A file that cannot be read at all is moved to `config.json.broken` at start-up and the service runs on defaults; `tcl-me-remo status`, the doctor and the panel's Diagnostics page say so, also after later starts, until the file is mended and moved back, deleted, or settings have been saved |
 | `/var/lib/tcl-me-remo/power.json` | which way the last power key switched the TV (`on`, `off`, or empty for "not known"); only read when the on key is a toggle, see [Discrete power](#discrete-power). Deleting it is harmless: the next automatic "TV on" with a toggle is then skipped once |
-| `/var/lib/tcl-me-remo/` | other state: Wi-Fi pairing certificate, what was learned about the TV, the installer's notes (links it made, "the plugin was removed") |
+| `/var/lib/tcl-me-remo/` | other state: Wi-Fi pairing certificate, what was learned about the TV, the installer's notes (links it made, "the plugin was removed", which Decky plugins folder the installing plugin is in) |
 | `/run/tcl-me-remo/control.sock` | control socket (`root:wheel`, `0660`) |
 | `/var/lib/bluetooth/` | the Bluetooth bond itself (BlueZ's, not ours) |
 

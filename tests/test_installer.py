@@ -219,6 +219,8 @@ def test_a_service_that_fails_at_every_start_is_not_called_starting(tmp_path):
     assert systemd.count("restart") == 0 and systemd.count("start") == 0
     (trouble,) = result["problems"]
     assert "keeps failing" in trouble and "8 times" in trouble and "journalctl -b -u tcl-me-remo" in trouble
+    # Shown in the Decky panel too, so the way without a terminal comes first.
+    assert trouble.index("Diagnostics page of the Decky panel") < trouble.index("journalctl")
     assert result["log"] == ["already up to date", trouble] and result["active"] is False
     assert installer.info(layout, systemd, source=REPO)["problems"] == [trouble]
     # the first restart after a failure is under way: not "keeps failing" yet, but not just "starting"
@@ -569,6 +571,7 @@ def test_purge_says_what_to_do_when_the_bond_could_not_be_removed(tmp_path):
     _paired(layout)
     log = installer.uninstall(layout, tools, purge=True)["log"]
     assert any(line.endswith("run: bluetoothctl remove AA:BB:CC:DD:EE:FF") for line in log)
+    assert any("forget it in SteamOS's Bluetooth settings if it is listed there, or run:" in line for line in log)
     # a bond BlueZ does not have is not worth a line
     layout, tools = _layout(tmp_path / "second"), Tools(forget=3, bluetoothctl=(1, "Device AA:BB not available\n"))
     installer.install(layout, tools, source=REPO)
@@ -883,6 +886,126 @@ def test_orphan_check_can_be_told_where_to_look(env, tmp_path, monkeypatch):
     assert seen == [plugins, None]
 
 
+# ---- a plugin that was removed without its uninstall hook being run
+#
+# Decky runs the hook only in a plugin that is loaded.  One that the user disabled and then
+# uninstalled leaves no note, so the plugin's install records where Decky keeps its plugins
+# and the service looks there itself.
+
+
+def test_an_install_by_the_plugin_records_where_decky_keeps_it(env, tmp_path, monkeypatch):
+    layout, systemd = env
+    plugins = _plugins(tmp_path, ("tcl-me-remo", installer.PLUGIN_NAME))
+    record = layout.state_dir / installer.PLUGIN_RECORD
+    result = installer.install(layout, systemd, source=REPO, plugins_dir=plugins)
+    assert json.loads(record.read_text()) == {"plugins_dir": str(plugins)}
+    assert not any("could not write" in line for line in result["log"])
+    # the plugin loading again changes nothing, and restarts nothing
+    before = record.stat().st_mtime_ns
+    again = installer.install(layout, systemd, source=REPO, plugins_dir=plugins)
+    assert again["log"] == ["already up to date"] and not again["restarted"]
+    assert record.stat().st_mtime_ns == before
+    # install.sh (no plugin behind it): that service is wanted for its own sake
+    installer.install(layout, systemd, source=REPO)
+    assert not record.exists()
+    # a path that is not absolute says nothing about where to look
+    installer.install(layout, systemd, source=REPO, plugins_dir=Path("homebrew/plugins"))
+    assert not record.exists()
+    # and it is what the command line hands on
+    seen = {}
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(installer, "install", lambda **options: seen.update(options) or {"log": []})
+    assert installer.main(["install", "--user-home", "/home/deck", "--plugins-dir", str(plugins)]) == 0
+    assert seen == {"source": None, "user_home": Path("/home/deck"), "plugins_dir": plugins}
+    assert installer.main(["install"]) == 0 and seen["plugins_dir"] is None
+
+
+def test_a_plugin_removed_without_its_hook_is_noticed(env, tmp_path):
+    layout, systemd = env
+    plugins = _plugins(tmp_path, ("tcl-me-remo", installer.PLUGIN_NAME), ("some-other-plugin", "Other"))
+    installer.install(layout, systemd, source=REPO, plugins_dir=plugins)
+    assert not (layout.state_dir / installer.REMOVED_MARKER).exists()
+    # While the plugin is there (loaded or disabled, Decky keeps its folder) nothing is
+    # started, and a check that is made all the same leaves the service alone.
+    assert installer.orphan_check_command(layout.state_dir) is None
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is False and _installed(layout, systemd)
+    assert (layout.state_dir / installer.PLUGIN_RECORD).exists()
+    # "Disable", then "Uninstall" in Decky: the folder goes, and no hook has run.
+    shutil.rmtree(plugins / "tcl-me-remo")
+    # Not decided on while Decky may be putting a new copy there ...
+    assert installer.orphan_check_command(layout.state_dir) is None
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is None and _installed(layout, systemd)
+    assert "changed moments ago" in result["log"][0]
+    # ... but once the folder has been left alone for a while.
+    _settled(plugins)
+    argv = installer.orphan_check_command(layout.state_dir)
+    assert argv is not None and argv[0] == "systemd-run" and argv[-1] == "uninstall-if-orphaned"
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is True and not _installed(layout, systemd)
+    assert f"the plugin is gone from {plugins}" in result["log"][0]
+    # Settings stay, the record does not: nothing is left that would start a check.
+    assert layout.state_dir.is_dir() and not (layout.state_dir / installer.PLUGIN_RECORD).exists()
+    assert installer.orphan_check_command(layout.state_dir) is None
+    assert installer.uninstall_if_orphaned(None, layout, systemd)["orphaned"] is False
+
+
+def test_a_plugins_folder_that_is_not_there_proves_nothing_without_a_note_either(env, tmp_path):
+    # The home is not mounted yet, or Decky was moved: the service stays.
+    layout, systemd = env
+    plugins = _plugins(tmp_path, ("tcl-me-remo", installer.PLUGIN_NAME))
+    installer.install(layout, systemd, source=REPO, plugins_dir=plugins)
+    shutil.rmtree(plugins)
+    assert installer.orphan_check_command(layout.state_dir) is None
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is None and _installed(layout, systemd)
+    assert "cannot tell" in result["log"][0]
+    # nor does a plugin.json that cannot be read
+    plugins = _plugins(tmp_path, ("tcl-me-remo", installer.PLUGIN_NAME))
+    (plugins / "tcl-me-remo" / "plugin.json").unlink()
+    (plugins / "tcl-me-remo" / "plugin.json").symlink_to(plugins / "tcl-me-remo" / "plugin.json")  # a loop
+    _settled(plugins)
+    assert installer.orphan_check_command(layout.state_dir) is None
+    assert installer.uninstall_if_orphaned(None, layout, systemd)["orphaned"] is None
+
+
+@pytest.mark.parametrize("text", ["", "{not json", "[1]", '{"plugins_dir": 5}', '{"plugins_dir": "plugins"}'])
+def test_a_record_that_cannot_be_used_is_no_record(env, tmp_path, text):
+    layout, systemd = env
+    installer.install(layout, systemd, source=REPO)
+    (layout.state_dir / installer.PLUGIN_RECORD).write_text(text)
+    assert installer.orphan_check_command(layout.state_dir) is None
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is False and _installed(layout, systemd)
+
+
+def test_the_note_decides_before_the_record_and_the_record_when_the_note_is_unusable(env, tmp_path):
+    layout, systemd = env
+    plugins = _plugins(tmp_path, ("some-other-plugin", "Other"))
+    installer.install(layout, systemd, source=REPO, plugins_dir=plugins)
+    # A fresh note (an update in progress) holds the check back although the plugin is absent.
+    _note_removal(layout, plugins, age=5)
+    assert installer.orphan_check_command(layout.state_dir) is not None
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is None and "moments ago" in result["log"][0] and _installed(layout, systemd)
+    # A note nothing can be read from is discarded; what the install recorded still answers.
+    (layout.state_dir / installer.REMOVED_MARKER).write_text("{not json")
+    result = installer.uninstall_if_orphaned(None, layout, systemd)
+    assert result["orphaned"] is True and not _installed(layout, systemd)
+    assert not (layout.state_dir / installer.REMOVED_MARKER).exists()
+
+
+def test_removing_the_service_removes_the_record(env, tmp_path):
+    # The panel's Remove: the plugin is still installed and records itself again when it
+    # next installs the service.  Until then there is no service to look after.
+    layout, systemd = env
+    plugins = _plugins(tmp_path, ("tcl-me-remo", installer.PLUGIN_NAME))
+    installer.install(layout, systemd, source=REPO, plugins_dir=plugins)
+    installer.uninstall(layout, systemd)
+    assert layout.state_dir.is_dir() and not (layout.state_dir / installer.PLUGIN_RECORD).exists()
+
+
 def test_a_plugin_that_decky_is_unpacking_is_not_taken_for_gone(env, tmp_path):
     # A reinstall caught half-way: the folder is there, its plugin.json not yet.
     layout, systemd = env
@@ -935,7 +1058,7 @@ def test_an_install_cancels_the_orphan_check(env, tmp_path):
 def test_orphan_check_command_for_the_service(env):
     layout, systemd = env
     installer.install(layout, systemd, source=REPO)
-    assert installer.orphan_check_command(layout.state_dir) is None  # no note, nothing to start
+    assert installer.orphan_check_command(layout.state_dir) is None  # no note, no plugin behind it: nothing to start
     _note_removal(layout, Path("/home/deck/homebrew/plugins"))
     argv = installer.orphan_check_command(layout.state_dir)
     assert argv[0] == "systemd-run"  # not a child of the service, which the check may stop

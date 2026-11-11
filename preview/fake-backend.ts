@@ -7,7 +7,7 @@
 //
 // Scenarios and knobs come from the page URL:
 //   ?scenario=default | unpaired | no-service | stopped | failed | installing
-//   &fail=tv_off,send_key   make these calls fail
+//   &fail=tv_off,send_key   make these calls fail (also: doctor, service_log)
 //   &pair=3                 seconds until pairing completes ("never" to let it time out)
 //   &classic=1              another Bluetooth pairing screen is open: pairing mode warns about it
 //   &statusDelay=1500       milliseconds a status request takes
@@ -19,6 +19,8 @@ import type {
   BluetoothState,
   Config,
   ConfigBundle,
+  DoctorCheck,
+  DoctorReport,
   KeyInfo,
   RpcReply,
   ServiceInfo,
@@ -236,6 +238,8 @@ export class FakeBackend {
   private lastingProblems: string[] = [];
   /** True while the pretend start-up install runs (scenario "installing"). */
   private installing = false;
+  /** The service was there and was removed: the system journal still has its lines. */
+  private removed = false;
 
   constructor() {
     this.bluetooth = {
@@ -866,7 +870,15 @@ export class FakeBackend {
     this.calls.push({ fn: "remove_service", method: "", params: { purge }, at: Date.now() });
     await sleep(800);
     this.mode = "not-installed";
-    return { ok: true, result: { log: purge ? ["service removed", "settings deleted"] : ["service removed"] } };
+    this.removed = true;
+    // In installer.py's own wording (uninstall()).
+    const log = ["removed tcl-me-remo-sleep.service", "removed tcl-me-remo.service", "removed /opt/tcl-me-remo"];
+    log.push(
+      purge
+        ? "removed settings and state in /var/lib/tcl-me-remo"
+        : "kept settings in /var/lib/tcl-me-remo (to delete them too: Remove with 'Also delete settings and the pairing' in the Decky panel, or uninstall --purge)",
+    );
+    return { ok: true, result: { log } };
   }
 
   async restart_service(): Promise<RpcReply<unknown>> {
@@ -879,6 +891,99 @@ export class FakeBackend {
     this.startedAt = Date.now();
     Object.assign(this.bluetooth, { connected: false, ready: false, subscribed: false, delivery: "" });
     return { ok: true, result: {} };
+  }
+
+  /** main.py's doctor(): the report of "tcl-me-remo doctor", in doctor.py's own wording. */
+  async doctor(): Promise<RpcReply<DoctorReport>> {
+    this.calls.push({ fn: "doctor", method: "", params: {}, at: Date.now() });
+    await sleep(700);
+    if (this.failing.has("doctor")) {
+      return { ok: false, error: { code: "doctor_failed", message: "timed out after 75s" } };
+    }
+    const up = this.mode === "running";
+    const bt = this.bluetooth;
+    const checks: DoctorCheck[] = [
+      { name: "python", status: "ok", detail: "Python 3.13.1" },
+      { name: "bluez", status: "ok", detail: "BlueZ 5.79" },
+      { name: "bluetooth service", status: "ok", detail: "bluetooth.service is active" },
+      { name: "adapter", status: "ok", detail: "hci0 is powered (btusb)" },
+      { name: "peripheral role", status: "ok", detail: "the adapter can act as a peripheral" },
+      { name: "advertising", status: "ok", detail: "5 advertising instance(s) supported" },
+    ];
+    if (!up) {
+      checks.push({
+        name: "service",
+        status: "fail",
+        detail: "not reachable: cannot reach the tcl-me-remo service: [Errno 2] No such file or directory",
+      });
+      checks.push({
+        name: "direct delivery",
+        status: "unknown",
+        detail:
+          "kernel 6.11.11-valve19-1-neptune-611, raw_notify unknown: the service did not say; with the default " +
+          "'auto' direct delivery would not be used on this kernel",
+      });
+    } else {
+      checks.push({ name: "service", status: "ok", detail: `running, version ${this.base.version}` });
+      checks.push({ name: "HID service", status: "ok", detail: "registered with BlueZ" });
+      checks.push(
+        !bt.paired
+          ? {
+              name: "TV pairing",
+              status: "warn",
+              detail: "no TV is paired yet (Pair TV in the Decky panel, or run: tcl-me-remo pair)",
+            }
+          : bt.ready
+            ? { name: "TV link", status: "ok", detail: `${bt.tv_name} is connected (BlueZ)` }
+            : { name: "TV link", status: "warn", detail: `${bt.tv_name} is not connected: the link comes up when it is needed` },
+      );
+      checks.push({ name: "display check", status: "ok", detail: "HDMI-A-1 is connected" });
+      for (const problem of this.configProblems) checks.push({ name: "config", status: "warn", detail: problem });
+      checks.push({
+        name: "direct delivery",
+        status: "ok",
+        detail:
+          "kernel 6.11.11-valve19-1-neptune-611, raw_notify = auto: not used on this kernel (only from Linux 6.17 " +
+          "on, where it has no side effects); a TV that does not subscribe again after a reboot (Android 11 to 13) " +
+          "has to be paired again, or set Direct delivery (bluetooth.raw_notify; in the panel: Bluetooth page, " +
+          "Advanced) to 'on'",
+      });
+      checks.push({ name: "suspend lock", status: "ok", detail: "2 delay lock(s) held" });
+    }
+    const worst = (["fail", "warn", "unknown"] as const).find((level) => checks.some((check) => check.status === level)) ?? "ok";
+    return {
+      ok: true,
+      result: {
+        worst,
+        system: [
+          `tcl-me-remo ${this.base.version} on SteamOS 3.7.13`,
+          "kernel 6.11.11-valve19-1-neptune-611, Python 3.13.1, systemd 257 (257.5-1)",
+          "BlueZ 5.79, hci0 btusb 8087/32/0",
+        ],
+        checks,
+        details: [
+          ...(bt.paired ? ["Paired Bluetooth devices:", `  Device ${TV_ADDRESS} ${TV_NAME}`, ""] : []),
+          "Connected displays: HDMI-A-1",
+        ],
+      },
+    };
+  }
+
+  /** main.py's service_log(): the unit's lines in the system journal, oldest first. */
+  async service_log(lines: number = 100): Promise<RpcReply<{ lines: string[] }>> {
+    this.calls.push({ fn: "service_log", method: "", params: { lines }, at: Date.now() });
+    await sleep(200);
+    if (this.failing.has("service_log")) {
+      return { ok: false, error: { code: "log_failed", message: "[Errno 2] No such file or directory: 'journalctl'" } };
+    }
+    if (this.mode === "not-installed" && !this.removed) return { ok: true, result: { lines: [] } };
+    const journal = [
+      "2026-11-10T19:21:28+0000 steamdeck systemd[1]: Started tcl-me-remo.service - Control a TCL Google TV over Bluetooth.",
+      "2026-11-10T19:21:29+0000 steamdeck tcl-me-remo[812]: INFO tcl_me_remo.daemon: service started",
+      "2026-11-10T19:29:41+0000 steamdeck systemd[1]: Stopping tcl-me-remo.service - Control a TCL Google TV over Bluetooth...",
+      "2026-11-10T19:29:42+0000 steamdeck systemd[1]: Stopped tcl-me-remo.service - Control a TCL Google TV over Bluetooth.",
+    ];
+    return { ok: true, result: { lines: journal.slice(-lines) } };
   }
 }
 
