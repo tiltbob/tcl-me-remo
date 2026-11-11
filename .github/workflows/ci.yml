@@ -27,9 +27,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Install test tools
+        # The tests need dbus-daemon, which GitHub's runner image has.  Ubuntu's package
+        # mirrors are asked only if it is missing: when they cannot be reached, apt waits
+        # for minutes, for a package that was there all along.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq dbus
+          command -v dbus-daemon >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq dbus; }
           python -m pip install --quiet pytest pytest-asyncio pytest-timeout ruff
       - name: Lint
         run: ruff check .
@@ -76,10 +78,23 @@ jobs:
         # Renders the real components against mocked Decky modules and a fake backend and
         # clicks through them.  Playwright is not a project dependency; the script loads it
         # through NODE_PATH.
+        #
+        # The browser is downloaded without "--with-deps".  That option installs system
+        # packages from Ubuntu's mirrors, and a run in which the mirrors could not be
+        # reached failed here before a single check had run, and kept a release from being
+        # published.  The runner image has the libraries Chromium needs; only if the browser
+        # does not start are they installed after all.
         run: |
           npm install --global playwright@1
-          npx playwright install --with-deps chromium
-          NODE_PATH="$(npm root --global)" pnpm run preview
+          export NODE_PATH="$(npm root --global)"
+          npx playwright install chromium
+          if node -e "require('playwright').chromium.launch().then((browser) => browser.close())"; then
+            echo "Chromium starts with what the runner image has; no system packages were installed."
+          else
+            echo "::warning::Chromium did not start with what the runner image has; installing its system packages."
+            npx playwright install-deps chromium
+          fi
+          pnpm run preview
       - name: Package
         run: python3 scripts/build_zip.py
       - uses: actions/upload-artifact@v4
